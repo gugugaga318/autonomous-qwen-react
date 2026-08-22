@@ -494,6 +494,237 @@ class QwenNextActionPlannerContractTest(unittest.TestCase):
         self.assertEqual(consumed.decision.decision_type, DecisionType.STOP.value)
         self.assertEqual(consumed.decision.stop_reason, StopReason.NO_ALLOWED_ACTION.value)
 
+    def test_third_reasoning_round_requires_unconsumed_discriminative_evidence(
+        self,
+    ) -> None:
+        mechanism = questions()[1]
+        gap_id = "candidate_0.hypothesis_discrimination.product_outcome.lane_round_3"
+        target_scope = {
+            "lane_id": "LANE_ROUND_3",
+            "operation": "OP_ROUND_3",
+            "equipment": "TOOL_ROUND_3",
+            "chamber": "CH_ROUND_3",
+            "recipe": "RCP_ROUND_3",
+            "discriminator_kind": "product_outcome",
+        }
+        mes = finding(AgentKind.MES.value)
+        mes.details["lane_candidates"] = [
+            {
+                **target_scope,
+                "parameter_scope": ["pressure_cv"],
+                "exposed_lot_ids": ["LOT_01"],
+            }
+        ]
+        rca_round_1 = AgentFinding(
+            finding_id="FINDING_RCA_ROUND_1",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="The first candidate comparison is incomplete.",
+            confidence=0.4,
+            evidence_ids=["EV_RCA_ROUND_1"],
+        )
+        rca_round_2 = AgentFinding(
+            finding_id="FINDING_RCA_ROUND_2",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="A second comparison selected one more discriminator.",
+            confidence=0.5,
+            evidence_ids=["EV_RCA_ROUND_1", "EV_RCA_ROUND_2"],
+            details={
+                "causal_evidence_gaps": [
+                    {
+                        "gap_id": gap_id,
+                        "gap_type": "hypothesis_discrimination",
+                        "discriminator_kind": "product_outcome",
+                        "candidate_index": 0,
+                        "candidate_id": "C_ROUND_3",
+                        "claim": "hypothesis_discrimination",
+                        "status": "unresolved",
+                        "reason": "Compare the alternative Lane product outcome.",
+                        "question_kind": "process_mechanism",
+                        "allowed_actions": [
+                            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+                            ActionKind.RUN_RCA_REASONING.value,
+                        ],
+                        "preferred_action": (
+                            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value
+                        ),
+                        "refresh_action": ActionKind.RUN_RCA_REASONING.value,
+                        "required_evidence_groups": ["shared_product_signal"],
+                        "target_scope": target_scope,
+                        "challenge_selected": True,
+                    }
+                ]
+            },
+        )
+        first_reasoning = ActionRecord(
+            action=InvestigationAction(
+                action_id="RCA_ACTION_ROUND_1",
+                kind=ActionKind.RUN_RCA_REASONING.value,
+                agent=AgentKind.RCA_REASONING.value,
+                reason="Generate the first candidates.",
+                inputs={"lot_id": "LOT_01"},
+                scope={"lot_id": "LOT_01"},
+            ),
+            status="completed",
+            produced_evidence_ids=["EV_RCA_ROUND_1"],
+            decision_summary="First RCA round completed.",
+        )
+        second_reasoning = ActionRecord(
+            action=InvestigationAction(
+                action_id="RCA_ACTION_ROUND_2",
+                kind=ActionKind.RUN_RCA_REASONING.value,
+                agent=AgentKind.RCA_REASONING.value,
+                reason="Compare candidates after the first discriminator.",
+                inputs={"lot_id": "LOT_01"},
+                scope={"lot_id": "LOT_01", "causal_gap_id": "PRIOR_GAP"},
+            ),
+            status="completed",
+            produced_evidence_ids=["EV_RCA_ROUND_1", "EV_RCA_ROUND_2"],
+            decision_summary="Second RCA round completed.",
+        )
+        observation_action = InvestigationAction(
+            action_id="ROUND_3_DISCRIMINATIVE_OBSERVATION",
+            kind=ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+            agent=AgentKind.DEFECT_WAT.value,
+            reason="Collect the final discriminative product observation.",
+            inputs={"lot_id": "LOT_01"},
+            scope={
+                "lot_id": "LOT_01",
+                "causal_gap_id": gap_id,
+                **target_scope,
+            },
+        )
+        observation = ActionRecord(
+            action=observation_action,
+            status="completed",
+            produced_evidence_ids=["EV_NEW_DISCRIMINATOR"],
+            decision_summary="A new Lane-scoped product observation was recorded.",
+        )
+        gain_link = QuestionEvidenceLink(
+            question_id=mechanism.question_id,
+            evidence_id="EV_NEW_DISCRIMINATOR",
+            action_id=observation_action.action_id,
+            relation=QuestionEvidenceRelation.SUPPORTS.value,
+            matched_evidence_group="shared_product_signal",
+            reason="The observation distinguishes the competing causal Lane.",
+        )
+        findings = [
+            mes,
+            finding(AgentKind.FDC.value),
+            finding(AgentKind.DEFECT_WAT.value),
+            rca_round_1,
+            rca_round_2,
+        ]
+        setup_records = [
+            ActionRecord(
+                action=InvestigationAction(
+                    action_id=f"SETUP_ACTION_{index}",
+                    kind=ActionKind.INSPECT_DEFECT_PATTERN.value,
+                    agent=AgentKind.DEFECT_WAT.value,
+                    reason="Collect a bounded setup observation.",
+                    inputs={"lot_id": "LOT_01"},
+                    scope={"lot_id": "LOT_01", "setup_step": index},
+                ),
+                status="completed",
+                produced_evidence_ids=[f"EV_SETUP_{index}"],
+                decision_summary="A setup observation was recorded.",
+            )
+            for index in range(5)
+        ]
+        records = [
+            *setup_records,
+            first_reasoning,
+            second_reasoning,
+            observation,
+        ]
+        self.assertEqual(len(records), 8)
+        planner = QwenNextActionPlanner(RecordingNextActionClient())
+
+        third = planner.decide_with_review(
+            goal=goal(),
+            questions=[mechanism],
+            findings=findings,
+            action_records=records,
+            tool_call_count=3,
+            evidence_ids=[
+                "EV_RCA_ROUND_1",
+                "EV_RCA_ROUND_2",
+                "EV_NEW_DISCRIMINATOR",
+            ],
+            question_evidence_links=[gain_link],
+            authoritative_rca_finding_id=rca_round_2.finding_id,
+        )
+
+        self.assertEqual(third.decision.decision_type, DecisionType.ACT.value)
+        self.assertEqual(
+            third.decision.next_action.kind,
+            ActionKind.RUN_RCA_REASONING.value,
+        )
+        self.assertEqual(third.decision.next_action.scope["causal_gap_id"], gap_id)
+
+        third_record = ActionRecord(
+            action=third.decision.next_action,
+            status="completed",
+            produced_evidence_ids=[
+                "EV_RCA_ROUND_1",
+                "EV_RCA_ROUND_2",
+                "EV_NEW_DISCRIMINATOR",
+            ],
+            decision_summary="The third and final RCA round consumed the Evidence.",
+        )
+        exhausted = planner.decide_with_review(
+            goal=goal(),
+            questions=[mechanism],
+            findings=findings,
+            action_records=[*records, third_record],
+            tool_call_count=4,
+            evidence_ids=[
+                "EV_RCA_ROUND_1",
+                "EV_RCA_ROUND_2",
+                "EV_NEW_DISCRIMINATOR",
+            ],
+            question_evidence_links=[gain_link],
+            prior_decisions=[third.decision],
+            authoritative_rca_finding_id=rca_round_2.finding_id,
+        )
+
+        self.assertEqual(exhausted.decision.decision_type, DecisionType.STOP.value)
+        self.assertEqual(
+            exhausted.decision.stop_reason,
+            StopReason.BUDGET_EXHAUSTED.value,
+        )
+
+        consumed_round_2 = AgentFinding(
+            finding_id=rca_round_2.finding_id,
+            agent=rca_round_2.agent,
+            summary=rca_round_2.summary,
+            confidence=rca_round_2.confidence,
+            evidence_ids=[*rca_round_2.evidence_ids, "EV_NEW_DISCRIMINATOR"],
+            details=rca_round_2.details,
+        )
+        already_consumed = planner.decide_with_review(
+            goal=goal(),
+            questions=[mechanism],
+            findings=[*findings[:-1], consumed_round_2],
+            action_records=records,
+            tool_call_count=3,
+            evidence_ids=[
+                "EV_RCA_ROUND_1",
+                "EV_RCA_ROUND_2",
+                "EV_NEW_DISCRIMINATOR",
+            ],
+            question_evidence_links=[gain_link],
+            authoritative_rca_finding_id=consumed_round_2.finding_id,
+        )
+
+        self.assertEqual(
+            already_consumed.decision.decision_type,
+            DecisionType.STOP.value,
+        )
+        self.assertEqual(
+            already_consumed.decision.stop_reason,
+            StopReason.BUDGET_EXHAUSTED.value,
+        )
+
     def test_required_missing_waits_for_executable_discrimination_gap(self) -> None:
         mechanism = questions()[1]
         gap_id = "candidate_0.hypothesis_discrimination.parameter_anomaly"
@@ -600,6 +831,171 @@ class QwenNextActionPlannerContractTest(unittest.TestCase):
             ActionKind.INSPECT_FDC_SPC.value,
         )
         self.assertEqual(outcome.decision.next_action.scope["causal_gap_id"], gap_id)
+        self.assertEqual(
+            outcome.decision.next_action.scope["lane_id"],
+            target_scope["lane_id"],
+        )
+
+    def test_unexecutable_priority_zero_gap_does_not_mask_discriminator(self) -> None:
+        mechanism = questions()[1]
+        discriminator_gap_id = (
+            "candidate_0.hypothesis_discrimination.product_outcome"
+        )
+        target_scope = {
+            "lane_id": "lane:2000:EQ_ALT:EQ_ALT_CH02:RCP_ALT",
+            "operation": "2000",
+            "equipment": "EQ_ALT",
+            "chamber": "EQ_ALT_CH02",
+            "recipe": "RCP_ALT",
+            "discriminator_kind": "product_outcome",
+        }
+        prior_scope = {
+            "lane_id": "lane:1000:EQ_PRIMARY:EQ_PRIMARY_CH01:RCP_PRIMARY",
+            "operation": "1000",
+            "equipment": "EQ_PRIMARY",
+            "chamber": "EQ_PRIMARY_CH01",
+            "recipe": "RCP_PRIMARY",
+            "discriminator_kind": "product_outcome",
+        }
+        mes = finding(AgentKind.MES.value)
+        mes.details["lane_candidates"] = [
+            {
+                **prior_scope,
+                "parameter_scope": ["pressure_cv"],
+                "exposed_lot_ids": ["LOT_01"],
+            },
+            {
+                **target_scope,
+                "parameter_scope": ["temperature_delta"],
+                "exposed_lot_ids": ["LOT_01"],
+            },
+        ]
+        rca = AgentFinding(
+            finding_id="FINDING_PRIORITY_FALLTHROUGH_RCA",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="One unavailable outcome must not hide a testable alternative.",
+            confidence=0.5,
+            evidence_ids=["EV_RCA_TRACE"],
+            details={
+                "causal_evidence_gaps": [
+                    {
+                        "gap_id": "candidate_1.outcome.unavailable",
+                        "gap_type": "data_missing",
+                        "candidate_index": 1,
+                        "claim": "outcome",
+                        "status": "unavailable",
+                        "priority": 0,
+                        "reason": "The outcome source is unavailable.",
+                        "question_kind": "process_mechanism",
+                        "allowed_actions": [
+                            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+                            ActionKind.RUN_RCA_REASONING.value,
+                        ],
+                        "preferred_action": (
+                            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value
+                        ),
+                        "refresh_action": ActionKind.RUN_RCA_REASONING.value,
+                        "target_scope": {},
+                    },
+                    {
+                        "gap_id": discriminator_gap_id,
+                        "gap_type": "hypothesis_discrimination",
+                        "discriminator_kind": "product_outcome",
+                        "candidate_index": 0,
+                        "candidate_id": "C_ALT",
+                        "claim": "hypothesis_discrimination",
+                        "status": "unresolved",
+                        "priority": 1,
+                        "reason": "Test the alternative Lane product outcome.",
+                        "question_kind": "process_mechanism",
+                        "allowed_actions": [
+                            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+                            ActionKind.RUN_RCA_REASONING.value,
+                        ],
+                        "preferred_action": (
+                            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value
+                        ),
+                        "refresh_action": ActionKind.RUN_RCA_REASONING.value,
+                        "required_evidence_groups": ["shared_product_signal"],
+                        "target_scope": target_scope,
+                        "challenge_selected": True,
+                    },
+                ]
+            },
+        )
+        records: list[ActionRecord] = []
+        links: list[QuestionEvidenceLink] = []
+        prior_actions = (
+            (
+                ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+                AgentKind.DEFECT_WAT.value,
+            ),
+            (ActionKind.RUN_RCA_REASONING.value, AgentKind.RCA_REASONING.value),
+        )
+        for index, (action_kind, agent) in enumerate(prior_actions, start=1):
+            action_id = f"PRIOR_LANE_GAP_ACTION_{index}"
+            evidence_id = f"EV_PRIORITY_GAIN_{index}"
+            records.append(
+                ActionRecord(
+                    action=InvestigationAction(
+                        action_id=action_id,
+                        kind=action_kind,
+                        agent=agent,
+                        reason="Investigate the same Gap on the prior Lane.",
+                        inputs={"lot_id": "LOT_01"},
+                        scope={
+                            "lot_id": "LOT_01",
+                            "causal_gap_id": discriminator_gap_id,
+                            **prior_scope,
+                        },
+                    ),
+                    status="completed",
+                    produced_evidence_ids=[evidence_id],
+                    decision_summary="The prior Lane recorded new Evidence.",
+                )
+            )
+            links.append(
+                QuestionEvidenceLink(
+                    question_id=mechanism.question_id,
+                    evidence_id=evidence_id,
+                    action_id=action_id,
+                    relation=QuestionEvidenceRelation.SUPPORTS.value,
+                    matched_evidence_group="process_anomaly",
+                    reason="The reasoning round recorded relevant Evidence.",
+                )
+            )
+        client = RecordingNextActionClient()
+
+        outcome = QwenNextActionPlanner(client).decide_with_review(
+            goal=goal(),
+            questions=[mechanism],
+            findings=[
+                mes,
+                finding(AgentKind.FDC.value),
+                finding(AgentKind.DEFECT_WAT.value),
+                rca,
+            ],
+            action_records=records,
+            tool_call_count=2,
+            evidence_ids=["EV_RCA_TRACE", *[link.evidence_id for link in links]],
+            question_evidence_links=links,
+            authoritative_rca_finding_id=rca.finding_id,
+        )
+
+        self.assertEqual(client.requests, [])
+        self.assertEqual(
+            outcome.decision.decision_type,
+            DecisionType.ACT.value,
+            msg=outcome.decision.reason,
+        )
+        self.assertEqual(
+            outcome.decision.next_action.kind,
+            ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+        )
+        self.assertEqual(
+            outcome.decision.next_action.scope["causal_gap_id"],
+            discriminator_gap_id,
+        )
         self.assertEqual(
             outcome.decision.next_action.scope["lane_id"],
             target_scope["lane_id"],
