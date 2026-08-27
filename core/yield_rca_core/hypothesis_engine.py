@@ -7,7 +7,7 @@ dependency. It is the sole production RCA decision engine after Batch 19.
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +25,7 @@ from yield_rca_core.causal_hypothesis import CausalHypothesis
 from yield_rca_core.causal_investigation_models import (
     AlternativeSearchStatus,
     CandidateChallenge,
+    CandidateSemanticProfile,
     CausalLaneRecord,
 )
 from yield_rca_core.evidence_models import Evidence
@@ -773,6 +774,10 @@ class HypothesisEngine:
         context_evidence: Sequence[Evidence] = (),
         causal_lanes: Sequence[CausalLaneRecord] = (),
         consumed_discriminators: Collection[tuple[str, str]] = (),
+        competition_brief: Mapping[str, Any] | None = None,
+        candidate_semantic_profiles: Sequence[
+            CandidateSemanticProfile | Mapping[str, Any]
+        ] = (),
     ) -> dict[str, Any]:
         """Return a JSON-safe deterministic hypothesis decision result."""
         by_kind = _findings_by_kind(findings)
@@ -882,8 +887,42 @@ class HypothesisEngine:
             if existing is None or candidate["confidence"] > existing["confidence"]:
                 candidates[root_cause] = candidate
 
+        semantic_profiles_by_candidate_id: dict[
+            str, CandidateSemanticProfile | Mapping[str, Any]
+        ] = {}
+        for raw_profile in candidate_semantic_profiles:
+            candidate_id = (
+                raw_profile.candidate_id
+                if isinstance(raw_profile, CandidateSemanticProfile)
+                else str(raw_profile.get("candidate_id", "")).strip()
+            )
+            if candidate_id:
+                semantic_profiles_by_candidate_id[candidate_id] = raw_profile
+        semantic_profiles_expected = bool(candidate_semantic_profiles) or str(
+            (competition_brief or {}).get("competition_requirement", "")
+        ).strip() in {
+            "alternative_discovery_required",
+            "direction_required",
+            "mechanism_required",
+            "scope_required",
+            "mixed_required",
+        }
+
         matrices_by_root: dict[str, CausalEvidenceMatrix] = {}
         for candidate in candidates.values():
+            hypothesis_id = str(candidate.get("hypothesis_id", "")).strip()
+            semantic_profile: CandidateSemanticProfile | Mapping[str, Any] | None
+            if candidate.get("basis") == "llm_evidence_composition":
+                # An explicit empty mapping means the LLM Candidate was expected
+                # to have scope semantics but none survived validation.  Matrix
+                # must keep that scope unresolved instead of falling back to the
+                # legacy Evidence-coverage inference used by controlled paths.
+                semantic_profile = semantic_profiles_by_candidate_id.get(
+                    hypothesis_id,
+                    {} if semantic_profiles_expected else None,
+                )
+            else:
+                semantic_profile = None
             try:
                 matrix = build_causal_evidence_matrix(
                     CausalHypothesis(
@@ -899,6 +938,7 @@ class HypothesisEngine:
                         ),
                     ),
                     evidence_by_id.values(),
+                    semantic_profile=semantic_profile,
                 )
             except (TypeError, ValueError):
                 continue
@@ -927,6 +967,8 @@ class HypothesisEngine:
                 candidate_ids=matrix_candidate_ids,
                 source_lot_id=source_lot_id,
                 consumed_discriminators=consumed_discriminators,
+                competition_brief=competition_brief,
+                candidate_semantic_profiles=candidate_semantic_profiles,
             )
         )
         evidence_gaps.sort(

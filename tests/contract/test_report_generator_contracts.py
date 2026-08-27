@@ -9,6 +9,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "core"))
 
+from yield_rca_core.causal_investigation_models import (  # noqa: E402
+    AlternativeSearchStatus,
+    CandidateCompetitionStatus,
+    CandidateCompetitionType,
+    CompetitionFailureReason,
+    CompetitionRequirement,
+    CompetitionTrace,
+)
 from yield_rca_core.models import (  # noqa: E402
     AgentFinding,
     AgentKind,
@@ -267,6 +275,41 @@ class ReportGeneratorContractTest(unittest.TestCase):
         self.assertNotIn(EXPECTED_ROOT_CAUSE, report.markdown)
         self.assertEqual(state.authoritative_rca_finding, current)
         self.assertEqual(state.authoritative_hypothesis, current_hypothesis)
+
+    def test_report_exposes_candidate_competition_state_and_lineage(self) -> None:
+        state = replace(
+            self.state,
+            competition_trace=CompetitionTrace(
+                alternative_search_status=AlternativeSearchStatus.UNRESOLVED.value,
+                competition_requirement=CompetitionRequirement.SCOPE_REQUIRED.value,
+                competition_status=CandidateCompetitionStatus.FAILED.value,
+                competition_type=CandidateCompetitionType.SCOPE.value,
+                competition_failure_reason=(
+                    CompetitionFailureReason.SCOPE_HYPOTHESIS_COLLAPSED.value
+                ),
+                candidate_lineage=(
+                    {
+                        "candidate_id": "candidate_0",
+                        "lineage_status": "retained",
+                        "root_cause": "Recipe-specific chamber drift",
+                    },
+                    {
+                        "candidate_id": "candidate_1",
+                        "lineage_status": "omitted",
+                        "prior_root_cause": "Chamber-wide drift",
+                    },
+                ),
+            ),
+        )
+
+        report = ReportGenerator().generate(state)
+
+        self.assertIn("## Candidate Competition", report.markdown)
+        self.assertIn("`scope_required`", report.markdown)
+        self.assertIn("`failed`", report.markdown)
+        self.assertIn("`scope_hypothesis_collapsed`", report.markdown)
+        self.assertIn("`retained`: Recipe-specific chamber drift", report.markdown)
+        self.assertIn("`omitted`: Chamber-wide drift", report.markdown)
 
     def test_missing_state_data_is_marked_not_invented(self) -> None:
         evidence = Evidence(

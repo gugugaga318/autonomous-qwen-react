@@ -462,6 +462,10 @@ class RCAJobStateResponse(APIModel):
     causal_lanes: list[dict[str, Any]] = Field(default_factory=list)
     candidate_challenges: list[dict[str, Any]] = Field(default_factory=list)
     competition_trace: dict[str, Any] | None = None
+    investigation_gain_history: list[dict[str, Any]] = Field(default_factory=list)
+    latest_action_value_assessments: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
     causal_chain_completeness: str | None = None
     warnings: list[WarningResponse] = Field(default_factory=list)
     report: ReportResponse | None = None

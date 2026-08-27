@@ -88,6 +88,8 @@ def causal_evidence() -> list[Evidence]:
                 "magnitude": 8.0,
                 "excursion_start": "2026-01-01T00:00:00",
                 "excursion_end": "2026-01-01T01:00:00",
+                "causal_support_kind": "matched_comparison",
+                "validation_status": "CONFIRMED",
             },
             observation="temperature high during OP_4000",
         ),

@@ -240,7 +240,12 @@ export interface AgentFinding {
   warnings: Warning[];
 }
 
-export type CausalClaimStatus = "supported" | "incomplete" | "conflicted" | "unavailable";
+export type CausalClaimStatus =
+  | "supported"
+  | "plausible"
+  | "incomplete"
+  | "conflicted"
+  | "unavailable";
 
 export interface CausalMatrixClaim {
   claim: string;
@@ -343,6 +348,8 @@ export interface CandidateImpactScopeTrace {
 export interface CausalLaneTrace {
   lane_id: string;
   operation: string;
+  operation_name?: string;
+  module?: string;
   equipment: string;
   chamber: string;
   recipe: string;
@@ -357,6 +364,9 @@ export interface CausalLaneTrace {
 
 export interface CandidateChallengeTrace {
   candidate_id: string;
+  alternative_candidate_id: string | null;
+  evidence_probe_lane_id: string | null;
+  challenge_kind: string;
   strongest_alternative_lane_id: string | null;
   supporting_evidence_ids: string[];
   contradicting_evidence_ids: string[];
@@ -376,6 +386,13 @@ export interface CompetitionTrace {
   blocked_lane_ids: string[];
   lane_resolutions: AlternativeLaneResolutionTrace[];
   alternative_search_status: string;
+  competition_requirement: string;
+  competition_status: string;
+  competition_type: string;
+  competition_axes?: string[];
+  scope_assessment_status?: string;
+  competition_failure_reason: string | null;
+  candidate_lineage: Record<string, unknown>[];
   challenge_round_count: number;
   resolution_evidence_ids: string[];
 }

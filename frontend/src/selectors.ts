@@ -114,7 +114,7 @@ function stringList(value: unknown): string[] {
 }
 
 function causalStatus(value: unknown): CausalClaimStatus {
-  return value === "supported" || value === "incomplete" || value === "conflicted" || value === "unavailable"
+  return value === "supported" || value === "plausible" || value === "incomplete" || value === "conflicted" || value === "unavailable"
     ? value
     : "unavailable";
 }
@@ -150,6 +150,8 @@ function causalLane(value: unknown): CausalLaneTrace | null {
   return {
     lane_id: value.lane_id,
     operation: typeof value.operation === "string" ? value.operation : "",
+    operation_name: typeof value.operation_name === "string" ? value.operation_name : "",
+    module: typeof value.module === "string" ? value.module : "",
     equipment: typeof value.equipment === "string" ? value.equipment : "",
     chamber: typeof value.chamber === "string" ? value.chamber : "",
     recipe: typeof value.recipe === "string" ? value.recipe : "",
@@ -168,6 +170,18 @@ function candidateChallenge(value: unknown): CandidateChallengeTrace | null {
   if (!isRecord(value) || typeof value.candidate_id !== "string") return null;
   return {
     candidate_id: value.candidate_id,
+    alternative_candidate_id:
+      typeof value.alternative_candidate_id === "string"
+        ? value.alternative_candidate_id
+        : null,
+    evidence_probe_lane_id:
+      typeof value.evidence_probe_lane_id === "string"
+        ? value.evidence_probe_lane_id
+        : typeof value.strongest_alternative_lane_id === "string"
+          ? value.strongest_alternative_lane_id
+          : null,
+    challenge_kind:
+      typeof value.challenge_kind === "string" ? value.challenge_kind : "lane_probe",
     strongest_alternative_lane_id:
       typeof value.strongest_alternative_lane_id === "string"
         ? value.strongest_alternative_lane_id
@@ -219,6 +233,30 @@ function competitionTrace(value: unknown): CompetitionTrace | null {
       typeof value.alternative_search_status === "string"
         ? value.alternative_search_status
         : "not_searched",
+    competition_requirement:
+      typeof value.competition_requirement === "string"
+        ? value.competition_requirement
+        : "not_evaluated",
+    competition_status:
+      typeof value.competition_status === "string"
+        ? value.competition_status
+        : "not_evaluated",
+    competition_type:
+      typeof value.competition_type === "string"
+        ? value.competition_type
+        : "not_evaluated",
+    competition_axes: stringList(value.competition_axes),
+    scope_assessment_status:
+      typeof value.scope_assessment_status === "string"
+        ? value.scope_assessment_status
+        : "not_evaluated",
+    competition_failure_reason:
+      typeof value.competition_failure_reason === "string"
+        ? value.competition_failure_reason
+        : null,
+    candidate_lineage: Array.isArray(value.candidate_lineage)
+      ? value.candidate_lineage.filter(isRecord)
+      : [],
     challenge_round_count:
       typeof value.challenge_round_count === "number" ? value.challenge_round_count : 0,
     resolution_evidence_ids: stringList(value.resolution_evidence_ids),

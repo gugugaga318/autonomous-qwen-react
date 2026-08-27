@@ -20,6 +20,7 @@ class CausalClaimStatus(StrEnum):
     """Status of one Python-owned claim in a causal evidence matrix."""
 
     SUPPORTED = "supported"
+    PLAUSIBLE = "plausible"
     INCOMPLETE = "incomplete"
     CONFLICTED = "conflicted"
     UNAVAILABLE = "unavailable"
@@ -45,6 +46,8 @@ class MechanismSupportSource(StrEnum):
 
     RULE = "rule"
     APPROVED_KNOWLEDGE = "approved_knowledge"
+    OBSERVED_INTERMEDIATE = "observed_intermediate"
+    EMPIRICAL_DISCRIMINATION = "empirical_discrimination"
     EMPIRICAL_CONVERGENCE = "empirical_convergence"
     LLM_EXPLANATION_ONLY = "llm_explanation_only"
 

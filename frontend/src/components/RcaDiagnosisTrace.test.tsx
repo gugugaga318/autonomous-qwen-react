@@ -174,6 +174,9 @@ function stateFixture(): RCAState {
     candidate_challenges: [
       {
         candidate_id: "C1",
+        alternative_candidate_id: "C2",
+        evidence_probe_lane_id: "LANE_PRESSURE",
+        challenge_kind: "scope",
         strongest_alternative_lane_id: "LANE_PRESSURE",
         supporting_evidence_ids: ["EV_PROCESS"],
         contradicting_evidence_ids: [],
@@ -193,6 +196,11 @@ function stateFixture(): RCAState {
       blocked_lane_ids: [],
       lane_resolutions: [],
       alternative_search_status: "unresolved",
+      competition_requirement: "scope_required",
+      competition_status: "failed",
+      competition_type: "scope",
+      competition_failure_reason: "scope_hypothesis_collapsed",
+      candidate_lineage: [],
       challenge_round_count: 1,
       resolution_evidence_ids: [],
     },
@@ -223,8 +231,9 @@ describe("RcaDiagnosisTrace", () => {
     expect(html).toContain("Candidate 2");
     expect(html).toContain("Alternative recipe excursion");
     expect(html).toContain("candidate exposure ∩ process excursion window");
-    expect(html).toContain("Causal Lane Competition");
+    expect(html).toContain("Candidate &amp; Lane Competition");
     expect(html).toContain("LANE_PRESSURE");
+    expect(html).toContain("scope_hypothesis_collapsed");
     expect(html).toContain("Unexplained precursor Evidence");
     expect(html).toContain("unresolved");
   });

@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Self
 
+from yield_rca_core.causal_investigation_models import ActionValueAssessment
+
 
 class InvestigationValidationError(ValueError):
     """Raised when a controlled investigation contract is invalid."""
@@ -169,6 +171,7 @@ class StopReason(StrEnum):
     GOAL_SATISFIED = "goal_satisfied"
     CRITICAL_CONTRADICTION = "critical_contradiction"
     NO_ALLOWED_ACTION = "no_allowed_action"
+    NO_HIGH_VALUE_ACTION = "no_high_value_action"
     BUDGET_EXHAUSTED = "budget_exhausted"
     DATA_UNAVAILABLE = "data_unavailable"
 
@@ -1319,6 +1322,7 @@ class PlannerDecisionOutcome:
     raw_question_update_count: int = 0
     decision_proposed_by: str = "qwen"
     question_updates_source: str | None = None
+    action_value_assessments: list[ActionValueAssessment] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not isinstance(self.decision, PlannerDecision):
@@ -1349,6 +1353,13 @@ class PlannerDecisionOutcome:
         if not isinstance(self.question_update_reviews, list):
             raise InvestigationValidationError(
                 "question_update_reviews must be a list"
+            )
+        if not isinstance(self.action_value_assessments, list) or any(
+            not isinstance(item, ActionValueAssessment)
+            for item in self.action_value_assessments
+        ):
+            raise InvestigationValidationError(
+                "action_value_assessments must contain ActionValueAssessment instances"
             )
         accepted_question_ids: list[str] = []
         for review in self.question_update_reviews:
@@ -1383,6 +1394,9 @@ class PlannerDecisionOutcome:
             "raw_question_update_count": self.raw_question_update_count,
             "decision_proposed_by": self.decision_proposed_by,
             "question_updates_source": self.question_updates_source,
+            "action_value_assessments": [
+                item.to_dict() for item in self.action_value_assessments
+            ],
         }
 
     @classmethod
@@ -1394,7 +1408,11 @@ class PlannerDecisionOutcome:
                 "question_update_reviews",
                 "raw_question_update_count",
             },
-            optional={"decision_proposed_by", "question_updates_source"},
+            optional={
+                "decision_proposed_by",
+                "question_updates_source",
+                "action_value_assessments",
+            },
             name="PlannerDecisionOutcome",
         )
         raw_reviews = payload["question_update_reviews"]
@@ -1410,6 +1428,10 @@ class PlannerDecisionOutcome:
             raw_question_update_count=payload["raw_question_update_count"],
             decision_proposed_by=payload.get("decision_proposed_by", "qwen"),
             question_updates_source=payload.get("question_updates_source"),
+            action_value_assessments=[
+                ActionValueAssessment.from_dict(item)
+                for item in payload.get("action_value_assessments", [])
+            ],
         )
 
 

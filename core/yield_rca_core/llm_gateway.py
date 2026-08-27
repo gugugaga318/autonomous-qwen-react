@@ -158,6 +158,44 @@ class LLMClient(Protocol):
     def complete_json(self, request: LLMRequest) -> LLMResponse: ...
 
 
+def llm_calls_remaining(client: LLMClient) -> int | None:
+    """Return a wrapper-advertised call budget without extending LLMClient.
+
+    Production/provider clients are intentionally not required to expose a
+    budget.  Evaluation wrappers may expose either ``remaining_calls`` or the
+    existing ``max_calls``/``call_count`` pair.  Unknown budgets return ``None``
+    and preserve the normal provider behavior.
+    """
+
+    raw_remaining = getattr(client, "remaining_calls", None)
+    if isinstance(raw_remaining, int) and not isinstance(raw_remaining, bool):
+        return max(0, raw_remaining)
+    raw_max = getattr(client, "max_calls", None)
+    raw_count = getattr(client, "call_count", None)
+    if (
+        isinstance(raw_max, int)
+        and not isinstance(raw_max, bool)
+        and isinstance(raw_count, int)
+        and not isinstance(raw_count, bool)
+    ):
+        return max(0, raw_max - raw_count)
+    return None
+
+
+def llm_call_budget_available(
+    client: LLMClient,
+    *,
+    required_calls: int = 1,
+    reserve_calls: int = 0,
+) -> bool:
+    """Check an optional bounded-client budget without consuming a call."""
+
+    if required_calls < 0 or reserve_calls < 0:
+        raise ValueError("required_calls and reserve_calls must be non-negative")
+    remaining = llm_calls_remaining(client)
+    return remaining is None or remaining >= required_calls + reserve_calls
+
+
 _USAGE_SINK: ContextVar[list[LLMUsageEvent] | None] = ContextVar(
     "yield_rca_llm_usage_sink",
     default=None,

@@ -11,6 +11,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from yield_rca_core.causal_competition import (
+    build_candidate_competition_brief,
+    select_diverse_lane_ids,
+)
+from yield_rca_core.causal_lane_lifecycle import lane_is_searchable
 from yield_rca_core.evidence_models import Evidence, EvidenceType
 
 _EXPOSURE_TYPES = {
@@ -66,11 +71,24 @@ _METADATA_ALLOWLIST = frozenset(
         "minimum_baseline_samples",
         "ooc_count",
         "operation_no",
+        "operation_name",
+        "module",
+        "process_module",
         "parameter_name",
         "parameter_names",
         "pattern_counts",
         "processing_window",
         "recipe_id",
+        "row_count",
+        "wafer_count",
+        "wat_fail_count",
+        "wat_fail_lot_count",
+        "wat_fail_record_count",
+        "defect_type",
+        "defect_description",
+        "fail_mode",
+        "outcome_name",
+        "engineering_description",
         "required_for_confirmation",
         "source_lot_id",
         "target_row_count",
@@ -123,6 +141,8 @@ _GLOBAL_FACT_GROUPS = (
 )
 _MAX_ACTIVE_LANES = 3
 _MAX_FACTS_PER_GROUP = 8
+_MAX_PROMPT_IDS_PER_ENTITY_TYPE = 4
+_PROMPT_FACT_TEXT_LENGTH = 280
 
 
 def _bounded_text(value: object) -> str | None:
@@ -201,6 +221,165 @@ def compact_evidence_record(item: Evidence) -> dict[str, Any]:
     return record
 
 
+def compact_evidence_prompt_card(item: Evidence) -> dict[str, Any]:
+    """Return one low-duplication Evidence card for RCA model prompts.
+
+    Python continues to retain the complete immutable Evidence object.  The
+    card exposes objective typed fields needed for reasoning without copying
+    arbitrary metadata or every entity attribute into multiple prompt blocks.
+    """
+
+    ids_by_type: dict[str, list[str]] = {}
+    emitted_entity_count = 0
+    for entity in item.entities:
+        values = ids_by_type.setdefault(str(entity.entity_type), [])
+        entity_id = str(entity.entity_id).strip()
+        if (
+            entity_id
+            and entity_id not in values
+            and len(values) < _MAX_PROMPT_IDS_PER_ENTITY_TYPE
+        ):
+            values.append(entity_id)
+            emitted_entity_count += 1
+    fact = " ".join((item.observation or item.summary).split())
+    if len(fact) > _PROMPT_FACT_TEXT_LENGTH:
+        fact = fact[: _PROMPT_FACT_TEXT_LENGTH - 1].rstrip() + "…"
+    card: dict[str, Any] = {
+        "evidence_id": item.evidence_id,
+        "evidence_type": item.evidence_type,
+        "source": {
+            "agent": item.source_agent,
+            "tool": item.source_tool,
+            "field": item.source_field,
+        },
+        "fact": fact,
+        "entity_ids_by_type": ids_by_type,
+    }
+    if item.timestamp:
+        card["timestamp"] = item.timestamp
+    prompt_metadata_keys = (
+        "direction",
+        "magnitude",
+        "excursion_start",
+        "excursion_end",
+        "processing_window",
+        "parameter_name",
+        "outcome_name",
+        "validation_status",
+        "required_for_confirmation",
+    )
+    details = {
+        key: _bounded_value(item.metadata[key])
+        for key in prompt_metadata_keys
+        if key in item.metadata
+    }
+    if details:
+        card["typed_details"] = details
+    card["projection_audit"] = {
+        "omitted_entity_count": max(0, len(item.entities) - emitted_entity_count),
+        "omitted_metadata_count": max(0, len(item.metadata) - len(details)),
+    }
+    return card
+
+
+def compact_lane_first_synthesis_for_prompt(
+    synthesis: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project Lane synthesis to identities, counts, and traceable IDs only."""
+
+    lane_keys = (
+        "lane_id",
+        "operation",
+        "operation_name",
+        "module",
+        "equipment",
+        "chamber",
+        "recipe",
+        "parameter_scope",
+        "exposed_lot_ids",
+        "time_window",
+        "priority_score",
+        "lifecycle_status",
+    )
+    compact_lanes: list[dict[str, Any]] = []
+    raw_lanes = synthesis.get("active_causal_lanes", [])
+    if isinstance(raw_lanes, Sequence) and not isinstance(raw_lanes, str | bytes):
+        for raw_lane in raw_lanes:
+            if not isinstance(raw_lane, Mapping):
+                continue
+            raw_facts = raw_lane.get("facts", {})
+            evidence_ids_by_group: dict[str, list[str]] = {}
+            if isinstance(raw_facts, Mapping):
+                for group, facts in raw_facts.items():
+                    if not isinstance(facts, Sequence) or isinstance(facts, str | bytes):
+                        continue
+                    evidence_ids_by_group[str(group)] = [
+                        str(fact.get("evidence_id"))
+                        for fact in facts
+                        if isinstance(fact, Mapping)
+                        and str(fact.get("evidence_id", "")).strip()
+                    ]
+            compact_lanes.append(
+                {
+                    **{
+                        key: _bounded_value(raw_lane[key])
+                        for key in lane_keys
+                        if key in raw_lane
+                    },
+                    "evidence_ids_by_group": evidence_ids_by_group,
+                    # Compatibility shape retained with ID-only records.  The
+                    # full fact card lives once in typed_evidence_register.
+                    "facts": {
+                        group: [
+                            {"evidence_id": evidence_id}
+                            for evidence_id in evidence_ids
+                        ]
+                        for group, evidence_ids in evidence_ids_by_group.items()
+                    },
+                    "fact_counts": dict(raw_lane.get("fact_counts", {})),
+                    "facts_omitted": dict(raw_lane.get("facts_omitted", {})),
+                }
+            )
+    raw_global = synthesis.get("global_facts", {})
+    global_evidence_ids_by_group: dict[str, list[str]] = {}
+    if isinstance(raw_global, Mapping):
+        for group, facts in raw_global.items():
+            if not isinstance(facts, Sequence) or isinstance(facts, str | bytes):
+                continue
+            global_evidence_ids_by_group[str(group)] = [
+                str(fact.get("evidence_id"))
+                for fact in facts
+                if isinstance(fact, Mapping)
+                and str(fact.get("evidence_id", "")).strip()
+            ]
+    return {
+        "schema": "lane_first_v1",
+        "prompt_projection_version": "compact_v1",
+        "evidence_count": synthesis.get("evidence_count", 0),
+        "group_counts": dict(synthesis.get("group_counts", {})),
+        "active_lane_count": len(compact_lanes),
+        "active_causal_lanes": compact_lanes,
+        "global_evidence_ids_by_group": global_evidence_ids_by_group,
+        "global_facts": {
+            group: [
+                {"evidence_id": evidence_id}
+                for evidence_id in evidence_ids
+            ]
+            for group, evidence_ids in global_evidence_ids_by_group.items()
+        },
+        "global_fact_counts": dict(synthesis.get("global_fact_counts", {})),
+        "global_facts_omitted": dict(synthesis.get("global_facts_omitted", {})),
+        "mechanism_bridge_inputs": dict(
+            synthesis.get("mechanism_bridge_inputs", {})
+        ),
+        "candidate_competition": dict(
+            synthesis.get("candidate_competition", {})
+        ),
+        "prompt_evidence_ids": list(synthesis.get("prompt_evidence_ids", [])),
+        "synthesis_note": synthesis.get("synthesis_note"),
+    }
+
+
 def _record(item: Evidence) -> dict[str, Any]:
     """Return only objective, JSON-safe fields from one Evidence item."""
 
@@ -256,6 +435,8 @@ def _lane_projection(lane: Mapping[str, Any]) -> dict[str, Any]:
     projected: dict[str, Any] = {
         "lane_id": str(lane.get("lane_id", "")).strip(),
         "operation": str(lane.get("operation", "")).strip(),
+        "operation_name": str(lane.get("operation_name", "")).strip(),
+        "module": str(lane.get("module", "")).strip(),
         "equipment": str(lane.get("equipment", "")).strip(),
         "chamber": str(lane.get("chamber", "")).strip(),
         "recipe": str(lane.get("recipe", "")).strip(),
@@ -267,6 +448,7 @@ def _lane_projection(lane: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "priority_score": float(lane.get("priority_score", 0.0) or 0.0),
         "investigation_status": str(lane.get("investigation_status", "")).strip(),
+        "lifecycle_status": str(lane.get("lifecycle_status", "")).strip(),
     }
     if len(projected["parameter_scope"]) > _MAX_SEQUENCE_ITEMS:
         projected["parameter_scope_count"] = len(projected["parameter_scope"])
@@ -288,19 +470,16 @@ def _active_lane_projections(
         if lane_id:
             unique[lane_id] = (index, lane)
     eligible = [
-        (index, lane)
-        for index, lane in unique.values()
-        if str(lane.get("investigation_status", "")) not in {"eliminated", "blocked"}
+        lane
+        for _, lane in unique.values()
+        if lane_is_searchable(lane)
     ]
-    ordered = sorted(
+    selected_ids = select_diverse_lane_ids(
         eligible,
-        key=lambda value: (
-            -float(value[1].get("priority_score", 0.0) or 0.0),
-            value[0],
-            str(value[1].get("lane_id", "")),
-        ),
+        limit=max_active_lanes,
     )
-    return [_lane_projection(lane) for _, lane in ordered[:max_active_lanes]]
+    by_id = {str(lane.get("lane_id", "")): lane for lane in eligible}
+    return [_lane_projection(by_id[lane_id]) for lane_id in selected_ids]
 
 
 def _entity_scope(item: Evidence) -> dict[str, set[str]]:
@@ -382,6 +561,33 @@ def _fact_counts(
     return counts
 
 
+def _enrich_lane_semantics_from_evidence(
+    causal_lanes: Sequence[Mapping[str, Any]],
+    evidence: Sequence[Evidence],
+) -> list[dict[str, Any]]:
+    """Recover losslessly projected Lane labels for legacy serialized State."""
+
+    semantic_by_lane_id: dict[str, Mapping[str, Any]] = {}
+    for item in evidence:
+        raw_lane = item.metadata.get("lane")
+        if not isinstance(raw_lane, Mapping):
+            continue
+        lane_id = str(raw_lane.get("lane_id", "")).strip()
+        if lane_id:
+            semantic_by_lane_id.setdefault(lane_id, raw_lane)
+    enriched: list[dict[str, Any]] = []
+    for raw_lane in causal_lanes:
+        lane = dict(raw_lane)
+        semantic = semantic_by_lane_id.get(str(lane.get("lane_id", "")).strip(), {})
+        for field in ("operation_name", "module"):
+            if not str(lane.get(field, "")).strip() and str(
+                semantic.get(field, "")
+            ).strip():
+                lane[field] = str(semantic[field]).strip()
+        enriched.append(lane)
+    return enriched
+
+
 def build_lane_first_evidence_synthesis(
     evidence: Iterable[Evidence],
     causal_lanes: Sequence[Mapping[str, Any]],
@@ -405,8 +611,12 @@ def build_lane_first_evidence_synthesis(
         if isinstance(item, Evidence) and item.is_typed
     }
     evidence_items = list(unique.values())
-    active_lanes = _active_lane_projections(
+    enriched_causal_lanes = _enrich_lane_semantics_from_evidence(
         causal_lanes,
+        evidence_items,
+    )
+    active_lanes = _active_lane_projections(
+        enriched_causal_lanes,
         max_active_lanes=max_active_lanes,
     )
     emitted_ids: set[str] = set()
@@ -478,6 +688,10 @@ def build_lane_first_evidence_synthesis(
                 emitted_ids.add(item.evidence_id)
 
     grouped = build_evidence_synthesis(evidence_items)
+    global_outcome_evidence_ids = [
+        str(record["evidence_id"])
+        for record in global_facts["outcomes"]
+    ]
     mechanism_bridge_inputs = {
         "by_lane": [
             {
@@ -493,10 +707,7 @@ def build_lane_first_evidence_synthesis(
             }
             for lane in lane_summaries
         ],
-        "global_outcome_evidence_ids": [
-            str(record["evidence_id"])
-            for record in global_facts["outcomes"]
-        ],
+        "global_outcome_evidence_ids": global_outcome_evidence_ids,
         "approved_knowledge_evidence_ids": list(
             dict.fromkeys(
                 [
@@ -515,6 +726,10 @@ def build_lane_first_evidence_synthesis(
             "Python-inferred physical mechanism."
         ),
     }
+    candidate_competition = build_candidate_competition_brief(
+        lane_summaries,
+        global_outcome_evidence_ids=global_outcome_evidence_ids,
+    )
     return {
         "schema": "lane_first_v1",
         "evidence_count": len(evidence_items),
@@ -531,6 +746,7 @@ def build_lane_first_evidence_synthesis(
             for group in _GLOBAL_FACT_GROUPS
         },
         "mechanism_bridge_inputs": mechanism_bridge_inputs,
+        "candidate_competition": candidate_competition,
         "prompt_evidence_ids": sorted(emitted_ids),
         "prompt_evidence_count": len(emitted_ids),
         "omitted_from_prompt_count": max(0, len(evidence_items) - len(emitted_ids)),
@@ -584,5 +800,7 @@ def build_evidence_synthesis(evidence: Iterable[Evidence]) -> dict[str, Any]:
 __all__ = [
     "build_evidence_synthesis",
     "build_lane_first_evidence_synthesis",
+    "compact_evidence_prompt_card",
     "compact_evidence_record",
+    "compact_lane_first_synthesis_for_prompt",
 ]

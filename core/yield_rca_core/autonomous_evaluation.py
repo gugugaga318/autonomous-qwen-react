@@ -502,10 +502,34 @@ def _observation_replanning_ok(
                 return False
             continue
         previous_record = state.action_history[request_index - 1]
-        if history[-1].get("action", {}).get("action_id") != previous_record.action.action_id:
+        prompt_record = history[-1]
+        if prompt_record.get("action", {}).get("action_id") != previous_record.action.action_id:
+            return False
+        projected_evidence_ids = set(
+            prompt_record.get("produced_evidence_ids", [])
+        )
+        previous_evidence_ids = set(previous_record.produced_evidence_ids)
+        if not projected_evidence_ids <= previous_evidence_ids:
+            return False
+        if prompt_record.get("produced_evidence_count") != len(
+            previous_record.produced_evidence_ids
+        ):
+            return False
+        evidence_ids_truncated = bool(
+            prompt_record.get("evidence_ids_truncated", False)
+        )
+        if evidence_ids_truncated != (
+            len(projected_evidence_ids) < len(previous_evidence_ids)
+        ):
             return False
         available_evidence_ids = set(request.payload.get("available_evidence_ids", []))
-        if not set(previous_record.produced_evidence_ids) <= available_evidence_ids:
+        if not available_evidence_ids <= {
+            item.evidence_id for item in state.evidence
+        }:
+            return False
+        if previous_evidence_ids and not (
+            previous_evidence_ids & available_evidence_ids
+        ):
             return False
         finding_ids = {
             finding.get("finding_id")

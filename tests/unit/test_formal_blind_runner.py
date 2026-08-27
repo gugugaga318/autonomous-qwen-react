@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from run_formal_blind_rca import (  # noqa: E402
+    _decision_critical_unavailable_evidence_ids,
     _execution_layer,
     _strict_qwen_acceptance_reasons,
 )
@@ -140,6 +141,79 @@ def test_strict_qwen_rejects_unproven_data_unavailable_stop() -> None:
     assert "python_runtime_stop_not_governed" in reasons
 
 
+def test_strict_qwen_accepts_competition_governed_data_unavailable_stop() -> None:
+    result = {
+        **clean_result(),
+        "planner_stop_proposed_by": "python_runtime",
+        "planner_stop_reason": "data_unavailable",
+        "conclusion_status": "insufficient_evidence",
+        "required_unavailable_evidence_ids": [],
+        "decision_critical_unavailable_evidence_ids": ["EV_SCOPED_FDC_MISSING"],
+        "competition_status": "blocked_by_missing_data",
+        "competition_terminal_reason": (
+            "no_high_value_action_after_required_source_unavailable"
+        ),
+        "competition_lifecycle_valid": True,
+        "investigation_decision_accepted": True,
+    }
+
+    assert _strict_qwen_acceptance_reasons(
+        result,
+        requested_mode="llm_react",
+        agent_mode="llm",
+    ) == []
+
+
+def test_strict_qwen_rejects_unproven_competition_missing_data_stop() -> None:
+    result = {
+        **clean_result(),
+        "planner_stop_proposed_by": "python_runtime",
+        "planner_stop_reason": "data_unavailable",
+        "conclusion_status": "insufficient_evidence",
+        "required_unavailable_evidence_ids": [],
+        "decision_critical_unavailable_evidence_ids": [],
+        "competition_status": "blocked_by_missing_data",
+        "competition_terminal_reason": (
+            "no_high_value_action_after_required_source_unavailable"
+        ),
+        "competition_lifecycle_valid": True,
+        "investigation_decision_accepted": True,
+    }
+
+    reasons = _strict_qwen_acceptance_reasons(
+        result,
+        requested_mode="llm_react",
+        agent_mode="llm",
+    )
+
+    assert "python_runtime_stop_not_governed" in reasons
+
+
+def test_decision_critical_missing_projection_requires_typed_blocked_evidence() -> None:
+    result = _decision_critical_unavailable_evidence_ids(
+        competition_trace={
+            "resolution_evidence_ids": ["EV_CONTEXT"],
+            "lane_resolutions": [
+                {
+                    "status": "blocked",
+                    "evidence_ids": ["EV_CONTEXT", "EV_SCOPED_FDC_MISSING"],
+                },
+                {
+                    "status": "unresolved",
+                    "evidence_ids": ["EV_UNRELATED_MISSING"],
+                },
+            ],
+        },
+        rca_details={"blocking_data_missing_evidence_ids": []},
+        data_missing_evidence_ids={
+            "EV_SCOPED_FDC_MISSING",
+            "EV_UNRELATED_MISSING",
+        },
+    )
+
+    assert result == ["EV_SCOPED_FDC_MISSING"]
+
+
 def test_strict_qwen_is_not_applied_to_non_real_qwen_configuration() -> None:
     assert _strict_qwen_acceptance_reasons(
         {"error": "failed"},
@@ -183,3 +257,57 @@ def test_execution_layer_reports_governed_python_stop_separately() -> None:
     assert layer["qwen_stop_proposal_count"] == 0
     assert layer["governed_python_stop_count"] == 1
     assert layer["governed_python_stop_rate"] == 1.0
+
+
+def test_execution_layer_keeps_candidate_competition_semantics_separate() -> None:
+    accepted = {
+        **clean_result(),
+        "workflow_completed": True,
+        "strict_qwen_accepted": True,
+        "competition_status": "complete_confirmed",
+        "execution_accepted": True,
+        "competition_lifecycle_valid": True,
+        "investigation_decision_accepted": True,
+        "root_cause_confirmed": True,
+        "qwen_competition_accepted": True,
+    }
+    failed = {
+        **clean_result(),
+        "workflow_completed": True,
+        "strict_qwen_accepted": True,
+        "competition_status": "failed",
+        "competition_failure_reason": "alternative_direction_not_generated",
+        "execution_accepted": True,
+        "competition_lifecycle_valid": True,
+        "investigation_decision_accepted": False,
+        "root_cause_confirmed": False,
+        "qwen_competition_accepted": False,
+    }
+
+    layer = _execution_layer([accepted, failed])
+
+    assert layer["strict_qwen_acceptance_rate"] == 1.0
+    assert layer["qwen_competition_evaluated_count"] == 2
+    assert layer["qwen_competition_accepted_count"] == 1
+    assert layer["qwen_competition_acceptance_rate"] == 0.5
+    assert layer["execution_acceptance_rate"] == 1.0
+    assert layer["competition_lifecycle_valid_rate"] == 1.0
+    assert layer["investigation_decision_acceptance_rate"] == 0.5
+    assert layer["root_cause_confirmation_rate"] == 0.5
+
+
+def test_strict_qwen_rejects_active_terminal_competition() -> None:
+    result = {
+        **clean_result(),
+        "competition_lifecycle_valid": False,
+        "investigation_decision_accepted": False,
+    }
+
+    reasons = _strict_qwen_acceptance_reasons(
+        result,
+        requested_mode="llm_react",
+        agent_mode="llm",
+    )
+
+    assert "competition_lifecycle_invalid" in reasons
+    assert "investigation_decision_invalid" in reasons

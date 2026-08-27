@@ -203,10 +203,30 @@ export function RcaDiagnosisTrace({ state }: RcaDiagnosisTraceProps) {
         <section className="causal-competition-panel" aria-labelledby="causal-competition-heading">
           <div className="causal-subheading">
             <GitCompareArrows size={16} aria-hidden="true" />
-            <h3 id="causal-competition-heading">Causal Lane Competition</h3>
-            <StatusPill status={competition?.alternative_search_status ?? "not_searched"} />
+            <h3 id="causal-competition-heading">Candidate &amp; Lane Competition</h3>
+            <StatusPill status={competition?.competition_status ?? "not_evaluated"} />
             <span>{competition?.challenge_round_count ?? 0} challenge round(s)</span>
           </div>
+          {competition && (
+            <div className="causal-comparison-note">
+              <GitCompareArrows size={15} aria-hidden="true" />
+              <div>
+                <strong>
+                  {competition.competition_type} · {competition.competition_requirement}
+                </strong>
+                <span>Lane search: {competition.alternative_search_status}</span>
+                {(competition.competition_axes?.length ?? 0) > 0 && (
+                  <span>Root-cause axes: {competition.competition_axes?.join(", ")}</span>
+                )}
+                <span>
+                  Scope assessment: {competition.scope_assessment_status ?? "not_evaluated"}
+                </span>
+                {competition.competition_failure_reason && (
+                  <span>Competition failure: {competition.competition_failure_reason}</span>
+                )}
+              </div>
+            </div>
+          )}
           {diagnosis.causal_lanes.length > 0 && (
             <div className="causal-lane-list">
               {diagnosis.causal_lanes.map((lane) => (
@@ -216,7 +236,7 @@ export function RcaDiagnosisTrace({ state }: RcaDiagnosisTraceProps) {
                     <StatusPill status={lane.investigation_status} />
                   </div>
                   <p>
-                    {[lane.operation, lane.equipment, lane.chamber, lane.recipe]
+                    {[lane.module, lane.operation_name, lane.operation, lane.equipment, lane.chamber, lane.recipe]
                       .filter(Boolean)
                       .join(" · ") || "Lane context unavailable"}
                   </p>
@@ -237,6 +257,15 @@ export function RcaDiagnosisTrace({ state }: RcaDiagnosisTraceProps) {
                     <StatusPill status={challenge.status} />
                   </div>
                   <p>{challenge.challenge_explanation}</p>
+                  {challenge.alternative_candidate_id && (
+                    <span>
+                      Alternative candidate: {challenge.alternative_candidate_id}
+                    </span>
+                  )}
+                  <span>Challenge kind: {challenge.challenge_kind}</span>
+                  {challenge.evidence_probe_lane_id && (
+                    <span>Evidence probe Lane: {challenge.evidence_probe_lane_id}</span>
+                  )}
                   {challenge.strongest_alternative_lane_id && (
                     <span>Strongest alternative: {challenge.strongest_alternative_lane_id}</span>
                   )}

@@ -67,17 +67,29 @@ For an act decision:
 - `causal_evidence_gaps` contains only gaps from the current authoritative RCA
   Finding. `legal_causal_gap_ids_by_action` is Python-derived. When one Action
   can fill several gaps, choose the most discriminating listed Gap by copying
-  exactly one permitted `causal_gap_id` into next_action.scope. If you omit it,
-  Python binds the first legal Gap deterministically. Never invent a Gap ID.
+  exactly one permitted `causal_gap_id` into next_action.scope. Python may bind
+  the scope automatically only when exactly one legal Gap exists for that
+  Action. When several legal Gaps exist, omitting the Gap or inventing a Gap ID
+  is invalid; Python will not choose one on your behalf.
 - Gaps are ordered by Python priority: blocking data missing first,
   `hypothesis_discrimination` second, contradiction resolution third, and ordinary
-  missing support last. When `alternative_search_status` is `not_searched`,
+  missing support last. Priority is applied after current executability is
+  checked, so a blocked or unbound high-priority Gap does not hide a lower-priority
+  Gap that can still collect discriminating Evidence. When
+  `alternative_search_status` is `not_searched`,
   `alternative_found`, or `unresolved`, do not keep strengthening only the top
   candidate; choose a legal Action that can distinguish the competing causal
   Lane or candidate. One Qwen candidate is not proof that no alternative exists.
 - `candidate_challenges` and `alternative_search_status` are audit context owned
   by Python. You may explain or select a Python-generated discrimination Gap, but
   you cannot mark alternatives eliminated or make the final conclusion supported.
+- `action_value_assessments` contains only Python-approved high-value options.
+  Python has already checked exact Candidate/Lane/Gap/discriminator/Action/source/
+  scope history, source availability, decision impact, and remaining budget.
+  Choose among these options; do not revive an omitted low-value or exhausted
+  direction. Python stops when zero high-value options remain and directly selects
+  the option when exactly one remains, so a Qwen planning call represents a real
+  choice among multiple decision-relevant options.
 
 For every open Question, use the supplied `question_context` as the investigation
 ledger. It contains the Question scope, compatible Actions, linked Evidence grouped
@@ -93,6 +105,14 @@ For a stop decision:
 - Set next_action to null and target_question_ids to [].
 - Use a terminal goal_status and one stop_reason: goal_satisfied,
   critical_contradiction, no_allowed_action, budget_exhausted, or data_unavailable.
+- The pair is exact: goal_satisfied requires `satisfied`; budget_exhausted
+  requires `budget_exhausted`; critical_contradiction, no_allowed_action, and
+  data_unavailable require `blocked`.
+- `no_allowed_action` is legal only when
+  `legal_target_question_ids_by_action` is empty. A critical_contradiction stop
+  is legal only when `critical_contradictions` contains a Python-supplied item.
+  Data unavailability must be backed by typed unavailable Evidence or an
+  authoritative capability notice; a free-text claim is not enough.
 - Do not create new open questions.
 - A goal_satisfied stop is legal only when
   goal_satisfied_stop_contract.executable_causal_gap_ids is empty and either
@@ -136,26 +156,41 @@ invent an unavailable lane, or use Knowledge relevance as root-cause confidence.
 Question updates are terminal deltas: status must be closed or unavailable, never
 open. Do not copy or rewrite goal_id, question, rationale, or scope. When evidence
 only provides partial progress, return question_updates=[] and preserve that
-  progress through Findings and Evidence. An act decision cannot update a question
-  and target that same question in target_question_ids.
+progress through Findings and Evidence. Do not terminally update a Question while
+the current authoritative `causal_evidence_gaps` still contains a Gap for that
+Question kind; Python owns that open-state boundary. An act decision cannot update
+a question and target that same question in target_question_ids.
 
-If an attempted Action produced no new `supports` or `contradicts`
-QuestionEvidenceLink for its target Question, it is a no-gain attempt; `context`
-and `unavailable` links are not Evidence Gain. You may change direction after the
-first no-gain observation. Python stops the investigation after two consecutive
-no-gain Actions. Candidate generation is also capped at two rounds, and the same
-candidate + gap + scope Action is single-use.
+Python distinguishes Evidence Gain from Investigation State Gain. New supporting
+or contradicting typed Evidence is Evidence Gain. The first typed `data_missing`,
+unavailable-source, or non-discriminative result for one exact Action scope is
+State Gain because it changes what can still be investigated; it neither supports
+nor rejects a Candidate. Repeating the same result for the same exact Candidate +
+Lane + Gap + discriminator + Action + source + scope is no gain. Never infer that
+a missing source invalidates a Candidate or requires switching to another Lane.
+Python continues only when a remaining Action can change Candidate ranking or the
+Confirmation Gate within budget. A `run_rca_reasoning` refresh is advertised only
+after new supporting or contradicting Evidence exists for its scoped Gap. The
+first two RCA Reasoning rounds retain the normal budget; at most one evidence-gated
+third refresh is permitted, and a fourth round is never legal. The same exact
+scoped Action is single-use.
 
 You may add a new open question only when it directly supports the same Goal.
 Never create more than five total questions. An impact Lot is a result inside the
 current investigation, not a new root-cause objective. Preserve the source Lot in
 the action and question scope; do not recursively investigate each impact Lot.
 
-The budget is a hard boundary. Never act after max_steps or max_tool_calls is
-reached. Do not invent an Agent, Action, Tool, Finding, Evidence, Hypothesis, Lot,
-or observation. You may propose a conclusion level, but the downstream
-Evidence/Hypothesis Gate remains authoritative and may downgrade it.
+The Python-projected budget is a hard boundary. Never act when
+`legal_target_question_ids_by_action` is empty or after max_tool_calls is reached.
+At the normal max_steps boundary, act only when
+`budget.evidence_gated_final_reasoning_refresh_available` is true and Python lists
+`run_rca_reasoning` as legal. Do not invent an Agent, Action, Tool, Finding,
+Evidence, Hypothesis, Lot, or observation. You may propose a conclusion level,
+but the downstream Evidence/Hypothesis Gate remains authoritative and may
+downgrade it.
 
 deterministic_planner_decision is a valid Fake Client and fallback reference. It
-is not mandatory for a real model: choose any different allowed action when the
-observations and open questions justify it.
+is not mandatory for a real model and never overrides
+`legal_target_question_ids_by_action`, `legal_causal_gap_ids_by_action`, or the
+evidence-gated final reasoning refresh flag. Choose a listed legal action when
+those current-state Python projections require further investigation.

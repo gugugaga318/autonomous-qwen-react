@@ -616,6 +616,42 @@ def _root_cause_sections(
     return lines + [""] + confidence_lines, evidence_ids
 
 
+def _competition_section(state: RCAState) -> list[str]:
+    trace = state.competition_trace
+    if trace is None:
+        return []
+    lines = [
+        "## Candidate Competition",
+        "",
+        f"- Requirement: `{trace.competition_requirement}`",
+        f"- Candidate Competition Status: `{trace.competition_status}`",
+        f"- Competition Type: `{trace.competition_type}`",
+        "- Competition Axes: "
+        + (
+            ", ".join(f"`{item}`" for item in trace.competition_axes)
+            if trace.competition_axes
+            else "Not evaluated"
+        ),
+        f"- Scope Assessment Status: `{trace.scope_assessment_status}`",
+        f"- Lane Search Status: `{trace.alternative_search_status}`",
+    ]
+    if trace.competition_failure_reason is not None:
+        lines.append(
+            f"- Competition Failure: `{trace.competition_failure_reason}`"
+        )
+    if trace.candidate_lineage:
+        lines.extend(["", "### Candidate Lineage", ""])
+        for item in trace.candidate_lineage:
+            status = str(item.get("lineage_status", "unavailable"))
+            root_cause = str(
+                item.get("root_cause")
+                or item.get("prior_root_cause")
+                or "Not available"
+            )
+            lines.append(f"- `{status}`: {root_cause}")
+    return lines
+
+
 def _action_section(actions: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     lines = ["## Recommended Actions", ""]
     cited: list[str] = []
@@ -948,6 +984,9 @@ class ReportGenerator:
         sections.append(spc_section)
         root_sections, root_citations = _root_cause_sections(rca_finding)
         sections.append(root_sections)
+        competition_section = _competition_section(state)
+        if competition_section:
+            sections.append(competition_section)
         if improvement_finding is not None:
             improvement_sections, action_citations = _improvement_sections(improvement_finding)
             sections.extend(improvement_sections)

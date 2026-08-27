@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -9,20 +10,40 @@ from typing import Any
 
 from yield_rca_core.causal_evidence_matrix import build_causal_evidence_matrix
 from yield_rca_core.causal_hypothesis import CausalHypothesis
+from yield_rca_core.causal_investigation_models import (
+    CandidateCompetitionStatus,
+    CandidateCompetitionType,
+    CandidateDistinguishingPrediction,
+    CandidateMechanismRelation,
+    CandidateScopeRelation,
+    CandidateSemanticProfile,
+    CompetitionFailureReason,
+    CompetitionGapReason,
+    CompetitionRequirement,
+)
 from yield_rca_core.evidence_models import EntityType, Evidence, EvidenceType
 from yield_rca_core.evidence_synthesis import (
     build_lane_first_evidence_synthesis,
+    compact_evidence_prompt_card,
     compact_evidence_record,
+    compact_lane_first_synthesis_for_prompt,
 )
 from yield_rca_core.llm_gateway import (
     LLMClient,
     LLMOutputValidationError,
     LLMRequest,
+    llm_call_budget_available,
 )
 from yield_rca_core.models import AgentFinding, AgentKind, ModelValidationError
 
 _OUTPUT_ATTEMPTS = 2
 _MAX_CANDIDATES = 2
+_MAX_PROMPT_EVIDENCE = 56
+_MAX_RECENT_EVIDENCE = 16
+_MAX_PRIOR_CANDIDATE_EVIDENCE = 12
+_MAX_CHALLENGE_EVIDENCE = 8
+_TARGET_PROMPT_PAYLOAD_CHARS = 52_000
+_MAX_PROMPT_PAYLOAD_CHARS = 64_000
 _NON_SUPPORTING_TYPES = {
     EvidenceType.DATA_MISSING.value,
     EvidenceType.NEGATIVE_SIGNAL.value,
@@ -54,6 +75,107 @@ _PRODUCT_TYPES = {
 }
 _DUPLICATE_EVIDENCE_OVERLAP_THRESHOLD = 0.75
 _DUPLICATE_MECHANISM_SIMILARITY_THRESHOLD = 0.65
+
+
+def _evidence_bucket(evidence: Evidence) -> str:
+    if evidence.evidence_type in _PROCESS_TYPES:
+        return "process"
+    if evidence.evidence_type in _PRODUCT_TYPES:
+        return "product"
+    if evidence.evidence_type in _EXPOSURE_TYPES:
+        return "exposure"
+    if evidence.evidence_type in _KNOWLEDGE_MECHANISM_TYPES:
+        return "knowledge"
+    if evidence.evidence_type == EvidenceType.DATA_MISSING.value:
+        return "data_missing"
+    return "other"
+
+
+def _diverse_bounded_ids(
+    evidence_ids: Sequence[str],
+    *,
+    evidence_by_id: Mapping[str, Evidence],
+    limit: int,
+) -> list[str]:
+    """Select a deterministic typed-Evidence cross-section without inference."""
+
+    buckets: dict[str, list[str]] = {
+        key: []
+        for key in (
+            "process",
+            "product",
+            "exposure",
+            "knowledge",
+            "data_missing",
+            "other",
+        )
+    }
+    for evidence_id in dict.fromkeys(str(item) for item in evidence_ids):
+        evidence = evidence_by_id.get(evidence_id)
+        if evidence is not None:
+            buckets[_evidence_bucket(evidence)].append(evidence_id)
+    selected: list[str] = []
+    while len(selected) < limit and any(buckets.values()):
+        for bucket in buckets.values():
+            if bucket and len(selected) < limit:
+                selected.append(bucket.pop(0))
+    return selected
+
+
+def _bounded_prompt_evidence_ids(
+    *,
+    evidence_by_id: Mapping[str, Evidence],
+    synthesis_ids: Sequence[str],
+    recent_ids: Sequence[str],
+    prior_candidate_ids: Sequence[str],
+    challenge_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Apply one hard bound to every Candidate Generator prompt round.
+
+    Recent Action Evidence is deliberately reserved space, but a first-round
+    ``new_evidence_ids_since_prior`` list can never reopen the full register.
+    The remaining slots are filled from Python's already bounded Lane-first
+    synthesis and traceable prior Candidate/Challenge references.
+    """
+
+    ordered_groups = (
+        _diverse_bounded_ids(
+            recent_ids,
+            evidence_by_id=evidence_by_id,
+            limit=_MAX_RECENT_EVIDENCE,
+        ),
+        _diverse_bounded_ids(
+            prior_candidate_ids,
+            evidence_by_id=evidence_by_id,
+            limit=_MAX_PRIOR_CANDIDATE_EVIDENCE,
+        ),
+        _diverse_bounded_ids(
+            challenge_ids,
+            evidence_by_id=evidence_by_id,
+            limit=_MAX_CHALLENGE_EVIDENCE,
+        ),
+        _diverse_bounded_ids(
+            synthesis_ids,
+            evidence_by_id=evidence_by_id,
+            limit=_MAX_PROMPT_EVIDENCE,
+        ),
+    )
+    selected: list[str] = []
+    for group in ordered_groups:
+        for evidence_id in group:
+            if evidence_id not in selected:
+                selected.append(evidence_id)
+                if len(selected) == _MAX_PROMPT_EVIDENCE:
+                    return tuple(selected)
+    if selected:
+        return tuple(selected)
+    return tuple(
+        _diverse_bounded_ids(
+            list(evidence_by_id),
+            evidence_by_id=evidence_by_id,
+            limit=_MAX_PROMPT_EVIDENCE,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -118,7 +240,18 @@ class HypothesisCandidateGeneration:
     analysis_summary: str = ""
     targeted_investigation_results: tuple[dict[str, Any], ...] = ()
     competition_repair_exhausted: bool = False
+    competition_repair_skipped_due_to_budget: bool = False
     rejected_candidates: tuple[dict[str, Any], ...] = ()
+    competition_requirement: str = CompetitionRequirement.NOT_EVALUATED.value
+    competition_status: str = CandidateCompetitionStatus.NOT_EVALUATED.value
+    competition_type: str = CandidateCompetitionType.NOT_EVALUATED.value
+    competition_failure_reason: str | None = None
+    competition_gap_reason: str | None = None
+    competition_assessment: dict[str, Any] | None = None
+    candidate_semantic_profiles: tuple[CandidateSemanticProfile, ...] = ()
+    semantic_validation_errors: tuple[str, ...] = ()
+    candidate_lineage: tuple[dict[str, Any], ...] = ()
+    evidence_synthesis: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -163,10 +296,22 @@ def _evidence_register(
         }
     )
     return [
-        compact_evidence_record(evidence)
+        compact_evidence_prompt_card(evidence)
         for evidence_id, evidence in evidence_by_id.items()
         if allowed_evidence_ids is None or evidence_id in allowed_evidence_ids
     ]
+
+
+def _payload_char_count(payload: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
 
 
 def _eligible_evidence_ids_by_lane(
@@ -409,10 +554,17 @@ def _overlap_coefficient(left: set[str], right: set[str]) -> float:
     return len(left & right) / min(len(left), len(right))
 
 
-def _candidate_discriminator_gap_ids(
+def _candidate_consumed_discriminator_gap_ids(
     proposal: HypothesisCandidateProposal,
     competition_context: Mapping[str, Any],
 ) -> set[str]:
+    """Return prior discriminator Gaps whose resulting Evidence this proposal cites.
+
+    These IDs describe investigation history.  They are not a whitelist for the
+    next adversarial-challenge round; that whitelist is rebuilt later from the
+    current Python-generated causal Gaps after Candidate IDs are assigned.
+    """
+
     supporting_ids = set(proposal.supporting_evidence_ids)
     return {
         str(item.get("gap_id", "")).strip()
@@ -534,7 +686,7 @@ def _candidate_dedup_signature(
         ),
         discriminator_gap_ids=tuple(
             sorted(
-                _candidate_discriminator_gap_ids(
+                _candidate_consumed_discriminator_gap_ids(
                     proposal,
                     competition_context,
                 )
@@ -666,7 +818,7 @@ def _rejected_candidate_audit(
         "parameter_scope": list(signature.parameter_scope),
         "evidence_ids": list(proposal.supporting_evidence_ids),
         "evidence_types": list(signature.evidence_types),
-        "discriminator_gap_ids": list(signature.discriminator_gap_ids),
+        "consumed_discriminator_gap_ids": list(signature.discriminator_gap_ids),
         "causal_mechanism_tokens": sorted(signature.mechanism_tokens),
         "duplicate_score": assessment.duplicate_score,
         "duplicate_reason": assessment.reason,
@@ -703,6 +855,12 @@ def _normalized_prior_challenge(
     known_ids = set(evidence_by_id)
     return {
         "candidate_id": str(value.get("candidate_id", "")),
+        "alternative_candidate_id": value.get("alternative_candidate_id"),
+        "evidence_probe_lane_id": value.get(
+            "evidence_probe_lane_id",
+            value.get("strongest_alternative_lane_id"),
+        ),
+        "challenge_kind": str(value.get("challenge_kind", "lane_probe")),
         "strongest_alternative_lane_id": value.get(
             "strongest_alternative_lane_id",
             value.get("strongest_alternative"),
@@ -860,11 +1018,11 @@ def _competition_repair_required(
             "targeted_supporting_evidence_ids", []
         )
     }
-    prior_roots = [
+    prior_roots = {
         str(candidate.get("root_cause", "")).strip()
         for candidate in prior_candidates
         if str(candidate.get("root_cause", "")).strip()
-    ]
+    }
     if not targeted_ids or not prior_roots:
         return False
     targeted_proposals = [
@@ -872,17 +1030,649 @@ def _competition_repair_required(
         for proposal in proposals
         if targeted_ids & set(proposal.supporting_evidence_ids)
     ]
-    if len(proposals) >= 2 and targeted_proposals:
-        # Pairwise Lane-aware Dedup already proved that the surviving proposals
-        # differ by causal scope, supporting Evidence, or mechanism.
-        return False
-    return not any(
-        not any(
-            _root_causes_near_duplicate(proposal.root_cause, prior_root)
-            for prior_root in prior_roots
+    if len(proposals) < 2 or not targeted_proposals:
+        return True
+    # Pairwise Lane-aware Dedup already proved that the surviving proposals
+    # differ by causal scope, supporting Evidence, or mechanism.  Requiring two
+    # proposals here prevents a broadened rewrite from silently replacing the
+    # prior candidate after targeted alternative Evidence was collected.
+    return False
+
+
+def _competition_bundle_evidence_ids(bundle: Mapping[str, Any]) -> set[str]:
+    return {
+        str(item)
+        for field in (
+            "shared_exposure_evidence_ids",
+            "process_evidence_ids",
         )
-        for proposal in targeted_proposals
+        for item in bundle.get(field, [])
+        if str(item)
+    }
+
+
+def _candidate_competition_profile(
+    proposal: HypothesisCandidateProposal,
+    *,
+    candidate_index: int,
+    semantic_profile: CandidateSemanticProfile | None = None,
+    evidence_by_id: Mapping[str, Evidence],
+    competition_context: Mapping[str, Any],
+    competition_brief: Mapping[str, Any],
+) -> dict[str, Any]:
+    signature = _candidate_dedup_signature(
+        proposal,
+        evidence_by_id=evidence_by_id,
+        competition_context=competition_context,
     )
+    supporting_ids = set(proposal.supporting_evidence_ids)
+    direction_bundle_ids = [
+        str(bundle.get("bundle_id", ""))
+        for bundle in competition_brief.get("direction_bundles", [])
+        if isinstance(bundle, Mapping)
+        and str(bundle.get("bundle_id", ""))
+        and supporting_ids & _competition_bundle_evidence_ids(bundle)
+    ]
+    return {
+        "candidate_index": candidate_index,
+        "root_cause": proposal.root_cause,
+        "direction_bundle_ids": direction_bundle_ids,
+        "lane_ids": list(signature.lane_ids),
+        "recipes": list(signature.recipes),
+        "parameter_scope": list(signature.parameter_scope),
+        "consumed_discriminator_gap_ids": list(signature.discriminator_gap_ids),
+        "evidence_coverage": {
+            "lane_ids": list(signature.lane_ids),
+            "recipes": list(signature.recipes),
+            "chambers": list(signature.chambers),
+            "parameter_scope": list(signature.parameter_scope),
+            "supporting_evidence_ids": list(signature.supporting_evidence_ids),
+        },
+        "semantic_profile": (
+            semantic_profile.to_dict() if semantic_profile is not None else None
+        ),
+        "scope_relation": (
+            semantic_profile.scope_relation
+            if semantic_profile is not None
+            else CandidateScopeRelation.UNRESOLVED.value
+        ),
+        "primary_mechanism": (
+            semantic_profile.primary_mechanism
+            if semantic_profile is not None
+            else None
+        ),
+        "effect_modifier": (
+            semantic_profile.effect_modifier
+            if semantic_profile is not None
+            else None
+        ),
+        "depends_on_candidate_id": (
+            semantic_profile.depends_on_candidate_id
+            if semantic_profile is not None
+            else None
+        ),
+        "mechanism_relation": (
+            semantic_profile.mechanism_relation
+            if semantic_profile is not None
+            else CandidateMechanismRelation.UNKNOWN.value
+        ),
+        "mechanism_tokens": sorted(signature.mechanism_tokens),
+    }
+
+
+def _prediction_semantic_signature(
+    profile: CandidateSemanticProfile,
+) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+    return tuple(
+        sorted(
+            (
+                prediction.discriminator_kind,
+                tuple(sorted(prediction.lane_ids)),
+                re.sub(r"\s+", " ", prediction.prediction.casefold()).strip(),
+            )
+            for prediction in profile.distinguishing_predictions
+        )
+    )
+
+
+def _scope_semantics_are_distinct(
+    left: CandidateSemanticProfile,
+    right: CandidateSemanticProfile,
+) -> bool:
+    """Require a different causal claim and a falsifiable prediction.
+
+    Comparison scope may be identical or broader than claimed scope. It is not
+    itself evidence that two hypotheses claim the same causal reach. A genuinely
+    different mechanism may also preserve competition within one observed
+    direction, but Python never treats that mechanism text as proof.
+    """
+
+    claimed_scope_distinct = (
+        left.scope_relation != right.scope_relation
+        or set(left.claimed_lane_ids) != set(right.claimed_lane_ids)
+    )
+    predictions_distinct = (
+        bool(left.distinguishing_predictions)
+        and bool(right.distinguishing_predictions)
+        and _prediction_semantic_signature(left)
+        != _prediction_semantic_signature(right)
+    )
+    return claimed_scope_distinct and predictions_distinct
+
+
+def _mechanism_semantics_are_distinct(
+    left: CandidateSemanticProfile,
+    right: CandidateSemanticProfile,
+) -> bool:
+    """Require an independent primary initiator, not a Scope/effect modifier."""
+
+    if (
+        left.mechanism_relation
+        not in {
+            CandidateMechanismRelation.REFERENCE.value,
+            CandidateMechanismRelation.INDEPENDENT_ALTERNATIVE.value,
+        }
+        or right.mechanism_relation
+        != CandidateMechanismRelation.INDEPENDENT_ALTERNATIVE.value
+        or left.depends_on_candidate_id is not None
+        or right.depends_on_candidate_id is not None
+    ):
+        return False
+    mechanism_distinct = (
+        _token_similarity(left.primary_mechanism, right.primary_mechanism)
+        < _DUPLICATE_MECHANISM_SIMILARITY_THRESHOLD
+    )
+    predictions_distinct = (
+        bool(left.distinguishing_predictions)
+        and bool(right.distinguishing_predictions)
+        and _prediction_semantic_signature(left)
+        != _prediction_semantic_signature(right)
+    )
+    return mechanism_distinct and predictions_distinct
+
+
+def _candidate_competition_assessment(
+    proposals: Sequence[HypothesisCandidateProposal],
+    *,
+    evidence_by_id: Mapping[str, Evidence],
+    competition_context: Mapping[str, Any],
+    competition_brief: Mapping[str, Any],
+    semantic_profiles: Sequence[CandidateSemanticProfile] = (),
+) -> dict[str, Any]:
+    requirement = str(
+        competition_brief.get(
+            "competition_requirement",
+            CompetitionRequirement.NOT_REQUIRED.value,
+        )
+    )
+    competition_type = str(
+        competition_brief.get(
+            "competition_type",
+            CandidateCompetitionType.NONE.value,
+        )
+    )
+    semantic_profiles_by_index: dict[int, CandidateSemanticProfile] = {}
+    for profile in semantic_profiles:
+        try:
+            candidate_number = int(profile.candidate_id.rsplit(":llm:", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        semantic_profiles_by_index[candidate_number - 1] = profile
+    profiles = [
+        _candidate_competition_profile(
+            proposal,
+            candidate_index=index,
+            semantic_profile=semantic_profiles_by_index.get(index),
+            evidence_by_id=evidence_by_id,
+            competition_context=competition_context,
+            competition_brief=competition_brief,
+        )
+        for index, proposal in enumerate(proposals)
+    ]
+    represented_direction_ids = sorted(
+        {
+            str(bundle_id)
+            for profile in profiles
+            for bundle_id in profile["direction_bundle_ids"]
+            if str(bundle_id)
+        }
+    )
+    semantic_profiles_complete = set(semantic_profiles_by_index) == set(
+        range(len(proposals))
+    )
+    scope_competition_represented = False
+    mechanism_competition_represented = False
+    pairwise_mechanism_relations: list[dict[str, Any]] = []
+    if semantic_profiles_complete:
+        for left_index, left in enumerate(profiles):
+            left_semantics = semantic_profiles_by_index[left_index]
+            for right_index in range(left_index + 1, len(profiles)):
+                right = profiles[right_index]
+                if not set(left["direction_bundle_ids"]) & set(
+                    right["direction_bundle_ids"]
+                ):
+                    continue
+                if _scope_semantics_are_distinct(
+                    left_semantics,
+                    semantic_profiles_by_index[right_index],
+                ):
+                    scope_competition_represented = True
+                mechanism_distinct = _mechanism_semantics_are_distinct(
+                    left_semantics,
+                    semantic_profiles_by_index[right_index],
+                )
+                right_semantics = semantic_profiles_by_index[right_index]
+                pairwise_mechanism_relations.append(
+                    {
+                        "left_candidate_index": left_index,
+                        "right_candidate_index": right_index,
+                        "declared_relation": right_semantics.mechanism_relation,
+                        "depends_on_candidate_id": (
+                            right_semantics.depends_on_candidate_id
+                        ),
+                        "left_primary_mechanism": (
+                            left_semantics.primary_mechanism
+                        ),
+                        "right_primary_mechanism": (
+                            right_semantics.primary_mechanism
+                        ),
+                        "independent_root_competition": mechanism_distinct,
+                    }
+                )
+                if mechanism_distinct:
+                    mechanism_competition_represented = True
+                if scope_competition_represented and mechanism_competition_represented:
+                    break
+            if scope_competition_represented:
+                if mechanism_competition_represented:
+                    break
+
+    # This function assesses whether a valid Candidate set has formed the
+    # Python-required competition.  Failure to form that competition is an
+    # unresolved investigation gap, not a Candidate-processing failure.
+    # Structural/provider failures are assigned by the caller at the boundary
+    # where all Candidate output or the adversarial challenge is invalid.
+    gap_reason: str | None = None
+    if requirement == CompetitionRequirement.NOT_REQUIRED.value:
+        status = CandidateCompetitionStatus.NOT_REQUIRED.value
+    elif requirement == CompetitionRequirement.ALTERNATIVE_DISCOVERY_REQUIRED.value:
+        status = CandidateCompetitionStatus.PENDING.value
+    elif requirement in {
+        CompetitionRequirement.DIRECTION_REQUIRED.value,
+        CompetitionRequirement.MIXED_REQUIRED.value,
+    }:
+        if len(profiles) >= 2 and len(represented_direction_ids) >= 2:
+            status = CandidateCompetitionStatus.ACTIVE.value
+        else:
+            status = CandidateCompetitionStatus.PENDING.value
+            gap_reason = (
+                CompetitionGapReason.ALTERNATIVE_DIRECTION_NOT_GENERATED.value
+            )
+    elif requirement == CompetitionRequirement.MECHANISM_REQUIRED.value:
+        if len(profiles) < 2 or not semantic_profiles_complete:
+            status = CandidateCompetitionStatus.PENDING.value
+            gap_reason = (
+                CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value
+            )
+        elif mechanism_competition_represented:
+            status = CandidateCompetitionStatus.ACTIVE.value
+        else:
+            status = CandidateCompetitionStatus.PENDING.value
+            gap_reason = (
+                CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value
+            )
+    elif requirement == CompetitionRequirement.SCOPE_REQUIRED.value:
+        if len(profiles) < 2:
+            status = CandidateCompetitionStatus.PENDING.value
+            gap_reason = CompetitionGapReason.SCOPE_HYPOTHESIS_COLLAPSED.value
+        elif not semantic_profiles_complete:
+            # Two valid Candidates remain available. Missing semantic metadata
+            # is isolated from Candidate validity and must never trigger a
+            # Candidate Generator repair or an orchestration fallback.
+            status = CandidateCompetitionStatus.PENDING.value
+        elif scope_competition_represented:
+            status = CandidateCompetitionStatus.ACTIVE.value
+        else:
+            status = CandidateCompetitionStatus.PENDING.value
+            gap_reason = CompetitionGapReason.SCOPE_HYPOTHESIS_COLLAPSED.value
+    else:
+        status = CandidateCompetitionStatus.NOT_EVALUATED.value
+    return {
+        "competition_requirement": requirement,
+        "competition_type": competition_type,
+        "competition_axes": list(competition_brief.get("competition_axes", [])),
+        "competition_status": status,
+        "competition_failure_reason": None,
+        "competition_gap_reason": gap_reason,
+        "required_candidate_count": int(
+            competition_brief.get("required_candidate_count", 1)
+        ),
+        "represented_direction_bundle_ids": represented_direction_ids,
+        "scope_competition_represented": scope_competition_represented,
+        "mechanism_competition_represented": mechanism_competition_represented,
+        "pairwise_mechanism_relations": pairwise_mechanism_relations,
+        "scope_assessment_required": bool(
+            competition_brief.get("scope_assessment_required")
+        ),
+        "scope_assessment_status": competition_brief.get(
+            "scope_assessment_status",
+            "not_required",
+        ),
+        "semantic_profiles_complete": semantic_profiles_complete,
+        "candidate_profiles": profiles,
+    }
+
+
+def _partition_root_candidates(
+    proposals: Sequence[HypothesisCandidateProposal],
+    semantic_profiles: Sequence[CandidateSemanticProfile],
+    *,
+    competition_requirement: str,
+    candidate_ids: Sequence[str] = (),
+    semantic_validation_errors: Sequence[str] = (),
+) -> tuple[
+    tuple[HypothesisCandidateProposal, ...],
+    tuple[CandidateSemanticProfile, ...],
+    tuple[dict[str, Any], ...],
+]:
+    """Keep Scope/modifier explanations out of Root Cause Candidate slots.
+
+    Qwen still authors and audits these explanations. Python only enforces the
+    declared semantic relation: a Candidate that depends on the reference
+    mechanism is a Scope/effect assessment, not an independent root cause.
+    Legacy ``scope_required`` State keeps its historical two-Candidate shape.
+    """
+
+    if (
+        len(proposals) < 2
+        or competition_requirement
+        not in {
+            CompetitionRequirement.MECHANISM_REQUIRED.value,
+            CompetitionRequirement.MIXED_REQUIRED.value,
+        }
+    ):
+        return tuple(proposals), tuple(semantic_profiles), ()
+
+    normalized_candidate_ids = tuple(str(item).strip() for item in candidate_ids)
+    profile_by_candidate_id = {
+        profile.candidate_id: profile for profile in semantic_profiles
+    }
+
+    def profile_for_index(index: int) -> CandidateSemanticProfile | None:
+        if len(normalized_candidate_ids) == len(proposals):
+            return profile_by_candidate_id.get(normalized_candidate_ids[index])
+        expected_suffix = f":llm:{index + 1}"
+        suffix_matches = [
+            profile
+            for profile in semantic_profiles
+            if profile.candidate_id.endswith(expected_suffix)
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        if len(semantic_profiles) == len(proposals):
+            return semantic_profiles[index]
+        return None
+
+    def profile_status(index: int) -> str:
+        indexed_marker = f"candidate_semantic_profiles[{index}]"
+        if any(indexed_marker in error for error in semantic_validation_errors):
+            return "invalid"
+        return "missing"
+
+    reference_profile = profile_for_index(0)
+    kept_proposals: list[HypothesisCandidateProposal] = []
+    kept_profiles: list[CandidateSemanticProfile] = []
+    scope_variants: list[dict[str, Any]] = []
+    for index, proposal in enumerate(proposals):
+        profile = profile_for_index(index)
+        independent_primary_mechanism = bool(
+            index > 0
+            and reference_profile is not None
+            and profile is not None
+            and reference_profile.mechanism_relation
+            == CandidateMechanismRelation.REFERENCE.value
+            and profile.mechanism_relation
+            == CandidateMechanismRelation.INDEPENDENT_ALTERNATIVE.value
+            and profile.depends_on_candidate_id is None
+            and _mechanism_semantics_are_distinct(reference_profile, profile)
+        )
+        is_root_candidate = index == 0 or independent_primary_mechanism
+        if is_root_candidate:
+            kept_proposals.append(proposal)
+            if profile is not None:
+                kept_profiles.append(profile)
+            continue
+        semantic_profile_status = (
+            "valid_non_root" if profile is not None else profile_status(index)
+        )
+        mechanism_relation = (
+            profile.mechanism_relation
+            if profile is not None
+            else CandidateMechanismRelation.UNKNOWN.value
+        )
+        depends_on_candidate_id = (
+            profile.depends_on_candidate_id if profile is not None else None
+        )
+        scope_variants.append(
+            {
+                "candidate_index": index,
+                "candidate_id": (
+                    normalized_candidate_ids[index]
+                    if len(normalized_candidate_ids) == len(proposals)
+                    else None
+                ),
+                "root_cause": proposal.root_cause,
+                "causal_explanation": proposal.causal_explanation,
+                "supporting_evidence_ids": list(proposal.supporting_evidence_ids),
+                "contradicting_evidence_ids": list(
+                    proposal.contradicting_evidence_ids
+                ),
+                "semantic_profile": profile.to_dict() if profile is not None else None,
+                "semantic_profile_status": semantic_profile_status,
+                "semantic_validation_errors": list(semantic_validation_errors),
+                "mechanism_relation": mechanism_relation,
+                "depends_on_candidate_id": depends_on_candidate_id,
+                "isolation_reason": (
+                    "candidate has no valid semantic proof of an independent "
+                    "primary mechanism relative to the reference candidate"
+                ),
+            }
+        )
+    return (
+        tuple(kept_proposals),
+        tuple(kept_profiles),
+        tuple(scope_variants),
+    )
+
+
+def _prior_proposals(
+    prior_candidates: Sequence[Mapping[str, Any]],
+    *,
+    evidence_by_id: Mapping[str, Evidence],
+) -> list[HypothesisCandidateProposal]:
+    proposals: list[HypothesisCandidateProposal] = []
+    for candidate in prior_candidates[:_MAX_CANDIDATES]:
+        supporting = tuple(
+            dict.fromkeys(
+                str(item)
+                for item in candidate.get("supporting_evidence_ids", [])
+                if str(item) in evidence_by_id
+            )
+        )
+        contradicting = tuple(
+            dict.fromkeys(
+                str(item)
+                for item in candidate.get("contradicting_evidence_ids", [])
+                if str(item) in evidence_by_id and str(item) not in supporting
+            )
+        )
+        try:
+            proposals.append(
+                HypothesisCandidateProposal(
+                    root_cause=str(candidate.get("root_cause", "")),
+                    causal_explanation=str(
+                        candidate.get(
+                            "causal_explanation",
+                            candidate.get("root_cause", ""),
+                        )
+                    ),
+                    supporting_evidence_ids=supporting,
+                    contradicting_evidence_ids=contradicting,
+                )
+            )
+        except (TypeError, ValueError, ModelValidationError):
+            continue
+    return proposals
+
+
+def _candidate_lineage(
+    proposals: Sequence[HypothesisCandidateProposal],
+    *,
+    prior_candidates: Sequence[Mapping[str, Any]],
+    semantic_profiles: Sequence[CandidateSemanticProfile] = (),
+    prior_semantic_profiles: Sequence[Mapping[str, Any]] = (),
+    evidence_by_id: Mapping[str, Evidence],
+    competition_context: Mapping[str, Any],
+    competition_brief: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    priors = _prior_proposals(prior_candidates, evidence_by_id=evidence_by_id)
+    if not priors:
+        return [
+            {
+                "candidate_index": index,
+                "prior_candidate_index": None,
+                "lineage_status": "new",
+                "root_cause": proposal.root_cause,
+            }
+            for index, proposal in enumerate(proposals)
+        ]
+    current_semantics_by_index: dict[int, CandidateSemanticProfile] = {}
+    for semantic_profile in semantic_profiles:
+        try:
+            candidate_number = int(
+                semantic_profile.candidate_id.rsplit(":llm:", 1)[1]
+            )
+        except (IndexError, ValueError):
+            continue
+        current_semantics_by_index[candidate_number - 1] = semantic_profile
+    prior_semantics_by_candidate_id: dict[str, CandidateSemanticProfile] = {}
+    for raw_profile in prior_semantic_profiles:
+        try:
+            semantic_profile = CandidateSemanticProfile.from_dict(dict(raw_profile))
+        except (TypeError, ValueError, ModelValidationError):
+            continue
+        prior_semantics_by_candidate_id[semantic_profile.candidate_id] = (
+            semantic_profile
+        )
+    prior_semantics_by_index = {
+        index: prior_semantics_by_candidate_id[candidate_id]
+        for index, candidate in enumerate(prior_candidates[:_MAX_CANDIDATES])
+        if (
+            candidate_id := str(candidate.get("candidate_id", "")).strip()
+        ) in prior_semantics_by_candidate_id
+    }
+    current_profiles = [
+        _candidate_competition_profile(
+            proposal,
+            candidate_index=index,
+            semantic_profile=current_semantics_by_index.get(index),
+            evidence_by_id=evidence_by_id,
+            competition_context=competition_context,
+            competition_brief=competition_brief,
+        )
+        for index, proposal in enumerate(proposals)
+    ]
+    prior_profiles = [
+        _candidate_competition_profile(
+            proposal,
+            candidate_index=index,
+            semantic_profile=prior_semantics_by_index.get(index),
+            evidence_by_id=evidence_by_id,
+            competition_context=competition_context,
+            competition_brief=competition_brief,
+        )
+        for index, proposal in enumerate(priors)
+    ]
+    lineage: list[dict[str, Any]] = []
+    matched_prior_indexes: set[int] = set()
+    for index, (proposal, profile) in enumerate(zip(proposals, current_profiles, strict=True)):
+        match_index: int | None = None
+        for prior_index, prior_profile in enumerate(prior_profiles):
+            if set(profile["direction_bundle_ids"]) & set(
+                prior_profile["direction_bundle_ids"]
+            ):
+                match_index = prior_index
+                break
+            if _root_causes_near_duplicate(
+                proposal.root_cause,
+                priors[prior_index].root_cause,
+            ):
+                match_index = prior_index
+                break
+        if match_index is None:
+            status = "new_direction"
+        else:
+            matched_prior_indexes.add(match_index)
+            prior_profile = prior_profiles[match_index]
+            current_semantics = current_semantics_by_index.get(index)
+            prior_semantics = prior_semantics_by_index.get(match_index)
+            if (
+                current_semantics is not None
+                and prior_semantics is not None
+                and set(current_semantics.claimed_lane_ids)
+                > set(prior_semantics.claimed_lane_ids)
+                and set(profile["direction_bundle_ids"])
+                == set(prior_profile["direction_bundle_ids"])
+            ):
+                status = "scope_expanded"
+            elif _root_causes_near_duplicate(
+                proposal.root_cause,
+                priors[match_index].root_cause,
+            ):
+                status = "retained"
+            else:
+                status = "revised"
+        lineage.append(
+            {
+                "candidate_index": index,
+                "prior_candidate_index": match_index,
+                "lineage_status": status,
+                "root_cause": proposal.root_cause,
+                "prior_root_cause": (
+                    priors[match_index].root_cause
+                    if match_index is not None
+                    else None
+                ),
+                "direction_bundle_ids": list(profile["direction_bundle_ids"]),
+                "recipes": list(profile["recipes"]),
+                "claimed_lane_ids": (
+                    list(current_semantics_by_index[index].claimed_lane_ids)
+                    if index in current_semantics_by_index
+                    else []
+                ),
+            }
+        )
+    lineage.extend(
+        {
+            "candidate_index": None,
+            "prior_candidate_index": prior_index,
+            "lineage_status": "omitted",
+            "root_cause": None,
+            "prior_root_cause": prior.root_cause,
+            "direction_bundle_ids": list(
+                prior_profiles[prior_index]["direction_bundle_ids"]
+            ),
+            "recipes": list(prior_profiles[prior_index]["recipes"]),
+            "claimed_lane_ids": (
+                list(prior_semantics_by_index[prior_index].claimed_lane_ids)
+                if prior_index in prior_semantics_by_index
+                else []
+            ),
+        }
+        for prior_index, prior in enumerate(priors)
+        if prior_index not in matched_prior_indexes
+    )
+    return lineage
 
 
 def _parse_candidate(
@@ -952,6 +1742,251 @@ def _parse_candidate(
     return proposal
 
 
+def _parse_candidate_semantic_profiles(
+    payload: object,
+    *,
+    request_id: str,
+    surviving_candidate_indexes: Sequence[int],
+    known_lane_ids: set[str],
+) -> tuple[tuple[CandidateSemanticProfile, ...], tuple[str, ...]]:
+    """Parse Qwen scope meaning without changing Candidate validity.
+
+    Profiles are deliberately isolated from the four-field Candidate contract.
+    A malformed or missing profile blocks semantic competition assessment but
+    never rejects an otherwise valid Evidence-bounded Candidate.
+    """
+
+    if payload is None:
+        return (), ("candidate_semantic_profiles is missing",)
+    if not isinstance(payload, list):
+        return (), ("candidate_semantic_profiles must be an array",)
+    raw_to_surviving = {
+        raw_index: surviving_index
+        for surviving_index, raw_index in enumerate(surviving_candidate_indexes)
+    }
+    profiles_by_surviving_index: dict[int, CandidateSemanticProfile] = {}
+    errors: list[str] = []
+    expected_profile_fields = {
+        "candidate_index",
+        "claimed_scope",
+        "comparison_scope",
+        "mechanism_claim",
+        "primary_mechanism",
+        "effect_modifier",
+        "depends_on_candidate_index",
+        "mechanism_relation",
+        "distinguishing_predictions",
+    }
+    expected_scope_fields = {"scope_relation", "lane_ids"}
+    expected_comparison_fields = {"lane_ids"}
+    expected_prediction_fields = {
+        "discriminator_kind",
+        "lane_ids",
+        "prediction",
+    }
+    for profile_index, raw in enumerate(payload):
+        try:
+            if not isinstance(raw, dict):
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}] must be an object"
+                )
+            if set(raw) != expected_profile_fields:
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}] must contain "
+                    f"exactly {sorted(expected_profile_fields)}"
+                )
+            raw_candidate_index = raw.get("candidate_index")
+            if not isinstance(raw_candidate_index, int) or isinstance(
+                raw_candidate_index, bool
+            ):
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}].candidate_index "
+                    "must be an integer"
+                )
+            if raw_candidate_index not in raw_to_surviving:
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}] references an "
+                    "unknown or isolated candidate_index"
+                )
+            surviving_index = raw_to_surviving[raw_candidate_index]
+            if surviving_index in profiles_by_surviving_index:
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles contains duplicate candidate_index "
+                    f"{raw_candidate_index}"
+                )
+            claimed_scope = raw.get("claimed_scope")
+            comparison_scope = raw.get("comparison_scope")
+            if not isinstance(claimed_scope, dict) or set(
+                claimed_scope
+            ) != expected_scope_fields:
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}].claimed_scope "
+                    f"must contain exactly {sorted(expected_scope_fields)}"
+                )
+            if not isinstance(comparison_scope, dict) or set(
+                comparison_scope
+            ) != expected_comparison_fields:
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}].comparison_scope "
+                    f"must contain exactly {sorted(expected_comparison_fields)}"
+                )
+            raw_predictions = raw.get("distinguishing_predictions")
+            if not isinstance(raw_predictions, list):
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}]."
+                    "distinguishing_predictions must be an array"
+                )
+            predictions: list[CandidateDistinguishingPrediction] = []
+            for prediction_index, prediction in enumerate(raw_predictions):
+                if not isinstance(prediction, dict) or set(
+                    prediction
+                ) != expected_prediction_fields:
+                    raise LLMOutputValidationError(
+                        f"candidate_semantic_profiles[{profile_index}]."
+                        f"distinguishing_predictions[{prediction_index}] must "
+                        f"contain exactly {sorted(expected_prediction_fields)}"
+                    )
+                predictions.append(
+                    CandidateDistinguishingPrediction(
+                        discriminator_kind=prediction["discriminator_kind"],
+                        lane_ids=tuple(prediction.get("lane_ids", [])),
+                        prediction=prediction["prediction"],
+                    )
+                )
+            raw_dependency_index = raw.get("depends_on_candidate_index")
+            if raw_dependency_index is not None and (
+                not isinstance(raw_dependency_index, int)
+                or isinstance(raw_dependency_index, bool)
+                or raw_dependency_index not in raw_to_surviving
+                or raw_dependency_index == raw_candidate_index
+            ):
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}]."
+                    "depends_on_candidate_index must be null or reference a "
+                    "different surviving candidate"
+                )
+            depends_on_candidate_id = (
+                f"{request_id}:llm:{raw_to_surviving[raw_dependency_index] + 1}"
+                if raw_dependency_index is not None
+                else None
+            )
+            profile = CandidateSemanticProfile(
+                candidate_id=f"{request_id}:llm:{surviving_index + 1}",
+                scope_relation=claimed_scope["scope_relation"],
+                claimed_lane_ids=tuple(claimed_scope.get("lane_ids", [])),
+                comparison_lane_ids=tuple(comparison_scope.get("lane_ids", [])),
+                mechanism_claim=raw["mechanism_claim"],
+                primary_mechanism=raw["primary_mechanism"],
+                effect_modifier=raw.get("effect_modifier"),
+                depends_on_candidate_id=depends_on_candidate_id,
+                mechanism_relation=raw["mechanism_relation"],
+                distinguishing_predictions=tuple(predictions),
+            )
+            if surviving_index == 0 and (
+                profile.mechanism_relation
+                != CandidateMechanismRelation.REFERENCE.value
+            ):
+                raise LLMOutputValidationError(
+                    "semantic coherence: candidate_semantic_profiles[0] must "
+                    "use mechanism_relation=reference"
+                )
+            if surviving_index > 0 and (
+                profile.mechanism_relation
+                == CandidateMechanismRelation.REFERENCE.value
+            ):
+                raise LLMOutputValidationError(
+                    "semantic coherence: only the first Candidate may use "
+                    "mechanism_relation=reference"
+                )
+            referenced_lane_ids = {
+                *profile.claimed_lane_ids,
+                *profile.comparison_lane_ids,
+                *(
+                    lane_id
+                    for prediction in profile.distinguishing_predictions
+                    for lane_id in prediction.lane_ids
+                ),
+            }
+            unknown_lane_ids = sorted(referenced_lane_ids - known_lane_ids)
+            if unknown_lane_ids:
+                raise LLMOutputValidationError(
+                    f"candidate_semantic_profiles[{profile_index}] references "
+                    f"unknown Lane IDs: {unknown_lane_ids}"
+                )
+            claimed_lane_ids = set(profile.claimed_lane_ids)
+            comparison_lane_ids = set(profile.comparison_lane_ids)
+            prediction_lane_ids = {
+                lane_id
+                for prediction in profile.distinguishing_predictions
+                for lane_id in prediction.lane_ids
+            }
+            if (
+                profile.scope_relation
+                == CandidateScopeRelation.SHARED_EFFECT.value
+                and len(claimed_lane_ids) < 2
+            ):
+                raise LLMOutputValidationError(
+                    "semantic coherence: "
+                    f"candidate_semantic_profiles[{profile_index}] shared_effect "
+                    "must claim at least two Lanes"
+                )
+            if (
+                profile.scope_relation == CandidateScopeRelation.FOCAL_ONLY.value
+                and (
+                    len(claimed_lane_ids) != 1
+                    or not claimed_lane_ids < comparison_lane_ids
+                )
+            ):
+                raise LLMOutputValidationError(
+                    "semantic coherence: "
+                    f"candidate_semantic_profiles[{profile_index}] focal_only "
+                    "must claim one Lane within a larger comparison scope"
+                )
+            if (
+                profile.scope_relation
+                == CandidateScopeRelation.DIFFERENTIAL_SENSITIVITY.value
+                and not claimed_lane_ids < comparison_lane_ids
+            ):
+                raise LLMOutputValidationError(
+                    "semantic coherence: "
+                    f"candidate_semantic_profiles[{profile_index}] "
+                    "differential_sensitivity must claim a strict subset of "
+                    "the comparison Lanes"
+                )
+            if (
+                profile.scope_relation != CandidateScopeRelation.UNRESOLVED.value
+                and prediction_lane_ids != comparison_lane_ids
+            ):
+                raise LLMOutputValidationError(
+                    "semantic coherence: "
+                    f"candidate_semantic_profiles[{profile_index}] prediction "
+                    "Lane coverage must match the resolved comparison scope"
+                )
+            profiles_by_surviving_index[surviving_index] = profile
+        except (LLMOutputValidationError, ModelValidationError, TypeError, ValueError) as exc:
+            errors.append(
+                str(exc).strip()
+                or f"candidate_semantic_profiles[{profile_index}] is invalid"
+            )
+    missing_indexes = [
+        index
+        for index in range(len(surviving_candidate_indexes))
+        if index not in profiles_by_surviving_index
+    ]
+    if missing_indexes:
+        errors.append(
+            "candidate_semantic_profiles missing surviving candidate indexes: "
+            f"{missing_indexes}"
+        )
+    return (
+        tuple(
+            profiles_by_surviving_index[index]
+            for index in sorted(profiles_by_surviving_index)
+        ),
+        tuple(errors),
+    )
+
+
 @dataclass(frozen=True)
 class QwenHypothesisCandidateGenerator:
     """Generate at most two proposals without deciding the RCA conclusion."""
@@ -972,6 +2007,7 @@ class QwenHypothesisCandidateGenerator:
         findings: list[AgentFinding],
         context_evidence: Sequence[Evidence] = (),
         prior_candidates: Sequence[Mapping[str, Any]] = (),
+        prior_semantic_profiles: Sequence[Mapping[str, Any]] = (),
         prior_challenges: Sequence[Mapping[str, Any]] = (),
         prior_causal_gaps: Sequence[Mapping[str, Any]] = (),
         causal_lanes: Sequence[Mapping[str, Any]] = (),
@@ -1003,40 +2039,52 @@ class QwenHypothesisCandidateGenerator:
             evidence_by_id.values(),
             causal_lanes,
         )
-        prompt_evidence_ids = {
-            str(item)
-            for item in evidence_synthesis.get("prompt_evidence_ids", [])
-            if str(item) in evidence_by_id
-        }
-        prompt_evidence_ids.update(
+        competition_brief = dict(
+            evidence_synthesis.get("candidate_competition", {})
+        )
+        prior_candidate_evidence_ids = [
             evidence_id
             for candidate in prior_candidates[:_MAX_CANDIDATES]
             for field in ("supporting_evidence_ids", "contradicting_evidence_ids")
             for evidence_id in (str(item) for item in candidate.get(field, []))
             if evidence_id in evidence_by_id
-        )
-        prompt_evidence_ids.update(
+        ]
+        challenge_evidence_ids = [
             str(item)
-            for item in competition_context["new_evidence_ids_since_prior"]
-            if str(item) in evidence_by_id
-        )
-        for challenge in competition_context["prior_candidate_challenges"]:
+            for challenge in competition_context["prior_candidate_challenges"]
             for field in (
                 "supporting_evidence_ids",
                 "contradicting_evidence_ids",
                 "unexplained_precursor_evidence_ids",
-            ):
-                prompt_evidence_ids.update(
-                    str(item)
-                    for item in challenge.get(field, [])
-                    if str(item) in evidence_by_id
-                )
-        # A partial or legacy workflow can reach candidate generation before
-        # concrete Lane discovery. Avoid silently sending an empty register.
-        if not prompt_evidence_ids:
-            prompt_evidence_ids.update(evidence_by_id)
-        evidence_synthesis["prompt_evidence_ids"] = sorted(prompt_evidence_ids)
+            )
+            for item in challenge.get(field, [])
+            if str(item) in evidence_by_id
+        ]
+        recent_evidence_ids = [
+            str(item)
+            for item in competition_context["new_evidence_ids_since_prior"]
+            if str(item) in evidence_by_id
+        ]
+        prompt_evidence_ids = _bounded_prompt_evidence_ids(
+            evidence_by_id=evidence_by_id,
+            synthesis_ids=[
+                str(item)
+                for item in evidence_synthesis.get("prompt_evidence_ids", [])
+                if str(item) in evidence_by_id
+            ],
+            recent_ids=recent_evidence_ids,
+            prior_candidate_ids=prior_candidate_evidence_ids,
+            challenge_ids=challenge_evidence_ids,
+        )
+        evidence_synthesis["prompt_evidence_ids"] = list(prompt_evidence_ids)
         evidence_synthesis["prompt_evidence_count"] = len(prompt_evidence_ids)
+        evidence_synthesis["prompt_evidence_limit"] = _MAX_PROMPT_EVIDENCE
+        evidence_synthesis["recent_evidence_available_count"] = len(
+            recent_evidence_ids
+        )
+        evidence_synthesis["recent_evidence_emitted_count"] = len(
+            set(recent_evidence_ids) & set(prompt_evidence_ids)
+        )
         evidence_synthesis["omitted_from_prompt_count"] = max(
             0,
             len(evidence_by_id) - len(prompt_evidence_ids),
@@ -1044,7 +2092,26 @@ class QwenHypothesisCandidateGenerator:
         evidence_register = _evidence_register(
             findings,
             context_evidence,
-            allowed_evidence_ids=prompt_evidence_ids,
+            allowed_evidence_ids=set(prompt_evidence_ids),
+        )
+        projection_audit_by_id: dict[str, dict[str, int]] = {}
+        for record in evidence_register:
+            raw_audit = record.pop("projection_audit", {})
+            projection_audit_by_id[str(record.get("evidence_id", ""))] = {
+                "omitted_entity_count": int(
+                    raw_audit.get("omitted_entity_count", 0)
+                ),
+                "omitted_metadata_count": int(
+                    raw_audit.get("omitted_metadata_count", 0)
+                ),
+            }
+        protected_prompt_evidence_ids = {
+            *recent_evidence_ids,
+            *prior_candidate_evidence_ids,
+            *challenge_evidence_ids,
+        }
+        prompt_synthesis = compact_lane_first_synthesis_for_prompt(
+            evidence_synthesis
         )
         prompt_evidence_by_id = {
             evidence_id: evidence_by_id[evidence_id]
@@ -1057,6 +2124,7 @@ class QwenHypothesisCandidateGenerator:
 
         validation_errors: list[str] = []
         rejected_candidates: list[dict[str, Any]] = []
+        competition_repair_skipped_due_to_budget = False
         for attempt in range(1, _OUTPUT_ATTEMPTS + 1):
             request = LLMRequest(
                 agent=AgentKind.RCA_REASONING.value,
@@ -1075,9 +2143,13 @@ class QwenHypothesisCandidateGenerator:
                         for finding in findings
                     ],
                     "typed_evidence_register": evidence_register,
-                    "evidence_synthesis": evidence_synthesis,
+                    "evidence_synthesis": prompt_synthesis,
+                    "candidate_competition_requirement": competition_brief,
                     "prior_authoritative_candidates": [
                         {
+                            "candidate_id": str(
+                                candidate.get("candidate_id", "")
+                            ),
                             "root_cause": str(candidate.get("root_cause", "")),
                             "causal_explanation": str(
                                 candidate.get(
@@ -1103,9 +2175,20 @@ class QwenHypothesisCandidateGenerator:
                         for candidate in prior_candidates[:_MAX_CANDIDATES]
                         if str(candidate.get("root_cause", "")).strip()
                     ],
+                    "prior_candidate_semantic_profiles": [
+                        dict(item)
+                        for item in prior_semantic_profiles[:_MAX_CANDIDATES]
+                        if isinstance(item, Mapping)
+                    ],
                     "prior_candidate_mechanism_feedback": prior_mechanism_feedback,
                     "new_evidence_ids_since_prior": competition_context[
                         "new_evidence_ids_since_prior"
+                    ]
+                    if not recent_evidence_ids
+                    else [
+                        evidence_id
+                        for evidence_id in recent_evidence_ids
+                        if evidence_id in set(prompt_evidence_ids)
                     ],
                     "prior_candidate_challenges": competition_context[
                         "prior_candidate_challenges"
@@ -1131,16 +2214,113 @@ class QwenHypothesisCandidateGenerator:
                 },
                 temperature=0.0,
             )
+            payload_char_count = _payload_char_count(request.payload)
+            while payload_char_count > _TARGET_PROMPT_PAYLOAD_CHARS:
+                removable_index = next(
+                    (
+                        index
+                        for index in range(len(evidence_register) - 1, -1, -1)
+                        if str(evidence_register[index].get("evidence_id", ""))
+                        not in protected_prompt_evidence_ids
+                    ),
+                    None,
+                )
+                if removable_index is None:
+                    break
+                evidence_register.pop(removable_index)
+                current_ids = [
+                    str(record.get("evidence_id", ""))
+                    for record in evidence_register
+                    if str(record.get("evidence_id", "")).strip()
+                ]
+                prompt_synthesis["prompt_evidence_ids"] = current_ids
+                request.payload["new_evidence_ids_since_prior"] = [
+                    evidence_id
+                    for evidence_id in request.payload[
+                        "new_evidence_ids_since_prior"
+                    ]
+                    if evidence_id in set(current_ids)
+                ]
+                payload_char_count = _payload_char_count(request.payload)
+            current_prompt_evidence_ids = {
+                str(record.get("evidence_id", ""))
+                for record in evidence_register
+                if str(record.get("evidence_id", "")).strip()
+            }
+            prompt_evidence_by_id = {
+                evidence_id: evidence_by_id[evidence_id]
+                for evidence_id in current_prompt_evidence_ids
+                if evidence_id in evidence_by_id
+            }
+            current_prompt_evidence_id_list = [
+                str(record.get("evidence_id", ""))
+                for record in evidence_register
+                if str(record.get("evidence_id", "")).strip()
+            ]
+            evidence_synthesis["prompt_evidence_ids"] = (
+                current_prompt_evidence_id_list
+            )
+            evidence_synthesis["prompt_evidence_count"] = len(
+                current_prompt_evidence_id_list
+            )
+            evidence_synthesis["omitted_from_prompt_count"] = max(
+                0,
+                len(evidence_by_id) - len(current_prompt_evidence_id_list),
+            )
+            omitted_entity_count = 0
+            omitted_metadata_count = 0
+            for evidence_id in prompt_evidence_ids:
+                item = evidence_by_id[evidence_id]
+                if evidence_id in current_prompt_evidence_ids:
+                    audit = projection_audit_by_id.get(evidence_id, {})
+                    omitted_entity_count += int(
+                        audit.get("omitted_entity_count", 0)
+                    )
+                    omitted_metadata_count += int(
+                        audit.get("omitted_metadata_count", 0)
+                    )
+                else:
+                    omitted_entity_count += len(item.entities)
+                    omitted_metadata_count += len(item.metadata)
+            prompt_audit = {
+                "prompt_payload_char_count": payload_char_count,
+                "prompt_evidence_count": len(current_prompt_evidence_ids),
+                "omitted_entity_count": omitted_entity_count,
+                "omitted_metadata_count": omitted_metadata_count,
+                "prompt_budget_applied": True,
+                "prompt_payload_char_limit": _MAX_PROMPT_PAYLOAD_CHARS,
+                "trimmed_evidence_count": (
+                    len(prompt_evidence_ids) - len(current_prompt_evidence_ids)
+                ),
+            }
+            evidence_synthesis.update(prompt_audit)
+            prompt_synthesis.update(prompt_audit)
+            payload_char_count = _payload_char_count(request.payload)
+            evidence_synthesis["prompt_payload_char_count"] = payload_char_count
+            prompt_synthesis["prompt_payload_char_count"] = payload_char_count
             try:
+                if payload_char_count > _MAX_PROMPT_PAYLOAD_CHARS:
+                    raise LLMOutputValidationError(
+                        "candidate generator prompt exceeds the governed payload limit"
+                    )
                 response = self.llm_client.complete_json(request)
             except LLMOutputValidationError as exc:
                 validation_errors.append(str(exc).strip() or type(exc).__name__)
                 continue
             try:
-                if set(response.data) != {"candidates", "analysis_summary"}:
+                allowed_output_fields = {
+                    "candidates",
+                    "analysis_summary",
+                    "candidate_semantic_profiles",
+                }
+                required_output_fields = {"candidates", "analysis_summary"}
+                if not required_output_fields <= set(response.data) or not set(
+                    response.data
+                ) <= allowed_output_fields:
                     raise LLMOutputValidationError(
-                        "candidate output must contain exactly candidates and "
-                        "analysis_summary"
+                        "candidate output must contain candidates and "
+                        "analysis_summary, with optional isolated "
+                        "candidate_semantic_profiles"
                     )
                 raw_candidates = response.data.get("candidates")
                 summary = response.data.get("analysis_summary")
@@ -1160,7 +2340,7 @@ class QwenHypothesisCandidateGenerator:
                             _parse_candidate(
                                 candidate,
                                 index=index,
-                                evidence_by_id=evidence_by_id,
+                                evidence_by_id=prompt_evidence_by_id,
                             )
                         )
                     except (LLMOutputValidationError, TypeError, ValueError) as exc:
@@ -1171,7 +2351,12 @@ class QwenHypothesisCandidateGenerator:
                     validation_errors.extend(candidate_errors)
                 if candidate_errors and not proposals_list:
                     validation_errors.extend(candidate_errors)
-                    if attempt < _OUTPUT_ATTEMPTS:
+                    if attempt < _OUTPUT_ATTEMPTS and llm_call_budget_available(
+                        self.llm_client,
+                        required_calls=1,
+                        # Preserve one call for the post-Action Planner stop.
+                        reserve_calls=1,
+                    ):
                         continue
                     return HypothesisCandidateGeneration(
                         candidates=(),
@@ -1183,6 +2368,25 @@ class QwenHypothesisCandidateGenerator:
                             competition_context["targeted_investigation_results"]
                         ),
                         rejected_candidates=tuple(rejected_candidates),
+                        competition_requirement=str(
+                            competition_brief.get(
+                                "competition_requirement",
+                                CompetitionRequirement.NOT_REQUIRED.value,
+                            )
+                        ),
+                        competition_status=(
+                            CandidateCompetitionStatus.FAILED.value
+                        ),
+                        competition_type=str(
+                            competition_brief.get(
+                                "competition_type",
+                                CandidateCompetitionType.NONE.value,
+                            )
+                        ),
+                        competition_failure_reason=(
+                            CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value
+                        ),
+                        evidence_synthesis=evidence_synthesis,
                     )
                 distinct: list[HypothesisCandidateProposal] = []
                 distinct_candidate_indexes: list[int] = []
@@ -1221,18 +2425,166 @@ class QwenHypothesisCandidateGenerator:
                     distinct.append(proposal)
                     distinct_candidate_indexes.append(index)
                 proposals = tuple(distinct)
-                competition_repair_required = _competition_repair_required(
+                semantic_profiles: tuple[CandidateSemanticProfile, ...] = ()
+                semantic_validation_errors: tuple[str, ...] = ()
+                if proposals:
+                    semantic_profiles, semantic_validation_errors = (
+                        _parse_candidate_semantic_profiles(
+                            response.data.get("candidate_semantic_profiles"),
+                            request_id=request_id,
+                            surviving_candidate_indexes=distinct_candidate_indexes,
+                            known_lane_ids={
+                                str(item.get("lane_id", "")).strip()
+                                for item in causal_lanes
+                                if str(item.get("lane_id", "")).strip()
+                            },
+                        )
+                    )
+                scope_assessment_variants: tuple[dict[str, Any], ...] = ()
+                if proposals:
+                    proposals, semantic_profiles, scope_assessment_variants = (
+                        _partition_root_candidates(
+                            proposals,
+                            semantic_profiles,
+                            competition_requirement=str(
+                                competition_brief.get(
+                                    "competition_requirement",
+                                    CompetitionRequirement.NOT_REQUIRED.value,
+                                )
+                            ),
+                            candidate_ids=tuple(
+                                f"{request_id}:llm:{index + 1}"
+                                for index in range(len(proposals))
+                            ),
+                            semantic_validation_errors=semantic_validation_errors,
+                        )
+                    )
+                    for variant in scope_assessment_variants:
+                        validation_errors.append(
+                            "candidate semantic relation does not form an "
+                            "independent primary-mechanism alternative: "
+                            f"candidate_index={variant['candidate_index']}, "
+                            f"relation={variant['mechanism_relation']}"
+                        )
+                competition_assessment = _candidate_competition_assessment(
+                    proposals,
+                    evidence_by_id=evidence_by_id,
+                    competition_context=competition_context,
+                    competition_brief=competition_brief,
+                    semantic_profiles=semantic_profiles,
+                )
+                competition_assessment["semantic_validation_errors"] = list(
+                    semantic_validation_errors
+                )
+                competition_assessment["scope_assessment_variants"] = [
+                    dict(item) for item in scope_assessment_variants
+                ]
+                candidate_lineage = _candidate_lineage(
+                    proposals,
+                    prior_candidates=prior_candidates,
+                    semantic_profiles=semantic_profiles,
+                    prior_semantic_profiles=prior_semantic_profiles,
+                    evidence_by_id=evidence_by_id,
+                    competition_context=competition_context,
+                    competition_brief=competition_brief,
+                )
+                targeted_repair_required = _competition_repair_required(
                     proposals,
                     prior_candidates=prior_candidates,
                     competition_context=competition_context,
                 )
+                competition_gap_repair_required = bool(
+                    competition_assessment.get("competition_gap_reason")
+                )
+                semantic_coherence_repair_required = any(
+                    error.startswith("semantic coherence:")
+                    for error in semantic_validation_errors
+                )
+                competition_repair_required = (
+                    targeted_repair_required
+                    or competition_gap_repair_required
+                    or semantic_coherence_repair_required
+                )
                 if competition_repair_required and attempt < _OUTPUT_ATTEMPTS:
-                    validation_errors.append(
-                        "candidate competition is incomplete: targeted Evidence "
-                        "supports review of an alternative causal Lane, but no "
-                        "materially distinct candidate cites that Evidence"
+                    failure_reason = str(
+                        competition_assessment.get("competition_gap_reason")
+                        or CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value
                     )
-                    continue
+                    if semantic_coherence_repair_required:
+                        validation_errors.append(
+                            "candidate semantic profile is internally inconsistent: "
+                            + " | ".join(semantic_validation_errors)
+                        )
+                    else:
+                        validation_errors.append(
+                            "candidate competition is incomplete: "
+                            f"{failure_reason}; preserve the prior candidate and "
+                            "represent the evidence-bounded competing causal "
+                            "direction or a materially different physical mechanism "
+                            "independently; a Scope-only variant does not satisfy "
+                            "root-cause competition"
+                        )
+                    # Competition repair is optional once at least one valid
+                    # Candidate survives.  Keep enough global budget for one
+                    # Challenge (when concrete Lanes exist) and the post-Action
+                    # Planner decision instead of attempting a cap-exceeding
+                    # repair call.
+                    downstream_reserve = 1 + (1 if causal_lanes else 0)
+                    if llm_call_budget_available(
+                        self.llm_client,
+                        required_calls=1,
+                        reserve_calls=downstream_reserve,
+                    ):
+                        continue
+                    competition_repair_skipped_due_to_budget = True
+                final_competition_status = str(
+                    competition_assessment["competition_status"]
+                )
+                final_failure_reason = competition_assessment.get(
+                    "competition_failure_reason"
+                )
+                final_gap_reason = competition_assessment.get(
+                    "competition_gap_reason"
+                )
+                if competition_repair_skipped_due_to_budget:
+                    final_competition_status = (
+                        CandidateCompetitionStatus.PENDING.value
+                        if str(competition_assessment["competition_requirement"])
+                        != CompetitionRequirement.NOT_REQUIRED.value
+                        else CandidateCompetitionStatus.NOT_REQUIRED.value
+                    )
+                    final_failure_reason = None
+                elif targeted_repair_required:
+                    final_competition_status = CandidateCompetitionStatus.PENDING.value
+                    final_failure_reason = None
+                    if (
+                        competition_assessment["competition_requirement"]
+                        == CompetitionRequirement.MECHANISM_REQUIRED.value
+                    ):
+                        final_gap_reason = (
+                            CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value
+                        )
+                    else:
+                        final_gap_reason = (
+                            CompetitionGapReason.SCOPE_HYPOTHESIS_COLLAPSED.value
+                            if any(
+                                item.get("lineage_status") == "scope_expanded"
+                                for item in candidate_lineage
+                            )
+                            else CompetitionGapReason.ALTERNATIVE_DIRECTION_NOT_GENERATED.value
+                        )
+                competition_assessment = {
+                    **competition_assessment,
+                    "competition_status": final_competition_status,
+                    "competition_failure_reason": final_failure_reason,
+                    "competition_gap_reason": final_gap_reason,
+                    "targeted_competition_repair_required": (
+                        targeted_repair_required
+                    ),
+                    "competition_repair_skipped_due_to_budget": (
+                        competition_repair_skipped_due_to_budget
+                    ),
+                }
                 return HypothesisCandidateGeneration(
                     candidates=proposals,
                     attempt_count=attempt,
@@ -1241,11 +2593,48 @@ class QwenHypothesisCandidateGenerator:
                     targeted_investigation_results=tuple(
                         competition_context["targeted_investigation_results"]
                     ),
-                    competition_repair_exhausted=competition_repair_required,
+                    competition_repair_exhausted=(
+                        competition_repair_required
+                        and not competition_repair_skipped_due_to_budget
+                    ),
+                    competition_repair_skipped_due_to_budget=(
+                        competition_repair_skipped_due_to_budget
+                    ),
                     rejected_candidates=tuple(rejected_candidates),
+                    competition_requirement=str(
+                        competition_assessment["competition_requirement"]
+                    ),
+                    competition_status=final_competition_status,
+                    competition_type=str(
+                        competition_assessment["competition_type"]
+                    ),
+                    competition_failure_reason=(
+                        str(final_failure_reason)
+                        if final_failure_reason is not None
+                        else None
+                    ),
+                    competition_gap_reason=(
+                        str(final_gap_reason)
+                        if final_gap_reason is not None
+                        else None
+                    ),
+                    competition_assessment=competition_assessment,
+                    candidate_semantic_profiles=semantic_profiles,
+                    semantic_validation_errors=semantic_validation_errors,
+                    candidate_lineage=tuple(candidate_lineage),
+                    evidence_synthesis=evidence_synthesis,
                 )
             except (LLMOutputValidationError, TypeError, ValueError) as exc:
                 validation_errors.append(str(exc).strip() or type(exc).__name__)
+                if attempt < _OUTPUT_ATTEMPTS and llm_call_budget_available(
+                    self.llm_client,
+                    required_calls=1,
+                    # A wholly invalid result has no downstream Candidate work,
+                    # but the Supervisor still needs a governed terminal call.
+                    reserve_calls=1,
+                ):
+                    continue
+                break
 
         raise LLMOutputValidationError(
             "Qwen Hypothesis Candidate Generator returned invalid output twice: "

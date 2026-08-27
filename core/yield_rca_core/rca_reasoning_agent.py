@@ -17,6 +17,7 @@ from yield_rca_core.causal_adversarial import (
 from yield_rca_core.causal_candidate_comparison import (
     QwenHypothesisCandidateComparator,
 )
+from yield_rca_core.causal_competition import select_diverse_lane_ids
 from yield_rca_core.causal_confirmation import evaluate_impact_lot_gate
 from yield_rca_core.causal_evidence_gap import (
     build_causal_evidence_gaps,
@@ -28,8 +29,13 @@ from yield_rca_core.causal_investigation_models import (
     AlternativeLaneResolution,
     AlternativeSearchStatus,
     CandidateChallenge,
+    CandidateCompetitionStatus,
+    CandidateCompetitionType,
     CausalLaneRecord,
+    CompetitionFailureReason,
+    CompetitionRequirement,
 )
+from yield_rca_core.causal_lane_lifecycle import lane_is_searchable
 from yield_rca_core.evidence_models import EntityType, Evidence, EvidenceType
 from yield_rca_core.evidence_synthesis import build_evidence_synthesis
 from yield_rca_core.hypothesis_candidate_generator import (
@@ -40,6 +46,7 @@ from yield_rca_core.llm_gateway import (
     LLMCallError,
     LLMClient,
     LLMOutputValidationError,
+    llm_call_budget_available,
 )
 from yield_rca_core.models import (
     AgentFinding,
@@ -66,6 +73,17 @@ def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _next_reasoning_round(prior_finding: AgentFinding | None) -> int:
+    if prior_finding is None:
+        return 1
+    raw_round = prior_finding.details.get("reasoning_round", 1)
+    try:
+        prior_round = int(raw_round)
+    except (TypeError, ValueError):
+        prior_round = 1
+    return max(1, prior_round) + 1
+
+
 def _lane_context(
     findings: list[AgentFinding],
     causal_lanes: Sequence[CausalLaneRecord] = (),
@@ -76,16 +94,26 @@ def _lane_context(
     list[str],
     list[dict[str, Any]],
 ]:
-    """Return all, active, and Python-eliminated concrete Lane IDs."""
+    """Return a full inventory plus one bounded, diverse active snapshot.
+
+    The full inventory stays available to Python-owned state.  Every LLM-facing
+    RCA stage receives only the same direction/scope-diverse active snapshot so
+    a later component cannot silently revert to the top-N-by-score behaviour.
+    """
 
     raw_lanes: list[dict[str, Any]] = []
-    for finding in findings:
-        if finding.agent != AgentKind.MES.value:
-            continue
-        raw = finding.details.get("lane_candidates", [])
-        if isinstance(raw, list):
-            raw_lanes.extend(item for item in raw if isinstance(item, dict))
-    raw_lanes.extend(record.to_dict() for record in causal_lanes)
+    if causal_lanes:
+        # The reconciled Python inventory is authoritative after discovery.
+        # Historical raw MES payloads must not reintroduce aliases or terminal
+        # Lanes into later Candidate/Challenge prompts.
+        raw_lanes.extend(record.to_dict() for record in causal_lanes)
+    else:
+        for finding in findings:
+            if finding.agent != AgentKind.MES.value:
+                continue
+            raw = finding.details.get("lane_candidates", [])
+            if isinstance(raw, list):
+                raw_lanes.extend(item for item in raw if isinstance(item, dict))
     ordered = sorted(
         {
             str(item.get("lane_id", "")).strip(): item
@@ -98,11 +126,17 @@ def _lane_context(
         ),
     )
     all_ids = [str(item["lane_id"]) for item in ordered]
-    active_ids = [
-        str(item["lane_id"])
+    searchable = [
+        item
         for item in ordered
-        if str(item.get("investigation_status", "")) not in {"eliminated", "blocked"}
-    ][:3]
+        if lane_is_searchable(item)
+    ]
+    active_ids = list(select_diverse_lane_ids(searchable, limit=3))
+    active_id_set = set(active_ids)
+    active_contexts = [
+        item for item in ordered if str(item["lane_id"]) in active_id_set
+    ]
+    active_contexts.sort(key=lambda item: active_ids.index(str(item["lane_id"])))
     eliminated_ids = [
         str(item["lane_id"])
         for item in ordered
@@ -113,7 +147,38 @@ def _lane_context(
         for item in ordered
         if str(item.get("investigation_status", "")) == "blocked"
     ]
-    return all_ids, active_ids, eliminated_ids, blocked_ids, ordered
+    return all_ids, active_ids, eliminated_ids, blocked_ids, active_contexts
+
+
+def _bounded_challenge_evidence_ids(
+    *,
+    candidates: Sequence[dict[str, Any]],
+    evidence_gaps: Sequence[dict[str, Any]],
+    evidence_by_id: dict[str, Evidence],
+    active_lane_ids: Sequence[str],
+) -> list[str]:
+    """Keep challenge citations relevant to candidates or active Lane probes."""
+
+    active = set(active_lane_ids)
+    selected: set[str] = {
+        str(evidence_id)
+        for candidate in candidates
+        for field in ("supporting_evidence_ids", "contradicting_evidence_ids")
+        for evidence_id in candidate.get(field, [])
+        if str(evidence_id) in evidence_by_id
+    }
+    selected.update(
+        str(evidence_id)
+        for gap in evidence_gaps
+        for evidence_id in gap.get("evidence_ids", [])
+        if str(evidence_id) in evidence_by_id
+    )
+    selected.update(
+        evidence_id
+        for evidence_id, evidence in evidence_by_id.items()
+        if str(evidence.metadata.get("lane_id", "")).strip() in active
+    )
+    return sorted(selected)
 
 
 def _merge_evidence_payload(
@@ -371,6 +436,21 @@ class RCAReasoningAgent:
             )
             else []
         )
+        prior_candidate_semantic_profiles = (
+            [
+                dict(profile)
+                for profile in prior_rca_finding.details.get(
+                    "candidate_semantic_profiles", []
+                )
+                if isinstance(profile, dict)
+            ]
+            if prior_rca_finding is not None
+            and isinstance(
+                prior_rca_finding.details.get("candidate_semantic_profiles", []),
+                list,
+            )
+            else []
+        )
         prior_evidence_ids = (
             set(prior_rca_finding.evidence_ids)
             if prior_rca_finding is not None
@@ -442,12 +522,22 @@ class RCAReasoningAgent:
         alternative_lane_resolutions: list[AlternativeLaneResolution] = []
         consumed_discriminators: set[tuple[str, str]] = set()
         alternative_search_status = AlternativeSearchStatus.NOT_SEARCHED.value
+        competition_requirement = CompetitionRequirement.NOT_EVALUATED.value
+        competition_status = CandidateCompetitionStatus.NOT_EVALUATED.value
+        competition_type = CandidateCompetitionType.NOT_EVALUATED.value
+        competition_axes: list[str] = []
+        scope_assessment_status = "not_evaluated"
+        competition_failure_reason: str | None = None
+        competition_gap_reason: str | None = None
+        candidate_semantic_profiles: list[dict[str, Any]] = []
+        candidate_lineage: list[dict[str, Any]] = []
         challenge_generation: dict[str, Any] = {
             "source": "not_requested",
             "attempt_count": 0,
             "validation_errors": [],
             "output_invalid": False,
         }
+        lane_first_evidence_synthesis: dict[str, Any] | None = None
         if self.agent_mode == AgentMode.LLM.value and self.llm_client is not None:
             try:
                 generated = QwenHypothesisCandidateGenerator(
@@ -458,10 +548,18 @@ class RCAReasoningAgent:
                     findings=findings,
                     context_evidence=context_evidence,
                     prior_candidates=prior_candidates,
+                    prior_semantic_profiles=(
+                        prior_candidate_semantic_profiles
+                    ),
                     prior_challenges=prior_challenges,
                     prior_causal_gaps=prior_causal_gaps,
                     causal_lanes=lane_contexts,
                     new_evidence_ids=new_evidence_ids_since_prior,
+                )
+                lane_first_evidence_synthesis = (
+                    dict(generated.evidence_synthesis)
+                    if generated.evidence_synthesis is not None
+                    else None
                 )
                 targeted_investigation_results = [
                     dict(item) for item in generated.targeted_investigation_results
@@ -494,6 +592,9 @@ class RCAReasoningAgent:
                     "competition_repair_exhausted": (
                         generated.competition_repair_exhausted
                     ),
+                    "competition_repair_skipped_due_to_budget": (
+                        generated.competition_repair_skipped_due_to_budget
+                    ),
                     "targeted_investigation_count": len(
                         targeted_investigation_results
                     ),
@@ -518,7 +619,53 @@ class RCAReasoningAgent:
                             consumed_discriminators
                         )
                     ],
+                    "competition_requirement": generated.competition_requirement,
+                    "competition_status": generated.competition_status,
+                    "competition_type": generated.competition_type,
+                    "competition_failure_reason": (
+                        generated.competition_failure_reason
+                    ),
+                    "competition_gap_reason": generated.competition_gap_reason,
+                    "competition_assessment": (
+                        dict(generated.competition_assessment)
+                        if generated.competition_assessment is not None
+                        else None
+                    ),
+                    "candidate_semantic_profiles": [
+                        item.to_dict()
+                        for item in generated.candidate_semantic_profiles
+                    ],
+                    "semantic_validation_errors": list(
+                        generated.semantic_validation_errors
+                    ),
+                    "candidate_lineage": [
+                        dict(item) for item in generated.candidate_lineage
+                    ],
                 }
+                competition_requirement = generated.competition_requirement
+                competition_status = generated.competition_status
+                competition_type = generated.competition_type
+                competition_axes = list(
+                    (generated.competition_assessment or {}).get(
+                        "competition_axes", []
+                    )
+                )
+                scope_assessment_status = str(
+                    (generated.competition_assessment or {}).get(
+                        "scope_assessment_status", "not_evaluated"
+                    )
+                )
+                competition_failure_reason = (
+                    generated.competition_failure_reason
+                )
+                competition_gap_reason = generated.competition_gap_reason
+                candidate_semantic_profiles = [
+                    item.to_dict()
+                    for item in generated.candidate_semantic_profiles
+                ]
+                candidate_lineage = [
+                    dict(item) for item in generated.candidate_lineage
+                ]
                 if generated.candidate_output_invalid:
                     candidate_generation["fallback_reason"] = "qwen_candidate_output_invalid"
                     warnings.append(
@@ -546,7 +693,19 @@ class RCAReasoningAgent:
                         }
                     )
                     matrices = []
-                    for candidate in external_candidates:
+                    semantic_profiles_by_candidate_id = {
+                        str(profile.get("candidate_id", "")).strip(): profile
+                        for profile in candidate_semantic_profiles
+                        if str(profile.get("candidate_id", "")).strip()
+                    }
+                    semantic_profiles_expected = bool(
+                        candidate_semantic_profiles
+                    ) or competition_requirement not in {
+                        CompetitionRequirement.NOT_EVALUATED.value,
+                        CompetitionRequirement.NOT_REQUIRED.value,
+                    }
+                    for index, candidate in enumerate(external_candidates):
+                        candidate_id = f"{request_id}:llm:{index + 1}"
                         matrices.append(
                             build_causal_evidence_matrix(
                                 CausalHypothesis(
@@ -560,12 +719,27 @@ class RCAReasoningAgent:
                                     ),
                                 ),
                                 evidence_by_id.values(),
+                                semantic_profile=(
+                                    semantic_profiles_by_candidate_id.get(
+                                        candidate_id,
+                                        {} if semantic_profiles_expected else None,
+                                    )
+                                ),
                             )
                         )
                     challenge_candidates = [
                         {
                             **candidate,
                             "candidate_id": f"{request_id}:llm:{index + 1}",
+                            "semantic_profile": next(
+                                (
+                                    profile
+                                    for profile in candidate_semantic_profiles
+                                    if profile.get("candidate_id")
+                                    == f"{request_id}:llm:{index + 1}"
+                                ),
+                                None,
+                            ),
                         }
                         for index, candidate in enumerate(external_candidates)
                     ]
@@ -580,24 +754,54 @@ class RCAReasoningAgent:
                             ],
                             source_lot_id=source_lot_id,
                             consumed_discriminators=consumed_discriminators,
+                            competition_brief=(
+                                lane_first_evidence_synthesis or {}
+                            ).get("candidate_competition", {}),
+                            candidate_semantic_profiles=(
+                                candidate_semantic_profiles
+                            ),
                         )
                     )
+                    challenge_evidence_ids = _bounded_challenge_evidence_ids(
+                        candidates=challenge_candidates,
+                        evidence_gaps=gaps,
+                        evidence_by_id=evidence_by_id,
+                        active_lane_ids=active_lane_ids,
+                    )
+                    challenge_evidence_by_id = {
+                        evidence_id: evidence_by_id[evidence_id]
+                        for evidence_id in challenge_evidence_ids
+                    }
                     if len(external_candidates) >= 2:
-                        try:
-                            candidate_comparison = QwenHypothesisCandidateComparator(
-                                self.llm_client,
-                                prompt_version=self.prompt_version,
-                            ).compare(
-                                request_id=request_id,
-                                candidates=challenge_candidates,
-                                matrices=matrices,
-                                evidence_gaps=gaps,
-                            )
-                        except (LLMCallError, LLMOutputValidationError) as exc:
+                        if not llm_call_budget_available(
+                            self.llm_client,
+                            required_calls=1,
+                            # Challenge and the post-Action Planner are both
+                            # decision-critical; comparison prose is optional.
+                            reserve_calls=1 + (1 if all_lane_ids else 0),
+                        ):
                             candidate_comparison = {
                                 "source": "python",
-                                "comparison_error": str(exc),
+                                "comparison_skipped_due_to_budget": True,
                             }
+                        else:
+                            try:
+                                candidate_comparison = (
+                                    QwenHypothesisCandidateComparator(
+                                        self.llm_client,
+                                        prompt_version=self.prompt_version,
+                                    ).compare(
+                                        request_id=request_id,
+                                        candidates=challenge_candidates,
+                                        matrices=matrices,
+                                        evidence_gaps=gaps,
+                                    )
+                                )
+                            except (LLMCallError, LLMOutputValidationError) as exc:
+                                candidate_comparison = {
+                                    "source": "python",
+                                    "comparison_error": str(exc),
+                                }
                     if not all_lane_ids:
                         # Pre-Batch-25 snapshots may not contain concrete Lane
                         # records. There is no alternative Lane to investigate,
@@ -640,13 +844,24 @@ class RCAReasoningAgent:
                             candidates=challenge_candidates,
                             matrices=matrices,
                             evidence_gaps=gaps,
-                            evidence_ids=list(evidence_by_id),
-                            evidence_by_id=evidence_by_id,
-                            lane_ids=all_lane_ids,
+                            evidence_ids=challenge_evidence_ids,
+                            evidence_by_id=challenge_evidence_by_id,
+                            lane_ids=active_lane_ids,
                             active_lane_ids=active_lane_ids,
-                            eliminated_lane_ids=eliminated_lane_ids,
-                            blocked_lane_ids=blocked_lane_ids,
+                            eliminated_lane_ids=[
+                                lane_id
+                                for lane_id in eliminated_lane_ids
+                                if lane_id in set(active_lane_ids)
+                            ],
+                            blocked_lane_ids=[
+                                lane_id
+                                for lane_id in blocked_lane_ids
+                                if lane_id in set(active_lane_ids)
+                            ],
                             lane_contexts=lane_contexts,
+                            candidate_competition=(
+                                generated.competition_assessment
+                            ),
                         )
                         candidate_challenges = list(challenge_result.challenges)
                         alternative_lane_resolutions = list(
@@ -663,13 +878,25 @@ class RCAReasoningAgent:
                                 challenge_result.validation_errors
                             ),
                             "output_invalid": challenge_result.output_invalid,
+                            "repair_skipped_due_to_budget": (
+                                challenge_result.repair_skipped_due_to_budget
+                            ),
                             "alternative_search_status": alternative_search_status,
                             "alternative_lane_resolutions": [
                                 item.to_dict()
                                 for item in alternative_lane_resolutions
                             ],
+                            "prompt_audit": (
+                                dict(challenge_result.prompt_audit)
+                                if challenge_result.prompt_audit is not None
+                                else None
+                            ),
                         }
                     if challenge_generation.get("output_invalid"):
+                        competition_status = CandidateCompetitionStatus.FAILED.value
+                        competition_failure_reason = (
+                            CompetitionFailureReason.CHALLENGE_OUTPUT_INVALID.value
+                        )
                         warnings.append(
                             Warning(
                                 warning_id="WARN_RCA_QWEN_CHALLENGE_INVALID",
@@ -694,7 +921,18 @@ class RCAReasoningAgent:
                         else "qwen_candidate_provider_failed"
                     ),
                     "candidate_output_invalid": True,
+                    "competition_requirement": competition_requirement,
+                    "competition_status": CandidateCompetitionStatus.FAILED.value,
+                    "competition_type": competition_type,
+                    "competition_failure_reason": (
+                        CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value
+                    ),
+                    "candidate_lineage": [],
                 }
+                competition_status = CandidateCompetitionStatus.FAILED.value
+                competition_failure_reason = (
+                    CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value
+                )
                 warnings.append(
                     Warning(
                         warning_id=(
@@ -726,6 +964,54 @@ class RCAReasoningAgent:
                 )
             )
 
+        if (
+            competition_status == CandidateCompetitionStatus.ACTIVE.value
+            and alternative_search_status
+            == AlternativeSearchStatus.ALTERNATIVES_ELIMINATED.value
+        ):
+            competition_status = CandidateCompetitionStatus.RESOLVED.value
+            competition_failure_reason = None
+        elif (
+            competition_status == CandidateCompetitionStatus.PENDING.value
+            and competition_requirement
+            == CompetitionRequirement.ALTERNATIVE_DISCOVERY_REQUIRED.value
+            and alternative_search_status
+            in {
+                AlternativeSearchStatus.ALTERNATIVE_FOUND.value,
+                AlternativeSearchStatus.IN_PROGRESS.value,
+                AlternativeSearchStatus.UNRESOLVED.value,
+            }
+        ):
+            competition_status = CandidateCompetitionStatus.ACTIVE.value
+
+        if competition_status == CandidateCompetitionStatus.FAILED.value:
+            alternative_search_status = AlternativeSearchStatus.UNRESOLVED.value
+            warnings.append(
+                Warning(
+                    warning_id="WARN_RCA_CANDIDATE_COMPETITION_FAILED",
+                    message=(
+                        "Qwen did not complete the Python-required candidate "
+                        "competition; confirmation remains blocked."
+                    ),
+                    evidence_ids=evidence_ids,
+                )
+            )
+        candidate_generation["competition_requirement"] = competition_requirement
+        candidate_generation["competition_status"] = competition_status
+        candidate_generation["competition_type"] = competition_type
+        candidate_generation["competition_axes"] = competition_axes
+        candidate_generation["scope_assessment_status"] = (
+            scope_assessment_status
+        )
+        candidate_generation["competition_failure_reason"] = (
+            competition_failure_reason
+        )
+        candidate_generation["competition_gap_reason"] = competition_gap_reason
+        candidate_generation["candidate_lineage"] = candidate_lineage
+        candidate_generation["candidate_semantic_profiles"] = (
+            candidate_semantic_profiles
+        )
+
         engine_result = self.hypothesis_engine.analyze(
             request_id=request_id,
             findings=findings,
@@ -741,8 +1027,14 @@ class RCAReasoningAgent:
             alternative_search_status=alternative_search_status,
             candidate_challenges=candidate_challenges,
             context_evidence=context_evidence,
-            causal_lanes=causal_lanes,
+            causal_lanes=tuple(
+                lane for lane in causal_lanes if lane.lane_id in set(active_lane_ids)
+            ),
             consumed_discriminators=consumed_discriminators,
+            competition_brief=(lane_first_evidence_synthesis or {}).get(
+                "candidate_competition", {}
+            ),
+            candidate_semantic_profiles=candidate_semantic_profiles,
         )
         decision = engine_result["decision_gate"]
         root_cause = str(decision["root_cause"])
@@ -848,6 +1140,7 @@ class RCAReasoningAgent:
         )
         ranked_candidates = [
             {
+                "candidate_id": candidate["hypothesis_id"],
                 "root_cause": candidate["root_cause"],
                 "causal_explanation": candidate.get(
                     "causal_explanation", candidate["root_cause"]
@@ -965,7 +1258,7 @@ class RCAReasoningAgent:
             evidence_ids=evidence_ids,
             details={
                 "root_cause": root_cause,
-                "reasoning_round": 2 if prior_rca_finding is not None else 1,
+                "reasoning_round": _next_reasoning_round(prior_rca_finding),
                 "prior_authoritative_rca_finding_id": (
                     prior_rca_finding.finding_id
                     if prior_rca_finding is not None
@@ -988,6 +1281,15 @@ class RCAReasoningAgent:
                 "ranked_candidates": ranked_candidates,
                 "reasoning_engine": "hypothesis_v1",
                 "hypothesis_candidate_generation": candidate_generation,
+                "competition_requirement": competition_requirement,
+                "competition_status": competition_status,
+                "competition_type": competition_type,
+                "competition_axes": competition_axes,
+                "scope_assessment_status": scope_assessment_status,
+                "competition_failure_reason": competition_failure_reason,
+                "competition_gap_reason": competition_gap_reason,
+                "candidate_semantic_profiles": candidate_semantic_profiles,
+                "candidate_lineage": candidate_lineage,
                 "adversarial_challenge_generation": challenge_generation,
                 "candidate_challenges": [
                     challenge.to_dict() for challenge in candidate_challenges
@@ -1010,18 +1312,21 @@ class RCAReasoningAgent:
                 "non_blocking_data_missing_evidence_ids": list(
                     decision.get("non_blocking_data_missing_evidence_ids", [])
                 ),
-                "evidence_synthesis": engine_result.get(
-                    "evidence_synthesis",
-                    build_evidence_synthesis(
-                        [
-                            *[
-                                item
-                                for finding in findings
-                                for item in finding.evidence
-                            ],
-                            *context_evidence,
-                        ]
-                    ),
+                "evidence_synthesis": (
+                    lane_first_evidence_synthesis
+                    or engine_result.get(
+                        "evidence_synthesis",
+                        build_evidence_synthesis(
+                            [
+                                *[
+                                    item
+                                    for finding in findings
+                                    for item in finding.evidence
+                                ],
+                                *context_evidence,
+                            ]
+                        ),
+                    )
                 ),
                 "causal_evidence_gaps": list(
                     engine_result.get("causal_evidence_gaps", [])

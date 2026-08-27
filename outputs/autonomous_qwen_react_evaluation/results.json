@@ -254,9 +254,9 @@
           },
           "observation": "CMP_CU03/CMP_CU03_CH02 shows endpoint_time +16.7%, slurry_flow -12.0%, 0 recorded OOC events, and 0 SPC OOC parameters at operation 6400.",
           "produced_evidence_ids": [
-            "EV_SPC_BASELINE_STATUS",
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW"
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F",
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "lane_id": "lane:6400:CMP_CU03:CMP_CU03_CH02:CU_CMP_40N",
@@ -351,9 +351,9 @@
           "evaluation_reason": "The allowlisted fdc action matched its completed ActionRecord and added 3 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_SPC_BASELINE_STATUS",
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW"
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F",
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "The process context is available; inspect FDC, OOC, and SPC evidence.",
           "redundant": false
@@ -489,8 +489,8 @@
           },
           "observation": "Selected Lots show scratch/edge_dominant defect evidence and 20 WAT-failing Lots led by leakage; metrology has 0 out-of-spec Wafer records.",
           "produced_evidence_ids": [
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "defect": "scratch",
@@ -510,9 +510,9 @@
           },
           "observation": "CMP_CU03/CMP_CU03_CH02 shows endpoint_time +16.7%, slurry_flow -12.0%, 0 recorded OOC events, and 0 SPC OOC parameters at operation 6400.",
           "produced_evidence_ids": [
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "defect": "scratch",
@@ -577,11 +577,11 @@
             "EV_MES_SHARED_LANE_LOT_A_001_6400_20_LANE_1500_CMP_STI_01_CMP_STI_01_CH03_STI_CMP_40N",
             "EV_MES_SHARED_LANE_LOT_A_001_6400_20_LANE_6100_CMP_IMD_01_CMP_IMD_01_CH02_IMD_CMP_40N",
             "EV_MES_SHARED_LANE_LOT_A_001_6400_20_LANE_5100_CMP_ILD_01_CMP_ILD_01_CH04_ILD_CMP_40N",
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE",
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "defect": "scratch",
@@ -692,8 +692,8 @@
           "evaluation_reason": "The allowlisted defect_wat action matched its completed ActionRecord and added 2 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "Shared-exposure Lots require a second defect-pattern comparison before FDC RCA.",
           "redundant": false
@@ -705,9 +705,9 @@
           "evaluation_reason": "The allowlisted fdc action matched its completed ActionRecord and added 3 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "The shared exposure needs FDC/SPC process-mechanism evidence.",
           "redundant": false
@@ -843,8 +843,8 @@
           },
           "observation": "Selected Lots show scratch/edge_dominant defect evidence and 20 WAT-failing Lots led by leakage; metrology has 0 out-of-spec Wafer records.",
           "produced_evidence_ids": [
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "lane_id": "lane:6400:CMP_CU03:CMP_CU03_CH02:CU_CMP_40N",
@@ -860,9 +860,9 @@
           },
           "observation": "CMP_CU03/CMP_CU03_CH02 shows endpoint_time +16.7%, slurry_flow -12.0%, 0 recorded OOC events, and 0 SPC OOC parameters at operation 6400.",
           "produced_evidence_ids": [
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "lane_id": "lane:6400:CMP_CU03:CMP_CU03_CH02:CU_CMP_40N",
@@ -878,7 +878,7 @@
           },
           "observation": "Historical case RCA_CMP_2025_032 matched at 99%; documented root cause: Slurry pump degradation reduced slurry flow on Cu CMP chamber.",
           "produced_evidence_ids": [
-            "EV_KNOWLEDGE_MATCH"
+            "EV_KNOWLEDGE_MATCH_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "lane_id": "lane:6400:CMP_CU03:CMP_CU03_CH02:CU_CMP_40N",
@@ -986,8 +986,8 @@
           "evaluation_reason": "The allowlisted defect_wat action matched its completed ActionRecord and added 2 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "Shared-exposure Lots require a second defect-pattern comparison before FDC RCA.",
           "redundant": false
@@ -999,9 +999,9 @@
           "evaluation_reason": "The allowlisted fdc action matched its completed ActionRecord and added 3 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "The shared exposure needs FDC/SPC process-mechanism evidence.",
           "redundant": false
@@ -1013,7 +1013,7 @@
           "evaluation_reason": "The allowlisted knowledge action matched its completed ActionRecord and added 1 new applicable QuestionEvidenceLink for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_KNOWLEDGE_MATCH"
+            "EV_KNOWLEDGE_MATCH_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "Historical retrieval requires current MES, FDC, and defect context for validation.",
           "redundant": false
@@ -1306,8 +1306,8 @@
           },
           "observation": "Selected Lots show scratch/edge_dominant defect evidence and 20 WAT-failing Lots led by leakage; metrology has 0 out-of-spec Wafer records.",
           "produced_evidence_ids": [
-            "EV_DEFECT_SCRATCH",
-            "EV_WAT_LEAKAGE"
+            "EV_DEFECT_SCRATCH_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "end_date": "2026-07-31",
@@ -1327,8 +1327,8 @@
           },
           "observation": "Selected Lots show scratch/edge_dominant defect evidence and 20 WAT-failing Lots led by leakage; metrology has 0 out-of-spec Wafer records.",
           "produced_evidence_ids": [
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "end_date": "2026-07-31",
@@ -1348,9 +1348,9 @@
           },
           "observation": "CMP_CU03/CMP_CU03_CH02 shows endpoint_time +16.7%, slurry_flow -12.0%, 0 recorded OOC events, and 0 SPC OOC parameters at operation 6400.",
           "produced_evidence_ids": [
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "end_date": "2026-07-31",
@@ -1413,13 +1413,13 @@
             "EV_MES_SHARED_LANE_LOT_A_001_LOT_A_020_20_LANE_5100_CMP_ILD_01_CMP_ILD_01_CH04_ILD_CMP_40N",
             "EV_HOLD_COMMENT",
             "EV_MES_LOT_HOLD",
-            "EV_DEFECT_SCRATCH",
-            "EV_WAT_LEAKAGE",
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE",
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_DEFECT_SCRATCH_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_LANE_6AF277418DC4910F",
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "scope": {
             "end_date": "2026-07-31",
@@ -1516,8 +1516,8 @@
           "evaluation_reason": "The allowlisted defect_wat action matched its completed ActionRecord and added 2 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_DEFECT_SCRATCH",
-            "EV_WAT_LEAKAGE"
+            "EV_DEFECT_SCRATCH_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "Root-cause assessment requires an observed product-outcome pattern.",
           "redundant": false
@@ -1529,8 +1529,8 @@
           "evaluation_reason": "The allowlisted defect_wat action matched its completed ActionRecord and added 2 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE",
-            "EV_WAT_LEAKAGE_SHARED_EXPOSURE"
+            "EV_DEFECT_SCRATCH_SHARED_EXPOSURE_LANE_6AF277418DC4910F",
+            "EV_WAT_LEAKAGE_SHARED_EXPOSURE_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "Shared-exposure Lots require a second defect-pattern comparison before FDC RCA.",
           "redundant": false
@@ -1542,9 +1542,9 @@
           "evaluation_reason": "The allowlisted fdc action matched its completed ActionRecord and added 3 new applicable QuestionEvidenceLinks for its target Question.",
           "evidence_gain": true,
           "new_evidence_ids": [
-            "EV_FDC_ENDPOINT_TIME",
-            "EV_FDC_SLURRY_FLOW",
-            "EV_SPC_BASELINE_STATUS"
+            "EV_FDC_ENDPOINT_TIME_LANE_6AF277418DC4910F",
+            "EV_FDC_SLURRY_FLOW_LANE_6AF277418DC4910F",
+            "EV_SPC_BASELINE_STATUS_LANE_6AF277418DC4910F"
           ],
           "planner_reason": "The shared exposure needs FDC/SPC process-mechanism evidence.",
           "redundant": false

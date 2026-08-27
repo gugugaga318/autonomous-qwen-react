@@ -9,8 +9,12 @@ from yield_rca_core.causal_investigation_models import (
     AlternativeLaneResolutionStatus,
     AlternativeSearchStatus,
     CandidateChallenge,
+    CandidateCompetitionStatus,
+    CandidateCompetitionType,
     CausalLaneRecord,
     ChallengeStatus,
+    CompetitionFailureReason,
+    CompetitionRequirement,
     InvestigationLaneStatus,
 )
 from yield_rca_core.evidence_models import (
@@ -130,7 +134,11 @@ def test_retained_blocked_and_non_discriminative_are_not_elimination() -> None:
         ),
         ChallengeStatus.BLOCKED.value: (
             AlternativeLaneResolutionStatus.BLOCKED.value,
-            AlternativeSearchStatus.BLOCKED_BY_MISSING_DATA.value,
+            # One unavailable Lane is unresolved investigation state, not
+            # proof that every high-value alternative is blocked. Patch 3's
+            # Python Competition Progression Engine owns that global terminal
+            # decision after evaluating all remaining Action values.
+            AlternativeSearchStatus.UNRESOLVED.value,
         ),
         ChallengeStatus.NON_DISCRIMINATIVE.value: (
             AlternativeLaneResolutionStatus.NON_DISCRIMINATIVE.value,
@@ -274,3 +282,49 @@ def test_supervisor_persists_each_lane_result_without_closing_other_lane() -> No
         "EV_B",
         "EV_C",
     }
+
+
+def test_supervisor_persists_candidate_competition_failure_without_challenge() -> None:
+    state = RCAState(
+        job=RCAJob(job_id="JOB_265_FAILURE", user_query="test"),
+        evidence=[_evidence("EV_A", "LANE_A")],
+        causal_lanes=[CausalLaneRecord(lane_id="LANE_A", priority_score=0.9)],
+    )
+    finding = AgentFinding(
+        finding_id="F_265_FAILURE",
+        agent="rca_reasoning",
+        summary="A second evidence-bounded direction was not proposed.",
+        confidence=0.0,
+        evidence_ids=["EV_A"],
+        details={
+            "adversarial_challenge_generation": {"source": "not_requested"},
+            "candidate_challenges": [],
+            "competition_requirement": (
+                CompetitionRequirement.DIRECTION_REQUIRED.value
+            ),
+            "competition_status": CandidateCompetitionStatus.FAILED.value,
+            "competition_type": CandidateCompetitionType.CAUSAL_DIRECTION.value,
+            "competition_failure_reason": (
+                CompetitionFailureReason.ALTERNATIVE_DIRECTION_NOT_GENERATED.value
+            ),
+            "candidate_lineage": [
+                {
+                    "candidate_index": 0,
+                    "lineage_status": "retained",
+                }
+            ],
+        },
+    )
+
+    updated = _update_competition_state(state, finding)
+
+    assert updated.competition_trace is not None
+    assert updated.competition_trace.competition_status == (
+        CandidateCompetitionStatus.FAILED.value
+    )
+    assert updated.competition_trace.competition_failure_reason == (
+        CompetitionFailureReason.ALTERNATIVE_DIRECTION_NOT_GENERATED.value
+    )
+    assert updated.competition_trace.candidate_lineage[0]["lineage_status"] == (
+        "retained"
+    )

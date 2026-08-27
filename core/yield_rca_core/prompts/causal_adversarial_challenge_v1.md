@@ -6,12 +6,63 @@ Evidence Gaps.  Challenge every supplied candidate before it can be confirmed.
 
 Your job is to:
 
-1. identify the strongest alternative causal Lane or candidate, when one exists;
+1. identify the strongest alternative candidate, when one exists;
 2. cite only Evidence IDs present in available_evidence_ids;
 3. select only Python-generated gap_id values from evidence_gaps as
    distinguishing_gap_ids;
 4. list precursor Evidence that the candidate does not explain;
 5. explain why the candidate is stronger, weaker, or still unresolved.
+
+An alternative Candidate and an Evidence-probe Lane are different concepts.
+Use ``alternative_candidate_id`` for the competing explanation and
+``evidence_probe_lane_id`` for the Lane where one distinguishing observation
+should be collected. A Lane by itself is not a causal hypothesis.
+
+Use ``challenge_kind=candidate_direction`` when candidates make different
+causal directions. Use ``challenge_kind=mechanism`` when candidates share a
+direction but assert materially different intervening physical processes. Use
+``challenge_kind=scope`` for falsifiably different scope
+hypotheses within one direction, such as recipe-specific versus chamber-wide.
+Use ``challenge_kind=lane_probe`` only when candidate competition is not yet
+evidence-bounded and a Lane must first be investigated.
+
+For every ``mechanism`` challenge, return ``mechanism_relation``. With two
+Candidates it must be ``independent_alternative`` only after applying this
+counterfactual: the alternative can remain true when the reference Candidate's
+primary mechanism is absent. If it presupposes the reference and only adds
+recipe sensitivity, scope, amplification, or severity, it is not a mechanism
+competition. With one Candidate, use ``mechanism_relation=unknown`` and select
+one legal mechanism-discovery Gap; do not invent Candidate B.
+
+When ``candidate_competition.candidate_profiles`` contains a
+``semantic_profile``, treat its ``claimed_scope`` as the Candidate's declared
+causal reach and its ``comparison_scope`` as the wider set used to test that
+claim. Do not infer claimed scope from the number of recipes, Lanes, or entities
+covered by supporting Evidence. A differential-sensitivity Candidate may cite
+both compared recipe Lanes while still making a focal sensitivity claim.
+Challenge whether the declared distinguishing predictions are supported or
+still need a typed Gap; do not rewrite the Candidate's scope.
+
+``challenge_output_contract`` is the authoritative whitelist for the current
+round. Always copy its non-null ``required_challenge_kind`` exactly. When it
+requires ``lane_probe``, copy the sole listed Candidate into ``candidate_id``,
+set ``alternative_candidate_id`` to null, and copy one listed Lane into
+``evidence_probe_lane_id``. Never copy a Lane ID into an alternative Candidate
+field. When it requires ``scope``, the listed probe Lanes are the unresolved
+same-direction comparison scope; do not switch to a different causal direction.
+For each challenge, first choose the Candidate and probe Lane, then select
+``distinguishing_gap_ids`` only from
+``challenge_output_contract.allowed_gap_ids_by_candidate_and_lane[candidate_id][evidence_probe_lane_id]``.
+Use the single value listed in
+``highest_information_gain_gap_ids_by_candidate_and_lane`` whenever that map is
+non-empty for the chosen Candidate/Lane pair. The broader
+``allowed_gap_ids_by_candidate`` list is audit context only and must not be used
+to move a Gap from one Lane to another.
+Candidate-profile ``consumed_discriminator_gap_ids`` describe prior
+investigation history and are never current selectable Gaps. On a repair
+attempt, follow the Candidate-and-Lane-specific mappings included in
+``previous_validation_feedback`` exactly. If changing the probe Lane, also
+change the Gap to one listed for the new Candidate/Lane pair.
 
 The ``causal_lanes`` payload contains Python-owned equipment, chamber,
 operation, recipe, Lot, and time-window facts.  Evidence used to resolve a
@@ -56,6 +107,10 @@ Return exactly this JSON object:
   "challenges": [
     {
       "candidate_id": "...",
+      "alternative_candidate_id": "... or null",
+      "evidence_probe_lane_id": "... or null",
+      "challenge_kind": "candidate_direction | mechanism | scope | lane_probe",
+      "mechanism_relation": "independent_alternative | unknown",
       "strongest_alternative_lane_id": "... or null",
       "supporting_evidence_ids": ["EV_..."],
       "contradicting_evidence_ids": ["EV_..."],

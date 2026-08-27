@@ -8,29 +8,40 @@ status used by the Confirmation Gate.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from yield_rca_core.causal_evidence_matrix import CausalEvidenceMatrix
+from yield_rca_core.causal_evidence_matrix import (
+    CausalEvidenceMatrix,
+    compact_causal_evidence_matrix_for_prompt,
+)
 from yield_rca_core.causal_investigation_models import (
     AlternativeLaneResolution,
     AlternativeLaneResolutionStatus,
     AlternativeSearchStatus,
     CandidateChallenge,
+    CandidateCompetitionAxis,
+    CandidateMechanismRelation,
+    ChallengeKind,
     ChallengeStatus,
+    CompetitionRequirement,
 )
 from yield_rca_core.evidence_models import Evidence
+from yield_rca_core.evidence_synthesis import compact_evidence_prompt_card
 from yield_rca_core.llm_gateway import (
     LLMCallError,
     LLMClient,
     LLMOutputValidationError,
     LLMRequest,
+    llm_call_budget_available,
 )
 from yield_rca_core.models import AgentKind, ModelValidationError
 
 _OUTPUT_ATTEMPTS = 2
+_MAX_CHALLENGE_PAYLOAD_CHARS = 64_000
 
 
 @dataclass(frozen=True)
@@ -41,8 +52,40 @@ class AdversarialChallengeGeneration:
     attempt_count: int
     validation_errors: tuple[str, ...] = ()
     output_invalid: bool = False
+    repair_skipped_due_to_budget: bool = False
     alternative_search_status: str = AlternativeSearchStatus.NOT_SEARCHED.value
     lane_resolutions: tuple[AlternativeLaneResolution, ...] = ()
+    prompt_audit: dict[str, Any] | None = None
+
+
+def _compact_lane_context_for_prompt(value: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "lane_id",
+        "operation",
+        "operation_name",
+        "module",
+        "equipment",
+        "chamber",
+        "recipe",
+        "parameter_scope",
+        "exposed_lot_ids",
+        "time_window",
+        "priority_score",
+        "lifecycle_status",
+    )
+    return {key: value[key] for key in keys if key in value}
+
+
+def _payload_char_count(payload: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
 
 
 def _string_list(value: object, field_name: str) -> tuple[str, ...]:
@@ -74,6 +117,35 @@ def _gap_information_gain_for_lane(
     return None
 
 
+def _gap_applies_to_lane(gap: Mapping[str, Any], lane_id: str) -> bool:
+    """Return whether a typed Gap can produce an observation on one Lane."""
+
+    raw_scope = gap.get("target_scope", {})
+    target_lane_id = (
+        str(raw_scope.get("lane_id", "")).strip()
+        if isinstance(raw_scope, Mapping)
+        else ""
+    )
+    if target_lane_id:
+        return target_lane_id == lane_id
+    raw_applicable_lanes = gap.get("applicable_lane_ids", [])
+    applicable_lanes = (
+        {
+            str(item).strip()
+            for item in raw_applicable_lanes
+            if str(item).strip()
+        }
+        if isinstance(raw_applicable_lanes, list | tuple)
+        else set()
+    )
+    if applicable_lanes:
+        return lane_id in applicable_lanes
+    raw_by_lane = gap.get("information_gain_by_lane")
+    if isinstance(raw_by_lane, Mapping) and raw_by_lane:
+        return lane_id in raw_by_lane
+    return True
+
+
 def _normalize_challenge_payload(
     payload: object,
     *,
@@ -93,7 +165,29 @@ def _normalize_challenge_payload(
             f"candidate challenge references unknown candidate_id: {candidate_id!r}"
         )
 
-    alternative = payload.get("strongest_alternative_lane_id")
+    alternative_candidate_id = payload.get("alternative_candidate_id")
+    normalized_alternative_candidate_id = (
+        str(alternative_candidate_id).strip()
+        if alternative_candidate_id is not None
+        else None
+    )
+    if normalized_alternative_candidate_id == "":
+        normalized_alternative_candidate_id = None
+    if (
+        normalized_alternative_candidate_id is not None
+        and normalized_alternative_candidate_id not in candidate_ids
+    ):
+        raise LLMOutputValidationError(
+            "candidate challenge references unknown alternative_candidate_id"
+        )
+    if normalized_alternative_candidate_id == candidate_id:
+        raise LLMOutputValidationError(
+            "alternative_candidate_id must differ from candidate_id"
+        )
+
+    alternative = payload.get("evidence_probe_lane_id")
+    if alternative is None:
+        alternative = payload.get("strongest_alternative_lane_id")
     if alternative is None:
         # The public design wording calls this field strongest_alternative;
         # accept the alias but normalize it into the Python-owned state model.
@@ -107,6 +201,93 @@ def _normalize_challenge_payload(
         raise LLMOutputValidationError(
             "candidate challenge references an unknown strongest alternative Lane"
         )
+    raw_challenge_kind = payload.get("challenge_kind")
+    if raw_challenge_kind is None:
+        challenge_kind = (
+            ChallengeKind.CANDIDATE_DIRECTION.value
+            if normalized_alternative_candidate_id is not None
+            else ChallengeKind.LANE_PROBE.value
+        )
+    else:
+        try:
+            challenge_kind = ChallengeKind(str(raw_challenge_kind)).value
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in ChallengeKind)
+            raise LLMOutputValidationError(
+                f"challenge_kind must be one of: {allowed}"
+            ) from exc
+    if (
+        challenge_kind
+        in {
+            ChallengeKind.CANDIDATE_DIRECTION.value,
+            ChallengeKind.SCOPE.value,
+        }
+        and normalized_alternative_candidate_id is None
+    ):
+        raise LLMOutputValidationError(
+            "candidate-direction and scope challenges require "
+            "alternative_candidate_id"
+        )
+    if (
+        challenge_kind == ChallengeKind.MECHANISM.value
+        and len(candidate_ids) >= 2
+        and normalized_alternative_candidate_id is None
+    ):
+        raise LLMOutputValidationError(
+            "a two-Candidate mechanism challenge requires "
+            "alternative_candidate_id"
+        )
+    if (
+        challenge_kind == ChallengeKind.MECHANISM.value
+        and normalized_alternative_candidate_id is None
+        and alternative_id is None
+    ):
+        raise LLMOutputValidationError(
+            "a one-Candidate mechanism probe requires evidence_probe_lane_id"
+        )
+    if (
+        challenge_kind == ChallengeKind.LANE_PROBE.value
+        and normalized_alternative_candidate_id is not None
+    ):
+        raise LLMOutputValidationError(
+            "lane_probe requires alternative_candidate_id=null; a causal Lane "
+            "must be supplied only as evidence_probe_lane_id"
+        )
+    raw_mechanism_relation = payload.get("mechanism_relation")
+    if challenge_kind == ChallengeKind.MECHANISM.value:
+        if raw_mechanism_relation is None:
+            raise LLMOutputValidationError(
+                "mechanism challenges require mechanism_relation"
+            )
+        try:
+            mechanism_relation = CandidateMechanismRelation(
+                str(raw_mechanism_relation)
+            ).value
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in CandidateMechanismRelation)
+            raise LLMOutputValidationError(
+                f"mechanism_relation must be one of: {allowed}"
+            ) from exc
+        if (
+            normalized_alternative_candidate_id is not None
+            and mechanism_relation
+            != CandidateMechanismRelation.INDEPENDENT_ALTERNATIVE.value
+        ):
+            raise LLMOutputValidationError(
+                "a two-Candidate mechanism challenge must independently verify "
+                "mechanism_relation=independent_alternative"
+            )
+        if (
+            normalized_alternative_candidate_id is None
+            and mechanism_relation
+            != CandidateMechanismRelation.UNKNOWN.value
+        ):
+            raise LLMOutputValidationError(
+                "a one-Candidate mechanism probe must use "
+                "mechanism_relation=unknown"
+            )
+    else:
+        mechanism_relation = CandidateMechanismRelation.UNKNOWN.value
 
     supporting = _string_list(
         payload.get("supporting_evidence_ids", []),
@@ -272,6 +453,7 @@ def _normalize_challenge_payload(
                 for gap_id, gap in gap_by_id.items()
                 if str(gap.get("gap_type", "")) == "hypothesis_discrimination"
                 and str(gap.get("candidate_id", "")).strip() in {"", candidate_id}
+                and _gap_applies_to_lane(gap, alternative_id)
                 and (
                     score := _gap_information_gain_for_lane(gap, alternative_id)
                 )
@@ -336,6 +518,10 @@ def _normalize_challenge_payload(
             )
     return CandidateChallenge(
         candidate_id=candidate_id,
+        alternative_candidate_id=normalized_alternative_candidate_id,
+        evidence_probe_lane_id=alternative_id,
+        challenge_kind=challenge_kind,
+        mechanism_relation=mechanism_relation,
         strongest_alternative_lane_id=alternative_id,
         strongest_alternative=alternative_id,
         supporting_evidence_ids=supporting,
@@ -426,6 +612,183 @@ def _candidate_ids(candidates: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
         if candidate_id and candidate_id not in result:
             result.append(candidate_id)
     return tuple(result)
+
+
+def _challenge_output_contract(
+    *,
+    candidate_ids: Sequence[str],
+    active_lane_ids: Sequence[str],
+    evidence_gaps: Sequence[Mapping[str, Any]] = (),
+    candidate_competition: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return explicit ID/kind choices for the current competition phase."""
+
+    normalized_candidate_ids = tuple(
+        dict.fromkeys(str(item).strip() for item in candidate_ids if str(item).strip())
+    )
+    requirement = str(
+        (candidate_competition or {}).get("competition_requirement", "")
+    )
+    discovery_probe = (
+        len(candidate_ids) == 1
+        and requirement == CompetitionRequirement.ALTERNATIVE_DISCOVERY_REQUIRED.value
+    )
+    mechanism_probe = (
+        len(candidate_ids) == 1
+        and requirement == CompetitionRequirement.MECHANISM_REQUIRED.value
+    )
+    semantic_profiles_complete = bool(
+        (candidate_competition or {}).get("semantic_profiles_complete")
+    )
+    required_challenge_kind: str | None = None
+    if discovery_probe:
+        required_challenge_kind = ChallengeKind.LANE_PROBE.value
+    elif requirement == CompetitionRequirement.MECHANISM_REQUIRED.value and len(
+        candidate_ids
+    ) >= 1:
+        required_challenge_kind = ChallengeKind.MECHANISM.value
+    elif (
+        requirement == CompetitionRequirement.SCOPE_REQUIRED.value
+        and len(candidate_ids) >= 2
+        and semantic_profiles_complete
+    ):
+        required_challenge_kind = ChallengeKind.SCOPE.value
+    elif requirement in {
+        CompetitionRequirement.DIRECTION_REQUIRED.value,
+        CompetitionRequirement.MIXED_REQUIRED.value,
+    } and len(candidate_ids) >= 2:
+        required_challenge_kind = ChallengeKind.CANDIDATE_DIRECTION.value
+    required_competition_axis = (
+        CandidateCompetitionAxis.MECHANISM.value
+        if required_challenge_kind == ChallengeKind.MECHANISM.value
+        else None
+    )
+
+    def gap_belongs_to_candidate(
+        gap: Mapping[str, Any], candidate_id: str
+    ) -> bool:
+        return (
+            str(gap.get("gap_type", "")).strip()
+            == "hypothesis_discrimination"
+            and (
+                required_competition_axis is None
+                or str(gap.get("competition_axis", "")).strip()
+                == required_competition_axis
+            )
+            and (
+                str(gap.get("candidate_id", "")).strip() == candidate_id
+                or candidate_id
+                in {
+                    str(item).strip()
+                    for item in gap.get("candidate_ids", [])
+                    if str(item).strip()
+                }
+            )
+            and bool(str(gap.get("gap_id", "")).strip())
+        )
+
+    candidate_gaps = {
+        candidate_id: [
+            gap
+            for gap in evidence_gaps
+            if gap_belongs_to_candidate(gap, candidate_id)
+        ]
+        for candidate_id in normalized_candidate_ids
+    }
+    allowed_gap_ids_by_candidate = {
+        candidate_id: sorted(
+            str(gap.get("gap_id", "")).strip() for gap in gaps
+        )
+        for candidate_id, gaps in candidate_gaps.items()
+    }
+    scope_gap_lane_ids = tuple(
+        dict.fromkeys(
+            str(target_scope.get("lane_id", "")).strip()
+            for gap in evidence_gaps
+            if str(gap.get("gap_origin", "")).strip() == "scope_competition"
+            and isinstance(
+                target_scope := gap.get("target_scope", {}),
+                Mapping,
+            )
+            and str(target_scope.get("lane_id", "")).strip()
+        )
+    )
+    allowed_probe_lane_ids = (
+        scope_gap_lane_ids
+        if required_challenge_kind == ChallengeKind.SCOPE.value
+        and scope_gap_lane_ids
+        else tuple(
+            dict.fromkeys(str(item) for item in active_lane_ids if str(item))
+        )
+    )
+    allowed_gap_ids_by_candidate_and_lane: dict[str, dict[str, list[str]]] = {}
+    highest_information_gain_gap_ids_by_candidate_and_lane: dict[
+        str, dict[str, list[str]]
+    ] = {}
+    for candidate_id, gaps in candidate_gaps.items():
+        allowed_by_lane: dict[str, list[str]] = {}
+        highest_by_lane: dict[str, list[str]] = {}
+        for lane_id in allowed_probe_lane_ids:
+            applicable = [
+                gap for gap in gaps if _gap_applies_to_lane(gap, lane_id)
+            ]
+            allowed_by_lane[lane_id] = sorted(
+                str(gap.get("gap_id", "")).strip() for gap in applicable
+            )
+            scored = [
+                (str(gap.get("gap_id", "")).strip(), score)
+                for gap in applicable
+                if (
+                    score := _gap_information_gain_for_lane(gap, lane_id)
+                )
+                is not None
+            ]
+            highest_by_lane[lane_id] = (
+                sorted(
+                    gap_id
+                    for gap_id, score in scored
+                    if score == max(item[1] for item in scored)
+                )
+                if scored
+                else list(allowed_by_lane[lane_id])
+            )
+        allowed_gap_ids_by_candidate_and_lane[candidate_id] = allowed_by_lane
+        highest_information_gain_gap_ids_by_candidate_and_lane[candidate_id] = (
+            highest_by_lane
+        )
+    return {
+        "allowed_candidate_ids": list(normalized_candidate_ids),
+        "allowed_alternative_candidate_ids": (
+            []
+            if discovery_probe or mechanism_probe
+            else list(normalized_candidate_ids)
+        ),
+        "allowed_evidence_probe_lane_ids": list(allowed_probe_lane_ids),
+        "required_challenge_kind": required_challenge_kind,
+        "required_competition_axis": required_competition_axis,
+        "required_mechanism_relation": (
+            CandidateMechanismRelation.UNKNOWN.value
+            if mechanism_probe
+            else CandidateMechanismRelation.INDEPENDENT_ALTERNATIVE.value
+            if required_challenge_kind == ChallengeKind.MECHANISM.value
+            else None
+        ),
+        "required_alternative_candidate_id": (
+            None if discovery_probe or mechanism_probe else "listed_only"
+        ),
+        "allowed_gap_ids_by_candidate": allowed_gap_ids_by_candidate,
+        "allowed_gap_ids_by_candidate_and_lane": (
+            allowed_gap_ids_by_candidate_and_lane
+        ),
+        "highest_information_gain_gap_ids_by_candidate_and_lane": (
+            highest_information_gain_gap_ids_by_candidate_and_lane
+        ),
+        "boundary": (
+            "When required_challenge_kind=lane_probe, set "
+            "alternative_candidate_id=null and choose one listed "
+            "evidence_probe_lane_id. A Lane is never a candidate ID."
+        ),
+    }
 
 
 def derive_alternative_lane_resolutions(
@@ -588,7 +951,11 @@ def derive_alternative_search_status(
         item.status == AlternativeLaneResolutionStatus.BLOCKED.value
         for item in resolutions
     ) or any(challenge.status == ChallengeStatus.BLOCKED.value for challenge in challenges):
-        return AlternativeSearchStatus.BLOCKED_BY_MISSING_DATA.value
+        # A blocked source changes Lane investigation state but does not by
+        # itself terminate the whole competition. Only the Python-owned
+        # Competition Progression Engine may emit blocked_by_missing_data after
+        # proving that no high-value decision-changing Action remains.
+        return AlternativeSearchStatus.UNRESOLVED.value
     if any(challenge.unexplained_precursor_evidence_ids for challenge in challenges):
         return AlternativeSearchStatus.UNRESOLVED.value
 
@@ -664,21 +1031,64 @@ class QwenAdversarialChallenger:
         eliminated_lane_ids: Sequence[str] = (),
         blocked_lane_ids: Sequence[str] = (),
         lane_contexts: Sequence[Mapping[str, Any]] = (),
+        candidate_competition: Mapping[str, Any] | None = None,
     ) -> AdversarialChallengeGeneration:
         if not candidates or len(candidates) != len(matrices):
             return AdversarialChallengeGeneration(challenges=(), attempt_count=0)
         ids = _candidate_ids(candidates)
+        challenge_output_contract = _challenge_output_contract(
+            candidate_ids=ids,
+            active_lane_ids=active_lane_ids,
+            evidence_gaps=evidence_gaps,
+            candidate_competition=candidate_competition,
+        )
         gap_by_id = {
             str(item.get("gap_id")): item
             for item in evidence_gaps
             if str(item.get("gap_id", "")).strip()
         }
-        gap_id_set = set(gap_by_id)
+        contract_gap_ids = {
+            str(gap_id)
+            for gap_ids in challenge_output_contract[
+                "allowed_gap_ids_by_candidate"
+            ].values()
+            for gap_id in gap_ids
+        }
+        contract_gap_by_id = {
+            gap_id: gap
+            for gap_id, gap in gap_by_id.items()
+            if gap_id in contract_gap_ids
+        }
+        gap_id_set = set(contract_gap_by_id)
         lane_context_by_id = {
             str(item.get("lane_id", "")).strip(): item
             for item in lane_contexts
             if str(item.get("lane_id", "")).strip()
         }
+        if not llm_call_budget_available(
+            self.llm_client,
+            required_calls=1,
+            # A completed RCA Action must leave one call for the Planner to
+            # decide whether to investigate further or stop.
+            reserve_calls=1,
+        ):
+            lane_resolutions = derive_alternative_lane_resolutions(
+                challenges=(),
+                active_lane_ids=active_lane_ids,
+                eliminated_lane_ids=eliminated_lane_ids,
+                blocked_lane_ids=blocked_lane_ids,
+            )
+            return AdversarialChallengeGeneration(
+                challenges=(),
+                attempt_count=0,
+                validation_errors=(
+                    "adversarial challenge deferred to preserve the governed "
+                    "post-Action Planner budget",
+                ),
+                repair_skipped_due_to_budget=True,
+                alternative_search_status=AlternativeSearchStatus.UNRESOLVED.value,
+                lane_resolutions=lane_resolutions,
+            )
         payload_candidates = []
         for index, (candidate, matrix) in enumerate(zip(candidates, matrices, strict=True)):
             payload_candidates.append(
@@ -686,43 +1096,116 @@ class QwenAdversarialChallenger:
                     "candidate_id": ids[index],
                     "root_cause": str(candidate.get("root_cause", "")),
                     "causal_explanation": str(candidate.get("causal_explanation", "")),
-                    "causal_evidence_matrix": matrix.to_dict(),
+                    "semantic_profile": (
+                        dict(candidate["semantic_profile"])
+                        if isinstance(candidate.get("semantic_profile"), Mapping)
+                        else None
+                    ),
+                    "causal_evidence_matrix": (
+                        compact_causal_evidence_matrix_for_prompt(matrix)
+                    ),
                 }
             )
+        compact_lane_contexts = [
+            _compact_lane_context_for_prompt(item) for item in lane_contexts
+        ]
+        prompt_evidence_cards: list[dict[str, Any]] = []
+        prompt_omitted_entity_count = 0
+        prompt_omitted_metadata_count = 0
+        for evidence_id in dict.fromkeys(str(item) for item in evidence_ids):
+            evidence = (evidence_by_id or {}).get(evidence_id)
+            if evidence is None:
+                continue
+            card = compact_evidence_prompt_card(evidence)
+            projection_audit = card.pop("projection_audit", {})
+            prompt_omitted_entity_count += int(
+                projection_audit.get("omitted_entity_count", 0)
+            )
+            prompt_omitted_metadata_count += int(
+                projection_audit.get("omitted_metadata_count", 0)
+            )
+            prompt_evidence_cards.append(card)
         validation_errors: list[str] = []
+        prompt_audit: dict[str, Any] | None = None
         for attempt in range(1, _OUTPUT_ATTEMPTS + 1):
+            request_payload = {
+                "request_id": request_id,
+                "candidates": payload_candidates,
+                "evidence_gaps": [dict(item) for item in evidence_gaps],
+                "available_evidence_ids": sorted(set(evidence_ids)),
+                "typed_evidence_register": prompt_evidence_cards,
+                "causal_lane_ids": list(dict.fromkeys(lane_ids)),
+                "active_lane_ids": list(dict.fromkeys(active_lane_ids)),
+                "eliminated_lane_ids": list(dict.fromkeys(eliminated_lane_ids)),
+                "blocked_lane_ids": list(dict.fromkeys(blocked_lane_ids)),
+                "causal_lanes": compact_lane_contexts,
+                "candidate_competition": (
+                    dict(candidate_competition)
+                    if candidate_competition is not None
+                    else None
+                ),
+                "challenge_output_contract": challenge_output_contract,
+                "output_attempt": attempt,
+                "previous_validation_feedback": (
+                    {
+                        "category": "challenge_output_validation_error",
+                        "message": validation_errors[-1],
+                        "must_repair_before_resubmission": True,
+                        "unresolved_named_alternative_gap_rule": (
+                            "Select exactly one highest-information-gain "
+                            "hypothesis_discrimination Gap for each unresolved "
+                            "named alternative Lane."
+                        ),
+                        "allowed_gap_ids": sorted(gap_id_set),
+                        "allowed_gap_ids_by_candidate": (
+                            challenge_output_contract[
+                                "allowed_gap_ids_by_candidate"
+                            ]
+                        ),
+                        "allowed_gap_ids_by_candidate_and_lane": (
+                            challenge_output_contract[
+                                "allowed_gap_ids_by_candidate_and_lane"
+                            ]
+                        ),
+                        "highest_information_gain_gap_ids_by_candidate_and_lane": (
+                            challenge_output_contract[
+                                "highest_information_gain_gap_ids_by_candidate_and_lane"
+                            ]
+                        ),
+                        "challenge_output_contract": challenge_output_contract,
+                    }
+                    if validation_errors
+                    else None
+                ),
+                "deterministic_challenges": [],
+            }
+            payload_char_count = _payload_char_count(request_payload)
+            prompt_audit = {
+                "prompt_payload_char_count": payload_char_count,
+                "prompt_evidence_count": len(set(evidence_ids)),
+                "omitted_entity_count": prompt_omitted_entity_count,
+                "omitted_metadata_count": prompt_omitted_metadata_count,
+                "omitted_matrix_fact_group_count": sum(
+                    int(
+                        compact_causal_evidence_matrix_for_prompt(matrix)[
+                            "projection_audit"
+                        ]["omitted_claim_fact_groups"]
+                    )
+                    for matrix in matrices
+                ),
+                "prompt_budget_applied": True,
+                "prompt_payload_char_limit": _MAX_CHALLENGE_PAYLOAD_CHARS,
+            }
+            if payload_char_count > _MAX_CHALLENGE_PAYLOAD_CHARS:
+                validation_errors.append(
+                    "adversarial challenge prompt exceeds the governed payload limit"
+                )
+                break
             request = LLMRequest(
                 agent=AgentKind.RCA_REASONING.value,
                 prompt_name="causal_adversarial_challenge",
                 prompt_version=self.prompt_version,
-                payload={
-                    "request_id": request_id,
-                    "candidates": payload_candidates,
-                    "evidence_gaps": [dict(item) for item in evidence_gaps],
-                    "available_evidence_ids": sorted(set(evidence_ids)),
-                    "causal_lane_ids": list(dict.fromkeys(lane_ids)),
-                    "active_lane_ids": list(dict.fromkeys(active_lane_ids)),
-                    "eliminated_lane_ids": list(dict.fromkeys(eliminated_lane_ids)),
-                    "blocked_lane_ids": list(dict.fromkeys(blocked_lane_ids)),
-                    "causal_lanes": [dict(item) for item in lane_contexts],
-                    "output_attempt": attempt,
-                    "previous_validation_feedback": (
-                        {
-                            "category": "challenge_output_validation_error",
-                            "message": validation_errors[-1],
-                            "must_repair_before_resubmission": True,
-                            "unresolved_named_alternative_gap_rule": (
-                                "Select exactly one highest-information-gain "
-                                "hypothesis_discrimination Gap for each unresolved "
-                                "named alternative Lane."
-                            ),
-                            "allowed_gap_ids": sorted(gap_id_set),
-                        }
-                        if validation_errors
-                        else None
-                    ),
-                    "deterministic_challenges": [],
-                },
+                payload=request_payload,
                 temperature=0.0,
             )
             try:
@@ -750,7 +1233,7 @@ class QwenAdversarialChallenger:
                                 lane_ids=set(lane_ids),
                                 evidence_ids=set(evidence_ids),
                                 gap_ids=gap_id_set,
-                                gap_by_id=gap_by_id,
+                                gap_by_id=contract_gap_by_id,
                                 evidence_by_id=evidence_by_id,
                                 lane_contexts=lane_context_by_id,
                             )
@@ -763,6 +1246,30 @@ class QwenAdversarialChallenger:
                     not parsed or attempt < _OUTPUT_ATTEMPTS
                 ):
                     raise LLMOutputValidationError("; ".join(candidate_errors))
+                required_challenge_kind = challenge_output_contract.get(
+                    "required_challenge_kind"
+                )
+                if required_challenge_kind and any(
+                    challenge.challenge_kind != required_challenge_kind
+                    for challenge in parsed
+                ):
+                    raise LLMOutputValidationError(
+                        "challenge_kind must match Python-owned "
+                        f"required_challenge_kind={required_challenge_kind}"
+                    )
+                required_mechanism_relation = challenge_output_contract.get(
+                    "required_mechanism_relation"
+                )
+                if required_mechanism_relation and any(
+                    challenge.mechanism_relation
+                    != required_mechanism_relation
+                    for challenge in parsed
+                ):
+                    raise LLMOutputValidationError(
+                        "mechanism_relation must match Python-owned "
+                        "required_mechanism_relation="
+                        f"{required_mechanism_relation}"
+                    )
                 validation_errors.extend(candidate_errors)
                 lane_resolutions = derive_alternative_lane_resolutions(
                     challenges=parsed,
@@ -784,6 +1291,7 @@ class QwenAdversarialChallenger:
                     validation_errors=tuple(validation_errors),
                     alternative_search_status=status,
                     lane_resolutions=lane_resolutions,
+                    prompt_audit=prompt_audit,
                 )
             except LLMCallError as exc:
                 lane_resolutions = derive_alternative_lane_resolutions(
@@ -798,10 +1306,34 @@ class QwenAdversarialChallenger:
                     validation_errors=(str(exc).strip() or type(exc).__name__,),
                     alternative_search_status=AlternativeSearchStatus.UNRESOLVED.value,
                     lane_resolutions=lane_resolutions,
+                    prompt_audit=prompt_audit,
                 )
             except LLMOutputValidationError as exc:
                 validation_errors.append(str(exc).strip() or type(exc).__name__)
-                continue
+                if attempt < _OUTPUT_ATTEMPTS and llm_call_budget_available(
+                    self.llm_client,
+                    required_calls=1,
+                    reserve_calls=1,
+                ):
+                    continue
+                lane_resolutions = derive_alternative_lane_resolutions(
+                    challenges=(),
+                    active_lane_ids=active_lane_ids,
+                    eliminated_lane_ids=eliminated_lane_ids,
+                    blocked_lane_ids=blocked_lane_ids,
+                )
+                return AdversarialChallengeGeneration(
+                    challenges=(),
+                    attempt_count=attempt,
+                    validation_errors=tuple(validation_errors),
+                    output_invalid=(attempt >= _OUTPUT_ATTEMPTS),
+                    repair_skipped_due_to_budget=(attempt < _OUTPUT_ATTEMPTS),
+                    alternative_search_status=(
+                        AlternativeSearchStatus.UNRESOLVED.value
+                    ),
+                    lane_resolutions=lane_resolutions,
+                    prompt_audit=prompt_audit,
+                )
         lane_resolutions = derive_alternative_lane_resolutions(
             challenges=(),
             active_lane_ids=active_lane_ids,
@@ -815,6 +1347,7 @@ class QwenAdversarialChallenger:
             output_invalid=True,
             alternative_search_status=AlternativeSearchStatus.UNRESOLVED.value,
             lane_resolutions=lane_resolutions,
+            prompt_audit=prompt_audit,
         )
 
 

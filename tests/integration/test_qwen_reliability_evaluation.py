@@ -360,7 +360,7 @@ class QwenReliabilityEvaluationTest(unittest.TestCase):
         self.assertEqual(run["core_planner_validation_errors"], [])
         self.assertEqual(run["fallback_failure_category"], "planner_output_invalid")
 
-    def test_paid_call_cap_is_a_hard_failed_acceptance_boundary(self) -> None:
+    def test_paid_call_cap_stops_without_an_over_cap_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             evaluation = run_qwen_reliability(
                 settings=LLMSettings(agent_mode="fake"),
@@ -373,11 +373,11 @@ class QwenReliabilityEvaluationTest(unittest.TestCase):
         self.assertFalse(evaluation["passed"])
         run = evaluation["runs"][0]
         self.assertEqual(run["paid_llm_call_count"], 1)
-        self.assertTrue(run["call_limit_exceeded"])
+        self.assertFalse(run["call_limit_exceeded"])
         self.assertTrue(run["checks"]["workflow_completed"])
         self.assertEqual(run["actual_mode"], "llm_react")
         self.assertEqual(run["stop_reason"], "budget_exhausted")
-        self.assertFalse(run["checks"]["within_llm_call_limit"])
+        self.assertTrue(run["checks"]["within_llm_call_limit"])
         self.assertIsNone(run["error_type"])
 
     def test_legacy_close_and_target_error_remains_attributed(self) -> None:

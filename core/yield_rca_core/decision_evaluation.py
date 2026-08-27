@@ -419,11 +419,17 @@ def _stop_correct(state: RCAState) -> tuple[bool, str]:
     ):
         return False, "the final stop decision does not match the terminal state."
 
-    contradictions = [
-        f"{hypothesis.hypothesis_id}: {hypothesis.root_cause}"
-        for hypothesis in state.hypotheses
-        if hypothesis.status == HypothesisStatus.CONFLICTED.value
-    ]
+    authoritative = state.authoritative_hypothesis
+    if authoritative is None and len(state.hypotheses) == 1:
+        # Preserve unambiguous legacy/synthetic traces that predate explicit
+        # authority markers without ever consulting multiple historical rounds.
+        authoritative = state.hypotheses[0]
+    contradictions = (
+        [f"{authoritative.hypothesis_id}: {authoritative.root_cause}"]
+        if authoritative is not None
+        and authoritative.status == HypothesisStatus.CONFLICTED.value
+        else []
+    )
     try:
         oracle = InvestigationPolicy().next_action(
             goal=goal,

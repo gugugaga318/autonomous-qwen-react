@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from run_formal_blind_rca import PublicCase  # noqa: E402
 from yield_rca_core.causal_adversarial import (  # noqa: E402
+    _challenge_output_contract,
     _normalize_challenge_payload,
     derive_alternative_search_status,
 )
@@ -140,6 +141,28 @@ def _complete_matrix(
         supporting_evidence_ids=("EV_EXPOSURE", "EV_PROCESS", "EV_OUTCOME"),
     )
     return build_causal_evidence_matrix(candidate, evidence)
+
+
+def test_validated_scope_semantics_require_scope_challenge_kind() -> None:
+    contract = _challenge_output_contract(
+        candidate_ids=["REQ:llm:1", "REQ:llm:2"],
+        active_lane_ids=["LANE_A", "LANE_B"],
+        candidate_competition={
+            "competition_requirement": "scope_required",
+            "semantic_profiles_complete": True,
+        },
+    )
+    assert contract["required_challenge_kind"] == "scope"
+
+    pending_contract = _challenge_output_contract(
+        candidate_ids=["REQ:llm:1", "REQ:llm:2"],
+        active_lane_ids=["LANE_A", "LANE_B"],
+        candidate_competition={
+            "competition_requirement": "scope_required",
+            "semantic_profiles_complete": False,
+        },
+    )
+    assert pending_contract["required_challenge_kind"] is None
 
 
 def test_lane_comparison_scope_keeps_the_fixed_source_lot() -> None:
@@ -364,6 +387,9 @@ def test_resolved_alternative_closes_and_persists_lane_elimination() -> None:
     updated = _update_competition_state(state, finding)
     lane_b = next(item for item in updated.causal_lanes if item.lane_id == "LANE_B")
     assert lane_b.investigation_status == InvestigationLaneStatus.ELIMINATED.value
+    assert lane_b.lifecycle_status == "eliminated"
+    assert lane_b.lifecycle_history[-1].to_status == "eliminated"
+    assert lane_b.lifecycle_history[-1].evidence_ids == ("EV_B",)
     assert updated.competition_trace is not None
     assert "LANE_B" in updated.competition_trace.eliminated_lane_ids
 

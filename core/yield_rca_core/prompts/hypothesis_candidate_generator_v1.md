@@ -15,12 +15,75 @@ Return exactly one JSON object:
       "contradicting_evidence_ids": ["existing Evidence ID"]
     }
   ],
+  "candidate_semantic_profiles": [
+    {
+      "candidate_index": 0,
+      "claimed_scope": {
+        "scope_relation": "shared_effect | focal_only | differential_sensitivity | unresolved",
+        "lane_ids": ["existing active Lane ID"]
+      },
+      "comparison_scope": {
+        "lane_ids": ["existing active Lane ID"]
+      },
+      "mechanism_claim": "the causal mechanism asserted by this candidate",
+      "primary_mechanism": "one primary physical initiator/failure mode",
+      "effect_modifier": "recipe sensitivity or scope modifier, or null",
+      "depends_on_candidate_index": "earlier candidate index, or null",
+      "mechanism_relation": "reference | independent_alternative | shared_primary_with_modifier | nested | scope_variant | unknown",
+      "distinguishing_predictions": [
+        {
+          "discriminator_kind": "parameter_anomaly | exposure_commonality | recipe_commonality | product_outcome | temporal_alignment | mechanism_context",
+          "lane_ids": ["existing active Lane ID"],
+          "prediction": "a falsifiable observation that distinguishes this candidate"
+        }
+      ]
+    }
+  ],
   "analysis_summary": "short summary of the proposed candidate set or why none is justified"
 }
 
 Rules:
 
 - Return zero to max_candidates candidates, ordered strongest first.
+- When ``candidates=[]``, return ``candidate_semantic_profiles=[]``.
+- Return one ``candidate_semantic_profiles`` entry for every Candidate, using
+  the Candidate's zero-based index. This metadata declares what the Candidate
+  means; it does not add supporting Evidence and Python validates it separately.
+  A malformed semantic profile cannot make an otherwise valid Candidate valid
+  or invalid.
+- Keep these scope concepts separate:
+  - ``claimed_scope`` is the causal reach asserted by the Candidate;
+  - ``comparison_scope`` is the wider set of Lanes compared to test that claim;
+  - Evidence coverage is only the set of entities present in cited Evidence.
+  Evidence covering two recipes does not by itself mean the Candidate claims a
+  shared multi-recipe effect. A recipe-sensitivity hypothesis normally compares
+  two recipe Lanes while claiming a differential effect.
+- Use ``scope_relation=shared_effect`` when the Candidate predicts the same
+  causal effect across every claimed Lane; ``focal_only`` when it predicts the
+  effect only in the claimed focal Lane; ``differential_sensitivity`` when the
+  same underlying condition has materially different effects across compared
+  Lanes; and ``unresolved`` when current Evidence cannot bound the reach.
+- ``comparison_scope.lane_ids`` must include every claimed Lane and may include
+  additional active Lanes needed for controls or contrast. For every resolved
+  scope relation, the distinguishing predictions must collectively name every
+  Lane in the comparison scope; mentioning a comparison Lane only in free text
+  is invalid. Use only Lane IDs supplied by Python.
+- ``mechanism_claim`` is open-world engineering text. It is not an approved
+  mechanism assertion and Python will not treat it as Evidence.
+- Separate the primary physical initiator from modifiers. Candidate 0 must use
+  ``mechanism_relation=reference`` and ``depends_on_candidate_index=null``.
+  Every later Candidate declares its relation to Candidate 0. Use
+  ``independent_alternative`` only when it can remain true if Candidate 0's
+  primary mechanism is absent, and keep ``depends_on_candidate_index=null``.
+  When Candidate B presupposes Candidate A and only adds recipe sensitivity,
+  scope, amplification, or severity, use ``shared_primary_with_modifier``,
+  ``nested``, or ``scope_variant``; set ``depends_on_candidate_index=0`` and put
+  that extra condition in ``effect_modifier``. Python preserves such variants
+  for Scope audit but does not treat them as independent root causes.
+- Every required root-cause competition needs a falsifiable prediction for each
+  Candidate. Select a listed discriminator kind; do not invent a new Gap or
+  claim that the predicted observation has already occurred unless cited typed
+  Evidence actually records it.
 - Use ``evidence_synthesis.active_causal_lanes`` as the primary investigation
   map. Each Lane contains Python-owned operation, equipment, chamber, recipe,
   parameter scope, exposed Lots, time window, and ID-traceable typed facts.
@@ -31,11 +94,53 @@ Rules:
 - ``evidence_synthesis.mechanism_bridge_inputs`` places each Lane's observed
   process Evidence beside Lane-bound and global outcome Evidence. Treat these as
   the endpoints of a mechanism question, not as a Python-provided answer. The
-  approved Knowledge IDs are optional engineering support and are never required
-  when an explicit, shared-Lot empirical bridge is otherwise justified.
-- On the first reasoning round, consider materially different active Lanes as
-  competing explanations. Return two candidates only when the supplied facts
-  justify two distinct mechanisms; never manufacture a weak second candidate.
+  approved Knowledge IDs are optional engineering support. Parameter/outcome
+  co-occurrence on a shared Lot makes a mechanism plausible, but does not by
+  itself prove the proposed physical bridge.
+- ``candidate_competition_requirement`` is a Python-owned classification of
+  factual Evidence bundles. A causal Lane is an investigation path, not itself
+  a hypothesis. Do not count a different recipe or time window as a different
+  causal direction unless it supports a different causal claim.
+- When ``competition_requirement=direction_required``, return two candidates
+  that cover two evidence-bounded direction bundles. The candidates must differ
+  in equipment/operation, abnormal parameter family, physical mechanism, or
+  another falsifiable causal claim. Do not broaden Candidate A to absorb the
+  second bundle.
+- When ``competition_requirement=mechanism_required``, use Candidate slots for
+  materially different physical mechanisms within the same evidence-bounded
+  causal direction. Candidates may share equipment, chamber, operation, recipe,
+  and observed endpoint Evidence, but must assert different intervening physical
+  processes and different falsifiable predictions. A recipe-specific and a
+  chamber-wide restatement of the same physical mechanism does not satisfy this
+  requirement. If current Evidence cannot justify a second mechanism after the
+  bounded repair attempt, keep one bounded Candidate or return none; never invent
+  a low-quality alternative.
+- Before using ``independent_alternative``, ask: "If Candidate 0's primary
+  physical mechanism did not occur, could this Candidate still independently
+  cause the observed result?" If not, it is a modifier, nested explanation, or
+  Scope variant even when its wording and predicted severity differ.
+- When ``competition_requirement=scope_required``, return two falsifiable scope
+  hypotheses only for legacy State compatibility. New State records recipe-
+  specific versus chamber-wide reach under ``scope_assessment_required`` and
+  reserves Root Cause Candidate slots for different directions or mechanisms.
+  ``scope_competition_opportunity=true`` means one focal recipe is
+  Evidence-bounded and a same-direction recipe sibling exists;
+  ``scope_evidence_complete=false`` means the sibling still needs a targeted
+  comparison. That missing comparison is a Gap, not permission to collapse the
+  two hypotheses. The candidates may share the focal Evidence, but must declare
+  different causal reach or sensitivity and different falsifiable predictions.
+  Cite only Evidence that already exists; never claim the missing observation
+  has occurred.
+- When ``competition_requirement=alternative_discovery_required``, a second
+  direction is not yet evidence-bounded. Do not fabricate Candidate B; retain a
+  bounded candidate so Python can request the missing discriminative Evidence.
+- When ``competition_requirement=not_required``, one candidate remains legal.
+- ``candidate_competition_requirement.scope_assessment_required`` is an
+  independent reach question. Use its normalized outcome facts to describe a
+  Candidate's claimed scope, but do not create a second Root Cause Candidate only
+  because its claimed scope differs. Raw record counts are not sensitivity;
+  compare normalized rates and independent Lot counts when available, and keep
+  scope unresolved when a denominator is unavailable.
 - When Evidence is sufficient, make ``root_cause`` an engineering-specific
   conclusion that states the implicated equipment/chamber/operation, abnormal
   parameter or process condition, physical mechanism, and observed result.
@@ -58,6 +163,10 @@ Rules:
   candidate only when it remains evidence-bounded, and include a materially
   different alternative when the new Evidence supports one. Do not copy a prior
   conclusion without checking the new Evidence.
+- ``prior_candidate_semantic_profiles`` preserves the prior Candidate's declared
+  meaning. Do not infer a prior scope expansion from newly cited comparison
+  Evidence. If a revised Candidate truly broadens or narrows its claimed scope,
+  declare that change in the new semantic profile so Python can audit lineage.
 - For a reasoning refresh, use these Python-bound fields together:
   - ``new_evidence_ids_since_prior`` identifies Evidence added after the prior
     authoritative RCA finding;
@@ -71,12 +180,13 @@ Rules:
     candidate. When it reports ``mechanism_status=incomplete``, repair the causal
     explanation only if current Evidence justifies a more specific bridge;
     otherwise retain an explicitly incomplete hypothesis or return no candidate.
-  When a targeted result has ``support_observed=true`` and its new Evidence
-  supports a materially different failure mechanism, represent that mechanism as
-  an independent competing candidate and cite the targeted Evidence. Do not merely
-  rewrite the prior candidate. If the targeted result is missing, contradictory,
-  irrelevant, or too weak to justify an alternative mechanism, retaining one
-  candidate or returning no candidates remains valid.
+  When a targeted result has ``support_observed=true``, preserve the prior
+  candidate and represent an evidence-bounded alternative direction or
+  falsifiable scope hypothesis independently. Do not silently replace a
+  recipe-specific candidate with a chamber-wide rewrite. If the targeted result
+  is missing, contradictory, irrelevant, or too weak to justify an alternative,
+  retaining one candidate or returning no candidates remains valid only when the
+  Python-owned competition requirement does not require two candidates.
 - Derive a candidate from current operational Evidence, not from the user wording.
 - A candidate may be incomplete when one or more causal lanes are still missing.
   Cite only the Evidence that genuinely supports it. Python will mark missing
@@ -90,8 +200,9 @@ Rules:
   exposure, process-anomaly, or product-outcome lane and cannot prove that the
   current Lot experienced the mechanism. Put a genuinely conflicting observation
   in contradicting_evidence_ids instead.
-- If you return two candidates, they must represent materially different failure
-  mechanisms, not paraphrases of the same equipment/parameter hypothesis.
+- If you return two candidates, they must represent materially different causal
+  directions or falsifiably different scope hypotheses. Mere paraphrases or two
+  recipe names carrying the same unbounded claim are invalid.
 - Do not invent equipment, chamber, operation, recipe, parameter, Lot, symptom, or
   measurement values.
 - Do not output confidence, status, impact Lots, recommendations, or new Evidence.

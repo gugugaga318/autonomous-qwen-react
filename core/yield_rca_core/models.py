@@ -13,10 +13,12 @@ from enum import StrEnum
 from typing import Any, Self
 
 from yield_rca_core.causal_investigation_models import (
+    ActionValueAssessment,
     CandidateChallenge,
     CausalChainCompleteness,
     CausalLaneRecord,
     CompetitionTrace,
+    InvestigationGainRecord,
 )
 from yield_rca_core.evidence_models import (
     SCHEMA_VERSION as SCHEMA_VERSION,
@@ -858,6 +860,12 @@ class RCAState:
     causal_lanes: list[CausalLaneRecord] = field(default_factory=list)
     candidate_challenges: list[CandidateChallenge] = field(default_factory=list)
     competition_trace: CompetitionTrace | None = None
+    investigation_gain_history: list[InvestigationGainRecord] = field(
+        default_factory=list
+    )
+    latest_action_value_assessments: list[ActionValueAssessment] = field(
+        default_factory=list
+    )
     causal_chain_completeness: str | None = None
     warnings: list[Warning] = field(default_factory=list)
     report: Report | None = None
@@ -904,6 +912,33 @@ class RCAState:
             if not isinstance(usage, LLMUsageEvent):
                 raise ModelValidationError("llm_usage must contain LLMUsageEvent instances")
         self._validate_causal_investigation()
+        if not isinstance(self.investigation_gain_history, list) or any(
+            not isinstance(item, InvestigationGainRecord)
+            for item in self.investigation_gain_history
+        ):
+            raise ModelValidationError(
+                "investigation_gain_history must contain InvestigationGainRecord instances"
+            )
+        gain_action_ids = [item.action_id for item in self.investigation_gain_history]
+        if len(gain_action_ids) != len(set(gain_action_ids)):
+            raise ModelValidationError(
+                "investigation_gain_history must contain at most one record per Action"
+            )
+        if not isinstance(self.latest_action_value_assessments, list) or any(
+            not isinstance(item, ActionValueAssessment)
+            for item in self.latest_action_value_assessments
+        ):
+            raise ModelValidationError(
+                "latest_action_value_assessments must contain "
+                "ActionValueAssessment instances"
+            )
+        assessment_option_ids = [
+            item.option_id for item in self.latest_action_value_assessments
+        ]
+        if len(assessment_option_ids) != len(set(assessment_option_ids)):
+            raise ModelValidationError(
+                "latest_action_value_assessments must contain unique option_id values"
+            )
         if self.investigation_goal is not None and not isinstance(
             self.investigation_goal, InvestigationGoal
         ):
@@ -1149,6 +1184,23 @@ class RCAState:
                 known_evidence_ids,
                 "causal lane",
             )
+            self._validate_reference_set(
+                [
+                    evidence_id
+                    for transition in lane.lifecycle_history
+                    for evidence_id in transition.evidence_ids
+                ],
+                known_evidence_ids,
+                "causal lane lifecycle",
+            )
+            if (
+                lane.merged_into_lane_id is not None
+                and lane.merged_into_lane_id not in known_lane_ids
+            ):
+                raise ModelValidationError(
+                    "merged causal lane references an unknown canonical lane: "
+                    f"{lane.merged_into_lane_id!r}"
+                )
 
         if not isinstance(self.candidate_challenges, list) or any(
             not isinstance(challenge, CandidateChallenge)
@@ -1190,6 +1242,19 @@ class RCAState:
                 + trace.eliminated_lane_ids
                 + trace.blocked_lane_ids
                 + tuple(item.lane_id for item in trace.lane_resolutions)
+                + tuple(
+                    lane_id
+                    for profile in trace.candidate_semantic_profiles
+                    for lane_id in (
+                        *profile.claimed_lane_ids,
+                        *profile.comparison_lane_ids,
+                        *(
+                            prediction_lane_id
+                            for prediction in profile.distinguishing_predictions
+                            for prediction_lane_id in prediction.lane_ids
+                        ),
+                    )
+                )
             )
             unknown_lane_ids = referenced_lane_ids - known_lane_ids
             if unknown_lane_ids:
@@ -1353,6 +1418,23 @@ class RCAState:
             record.action.action_id for record in self.action_history
         }
         known_evidence_ids = set(self.evidence_by_id)
+        known_lane_ids = {lane.lane_id for lane in self.causal_lanes}
+        for gain in self.investigation_gain_history:
+            if gain.action_id not in known_action_ids:
+                raise ModelValidationError(
+                    "InvestigationGainRecord references an unknown ActionRecord: "
+                    f"{gain.action_id!r}"
+                )
+            self._validate_reference_set(
+                list(gain.evidence_ids),
+                known_evidence_ids,
+                "investigation gain",
+            )
+            if gain.lane_id is not None and gain.lane_id not in known_lane_ids:
+                raise ModelValidationError(
+                    "InvestigationGainRecord references an unknown causal Lane: "
+                    f"{gain.lane_id!r}"
+                )
         seen_links: set[tuple[str, str, str, str]] = set()
         for link in self.question_evidence_links:
             if link.question_id not in known_question_ids:
@@ -1485,6 +1567,12 @@ class RCAState:
                 if self.competition_trace is not None
                 else None
             ),
+            "investigation_gain_history": [
+                item.to_dict() for item in self.investigation_gain_history
+            ],
+            "latest_action_value_assessments": [
+                item.to_dict() for item in self.latest_action_value_assessments
+            ],
             "causal_chain_completeness": self.causal_chain_completeness,
             "warnings": [item.to_dict() for item in self.warnings],
             "report": self.report.to_dict() if self.report else None,
@@ -1584,6 +1672,14 @@ class RCAState:
                 if data.get("competition_trace") is not None
                 else None
             ),
+            investigation_gain_history=[
+                InvestigationGainRecord.from_dict(item)
+                for item in data.get("investigation_gain_history", [])
+            ],
+            latest_action_value_assessments=[
+                ActionValueAssessment.from_dict(item)
+                for item in data.get("latest_action_value_assessments", [])
+            ],
             causal_chain_completeness=data.get("causal_chain_completeness"),
             warnings=[Warning.from_dict(item) for item in data.get("warnings", [])],
             report=Report.from_dict(data["report"]) if data.get("report") else None,

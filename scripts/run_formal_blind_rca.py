@@ -73,6 +73,12 @@ class CappedLLMClient:
         self.provider = delegate.provider
         self.model = delegate.model
 
+    @property
+    def remaining_calls(self) -> int:
+        """Expose the non-consuming budget capability used by core preflight."""
+
+        return max(0, self.max_calls - self.call_count)
+
     def complete_json(self, request: LLMRequest) -> LLMResponse:
         if self.call_count >= self.max_calls:
             self.limit_exceeded = True
@@ -268,23 +274,67 @@ def _strict_qwen_acceptance_reasons(
     if stop_proposer == "python_runtime":
         governed_stop_reasons = {
             StopReason.NO_ALLOWED_ACTION.value,
+            StopReason.NO_HIGH_VALUE_ACTION.value,
             StopReason.BUDGET_EXHAUSTED.value,
         }
-        governed_data_unavailable = (
+        governed_legacy_data_unavailable = (
             result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
             and result.get("conclusion_status") == "insufficient_evidence"
             and bool(result.get("required_unavailable_evidence_ids"))
         )
+        governed_competition_data_unavailable = (
+            result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
+            and result.get("conclusion_status") == "insufficient_evidence"
+            and result.get("competition_status") == "blocked_by_missing_data"
+            and result.get("competition_terminal_reason")
+            == "no_high_value_action_after_required_source_unavailable"
+            and result.get("competition_lifecycle_valid") is True
+            and result.get("investigation_decision_accepted") is True
+            and bool(result.get("decision_critical_unavailable_evidence_ids"))
+        )
         if (
             result.get("planner_stop_reason") not in governed_stop_reasons
-            and not governed_data_unavailable
+            and not governed_legacy_data_unavailable
+            and not governed_competition_data_unavailable
         ):
             reasons.append("python_runtime_stop_not_governed")
     elif stop_proposer != "qwen":
         reasons.append("planner_stop_source_invalid")
     if result.get("terminal_question_updates_source") != "python_evidence_gate":
         reasons.append("terminal_updates_not_python_evidence_gate")
+    if result.get("competition_lifecycle_valid") is False:
+        reasons.append("competition_lifecycle_invalid")
+    if result.get("investigation_decision_accepted") is False:
+        reasons.append("investigation_decision_invalid")
     return reasons
+
+
+def _decision_critical_unavailable_evidence_ids(
+    *,
+    competition_trace: dict[str, Any],
+    rca_details: dict[str, Any],
+    data_missing_evidence_ids: set[str],
+) -> list[str]:
+    """Project typed missing Evidence that governed a terminal Competition stop."""
+
+    candidate_ids = [
+        *(competition_trace.get("resolution_evidence_ids") or []),
+        *(rca_details.get("blocking_data_missing_evidence_ids") or []),
+        *(
+            evidence_id
+            for resolution in (competition_trace.get("lane_resolutions") or [])
+            if isinstance(resolution, dict)
+            and resolution.get("status") == "blocked"
+            for evidence_id in (resolution.get("evidence_ids") or [])
+        ),
+    ]
+    return list(
+        dict.fromkeys(
+            str(evidence_id)
+            for evidence_id in candidate_ids
+            if str(evidence_id) in data_missing_evidence_ids
+        )
+    )
 
 
 def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -310,6 +360,7 @@ def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
             item.get("planner_stop_reason")
             in {
                 StopReason.NO_ALLOWED_ACTION.value,
+                StopReason.NO_HIGH_VALUE_ACTION.value,
                 StopReason.BUDGET_EXHAUSTED.value,
             }
             or (
@@ -324,6 +375,25 @@ def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
     python_terminal = sum(
         item.get("terminal_question_updates_source") == "python_evidence_gate"
         for item in results
+    )
+    competition_evaluated = sum(
+        item.get("competition_status") not in {None, "not_evaluated"}
+        for item in results
+    )
+    competition_accepted = sum(
+        bool(item.get("qwen_competition_accepted")) for item in results
+    )
+    execution_accepted = sum(
+        bool(item.get("execution_accepted")) for item in results
+    )
+    lifecycle_valid = sum(
+        bool(item.get("competition_lifecycle_valid")) for item in results
+    )
+    investigation_accepted = sum(
+        bool(item.get("investigation_decision_accepted")) for item in results
+    )
+    root_cause_confirmed = sum(
+        bool(item.get("root_cause_confirmed")) for item in results
     )
     return {
         "case_count": case_count,
@@ -343,6 +413,19 @@ def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
         "governed_python_stop_rate": ratio(governed_python_stop),
         "python_terminal_gate_count": python_terminal,
         "python_terminal_gate_rate": ratio(python_terminal),
+        "qwen_competition_evaluated_count": competition_evaluated,
+        "qwen_competition_accepted_count": competition_accepted,
+        "qwen_competition_acceptance_rate": ratio(competition_accepted),
+        "execution_accepted_count": execution_accepted,
+        "execution_acceptance_rate": ratio(execution_accepted),
+        "competition_lifecycle_valid_count": lifecycle_valid,
+        "competition_lifecycle_valid_rate": ratio(lifecycle_valid),
+        "investigation_decision_accepted_count": investigation_accepted,
+        "investigation_decision_acceptance_rate": ratio(
+            investigation_accepted
+        ),
+        "root_cause_confirmed_count": root_cause_confirmed,
+        "root_cause_confirmation_rate": ratio(root_cause_confirmed),
         "llm_call_count": sum(int(item.get("llm_call_count") or 0) for item in results),
     }
 
@@ -462,6 +545,80 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
             candidate_generation = dict(
                 rca_details.get("hypothesis_candidate_generation", {})
             )
+            competition_trace = (
+                state.competition_trace.to_dict()
+                if state.competition_trace is not None
+                else {}
+            )
+            competition_requirement = competition_trace.get(
+                "competition_requirement",
+                rca_details.get("competition_requirement"),
+            )
+            competition_status = competition_trace.get(
+                "competition_status",
+                rca_details.get("competition_status"),
+            )
+            competition_failure_reason = competition_trace.get(
+                "competition_failure_reason",
+                rca_details.get("competition_failure_reason"),
+            )
+            competition_gap_reason = competition_trace.get(
+                "competition_gap_reason",
+                rca_details.get("competition_gap_reason"),
+            )
+            new_terminal_competition_statuses = {
+                "complete_confirmed",
+                "complete_rejected",
+                "exhausted",
+                "blocked_by_missing_data",
+                "budget_exhausted",
+                "failed",
+            }
+            accepted_terminal_competition_statuses = {
+                "not_required",
+                "resolved",  # Legacy terminal State compatibility.
+                *new_terminal_competition_statuses,
+            }
+            competition_terminal_reason = competition_trace.get(
+                "terminal_reason"
+            )
+            competition_lifecycle_valid = (
+                competition_status in {None, "not_evaluated"}
+                or (
+                    competition_status in accepted_terminal_competition_statuses
+                    and (
+                        competition_status not in new_terminal_competition_statuses
+                        or bool(competition_terminal_reason)
+                    )
+                )
+            )
+            investigation_decision_accepted = (
+                competition_lifecycle_valid
+                and competition_status != "failed"
+                and competition_failure_reason is None
+            )
+            root_cause_confirmed = (
+                competition_status == "complete_confirmed"
+                and rca_details.get("conclusion_status") == "supported"
+                and hypothesis is not None
+                and hypothesis.status == "supported"
+            )
+            execution_accepted = (
+                state.job.status == "completed"
+                and state.execution_metadata.get("orchestration_mode") == mode
+                and not state.execution_metadata.get(
+                    "orchestration_fallback_reason"
+                )
+                and not (client.provider_failures if client is not None else [])
+                and not (client.limit_exceeded if client is not None else False)
+            )
+            competition_evaluated = competition_status not in {
+                None,
+                "not_evaluated",
+            }
+            qwen_competition_accepted = (
+                competition_evaluated and investigation_decision_accepted
+            )
             ranked_candidates = list(rca_details.get("ranked_candidates", []))
             required_unavailable_evidence_ids = [
                 item.evidence_id
@@ -469,6 +626,18 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                 if item.evidence_type == "data_missing"
                 and item.metadata.get("required_for_confirmation") is True
             ]
+            data_missing_evidence_ids = {
+                item.evidence_id
+                for item in state.evidence
+                if item.evidence_type == "data_missing"
+            }
+            decision_critical_unavailable_evidence_ids = (
+                _decision_critical_unavailable_evidence_ids(
+                    competition_trace=competition_trace,
+                    rca_details=rca_details,
+                    data_missing_evidence_ids=data_missing_evidence_ids,
+                )
+            )
             case_result = {
                     "case_id": case.case_id,
                     "source_lot_id": case.source_lot_id,
@@ -495,6 +664,22 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                         "fallback_reason"
                     ),
                     "ranked_candidate_count": len(ranked_candidates),
+                    "competition_requirement": competition_requirement,
+                    "competition_status": competition_status,
+                    "competition_type": competition_trace.get(
+                        "competition_type",
+                        rca_details.get("competition_type"),
+                    ),
+                    "competition_failure_reason": competition_failure_reason,
+                    "competition_gap_reason": competition_gap_reason,
+                    "competition_terminal_reason": competition_terminal_reason,
+                    "execution_accepted": execution_accepted,
+                    "competition_lifecycle_valid": competition_lifecycle_valid,
+                    "investigation_decision_accepted": (
+                        investigation_decision_accepted
+                    ),
+                    "root_cause_confirmed": root_cause_confirmed,
+                    "qwen_competition_accepted": qwen_competition_accepted,
                     "top_candidate_basis": (
                         ranked_candidates[0].get("basis")
                         if ranked_candidates
@@ -531,6 +716,9 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                     "required_unavailable_evidence_ids": (
                         required_unavailable_evidence_ids
                     ),
+                    "decision_critical_unavailable_evidence_ids": (
+                        decision_critical_unavailable_evidence_ids
+                    ),
                 }
             acceptance_reasons = _strict_qwen_acceptance_reasons(
                 case_result,
@@ -557,6 +745,17 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                     "hypothesis_candidate_count": None,
                     "hypothesis_candidate_fallback_reason": None,
                     "ranked_candidate_count": None,
+                    "competition_requirement": None,
+                    "competition_status": None,
+                    "competition_type": None,
+                    "competition_failure_reason": None,
+                    "competition_gap_reason": None,
+                    "competition_terminal_reason": None,
+                    "execution_accepted": False,
+                    "competition_lifecycle_valid": False,
+                    "investigation_decision_accepted": False,
+                    "root_cause_confirmed": False,
+                    "qwen_competition_accepted": False,
                     "top_candidate_basis": None,
                     "impact_lot_count": None,
                     "evidence_count": None,

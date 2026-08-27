@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -10,20 +11,42 @@ from yield_rca_core.causal_adversarial import (
     derive_alternative_search_status,
 )
 from yield_rca_core.causal_chain import build_declared_unavailable_evidence
+from yield_rca_core.causal_competition import select_diverse_lane_ids
 from yield_rca_core.causal_investigation_models import (
     AlternativeLaneResolution,
     AlternativeLaneResolutionStatus,
     AlternativeSearchStatus,
     CandidateChallenge,
+    CandidateCompetitionStatus,
+    CandidateCompetitionType,
+    CandidateSemanticProfile,
     CausalChainCompleteness,
     CausalLaneRecord,
+    CompetitionRequirement,
     CompetitionTrace,
     InvestigationLaneStatus,
+    LaneLifecycleStatus,
+    LaneLifecycleTransition,
+)
+from yield_rca_core.causal_lane_lifecycle import (
+    apply_active_lane_snapshot,
+    lane_is_searchable,
+    mark_lanes_challenged,
+    reconcile_lane_inventory,
+    transition_lane,
 )
 from yield_rca_core.causal_scope import explicit_module_limit_requested
 from yield_rca_core.evidence_collection import EvidenceCollection
 from yield_rca_core.evidence_models import Evidence
 from yield_rca_core.improvement_agent import ImprovementAgent
+from yield_rca_core.investigation_decision import (
+    classify_investigation_gain,
+    derive_investigation_gain_history,
+)
+from yield_rca_core.investigation_finalizer import (
+    finalize_investigation,
+    validate_terminal_investigation_state,
+)
 from yield_rca_core.investigation_models import (
     ActionRecord,
     ConclusionLevel,
@@ -35,6 +58,7 @@ from yield_rca_core.investigation_models import (
     InvestigationGoal,
     InvestigationIntent,
     InvestigationQuestion,
+    PlannerDecision,
     PlannerDecisionOutcome,
     StopReason,
 )
@@ -44,6 +68,7 @@ from yield_rca_core.llm_gateway import (
     LLMClient,
     LLMOutputValidationError,
     LLMRequest,
+    llm_calls_remaining,
 )
 from yield_rca_core.models import (
     AgentFinding,
@@ -84,6 +109,17 @@ SUPERVISOR_EXECUTABLE_AGENTS = frozenset(
         AgentKind.IMPROVEMENT.value,
     }
 )
+_RCA_REASONING_MIN_REMAINING_LLM_CALLS = 3
+
+
+def _rca_reasoning_round_budget_available(llm_client: LLMClient) -> bool:
+    """Reserve Candidate generation, Challenge, and governed post-Action planning."""
+
+    remaining = llm_calls_remaining(llm_client)
+    return (
+        remaining is None
+        or remaining >= _RCA_REASONING_MIN_REMAINING_LLM_CALLS
+    )
 
 SPECIALIST_TOOL_ALLOWLISTS = {
     AgentKind.MES.value: [
@@ -118,6 +154,79 @@ def _initial_context_evidence(job: RCAJob) -> list[Evidence]:
     )
 
 
+def _align_terminal_planner_stop(state: RCAState) -> RCAState:
+    """Project a Python terminal decision when the final Gate changes a stop.
+
+    A superseded stop is retained in execution metadata for audit rather than as
+    a second typed stop (which would make the Planner trace invalid).  The last
+    effective PlannerDecision, State fields, and Competition terminal state then
+    describe the same outcome.
+    """
+
+    if (
+        state.stop_reason is None
+        or state.goal_status is None
+        or state.conclusion_level is None
+    ):
+        return state
+    last = state.planner_decisions[-1] if state.planner_decisions else None
+    if (
+        last is not None
+        and last.decision_type == DecisionType.STOP.value
+        and last.stop_reason == state.stop_reason
+        and last.goal_status == state.goal_status
+    ):
+        return state
+    goal_id = (
+        state.investigation_goal.goal_id
+        if state.investigation_goal is not None
+        else state.job.job_id
+    )
+    projection = PlannerDecision(
+        decision_id=(
+            last.decision_id
+            if last is not None and last.decision_type == DecisionType.STOP.value
+            else (
+                f"{goal_id}:python-terminal-projection:"
+                f"{len(state.planner_decisions) + 1}"
+            )
+        ),
+        goal_id=goal_id,
+        decision_type=DecisionType.STOP.value,
+        reason=(
+            "Python projected the authoritative Competition/Confirmation Gate "
+            "terminal state after preserving the original Planner decision."
+        ),
+        goal_status=state.goal_status,
+        proposed_conclusion_level=state.conclusion_level,
+        stop_reason=state.stop_reason,
+    )
+    superseded_stop = (
+        last.to_dict()
+        if last is not None and last.decision_type == DecisionType.STOP.value
+        else None
+    )
+    planner_decisions = (
+        [*state.planner_decisions[:-1], projection]
+        if superseded_stop is not None
+        else [*state.planner_decisions, projection]
+    )
+    return replace(
+        state,
+        planner_decisions=planner_decisions,
+        execution_metadata={
+            **state.execution_metadata,
+            "planner_stop_proposed_by": "python_runtime",
+            "terminal_stop_projection_applied": True,
+            **(
+                {"superseded_terminal_planner_decision": superseded_stop}
+                if superseded_stop is not None
+                else {}
+            ),
+        },
+    )
+
+
 def _is_llm_budget_exhaustion(error: LLMCallError) -> bool:
     """Recognize runtime call ceilings without treating them as provider faults."""
 
@@ -126,6 +235,45 @@ def _is_llm_budget_exhaustion(error: LLMCallError) -> bool:
         "evaluation_call_cap",
         "formal_blind_call_cap",
     }
+
+
+def _persist_authoritative_lane_inventory(
+    findings: list[AgentFinding],
+    *,
+    lanes: list[CausalLaneRecord],
+    discovery_finding_id: str | None = None,
+    raw_lane_candidate_count: int | None = None,
+) -> list[AgentFinding]:
+    """Project canonical Python Lane state into one Planner-visible MES Finding."""
+
+    target_id = discovery_finding_id
+    if target_id is None:
+        target_id = next(
+            (
+                item.finding_id
+                for item in reversed(findings)
+                if item.agent == AgentKind.MES.value
+                and item.details.get("lane_inventory_authoritative") is True
+            ),
+            None,
+        )
+    if target_id is None:
+        return findings
+    updated: list[AgentFinding] = []
+    for item in findings:
+        if item.finding_id != target_id:
+            updated.append(item)
+            continue
+        details = {
+            **item.details,
+            "lane_candidates": [lane.to_dict() for lane in lanes],
+            "lane_inventory_authoritative": True,
+            "canonical_lane_count": len(lanes),
+        }
+        if raw_lane_candidate_count is not None:
+            details["raw_lane_candidate_count"] = raw_lane_candidate_count
+        updated.append(replace(item, details=details))
+    return updated
 
 
 def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAState:
@@ -140,7 +288,6 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
     if finding.agent != AgentKind.MES.value or not isinstance(raw_candidates, list):
         return state
     known_evidence_ids = set(item.evidence_id for item in state.evidence)
-    records_by_id = {record.lane_id: record for record in state.causal_lanes}
     discovered: list[CausalLaneRecord] = []
     for raw in raw_candidates:
         if not isinstance(raw, dict):
@@ -149,18 +296,26 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
         if not lane_id:
             continue
         raw_evidence_ids = raw.get("evidence_ids", [])
-        evidence_ids = tuple(
-            str(item).strip()
-            for item in raw_evidence_ids
-            if isinstance(item, str)
-            and item.strip()
-            and item.strip() in known_evidence_ids
-        ) if isinstance(raw_evidence_ids, list | tuple) else ()
+        evidence_ids = (
+            tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in raw_evidence_ids
+                    if isinstance(item, str)
+                    and item.strip()
+                    and item.strip() in known_evidence_ids
+                )
+            )
+            if isinstance(raw_evidence_ids, list | tuple)
+            else ()
+        )
         time_window = raw.get("time_window", [])
         try:
             record = CausalLaneRecord(
                 lane_id=lane_id,
                 operation=str(raw.get("operation", "")),
+                operation_name=str(raw.get("operation_name", "")),
+                module=str(raw.get("module", "")),
                 equipment=str(raw.get("equipment", "")),
                 chamber=str(raw.get("chamber", "")),
                 recipe=str(raw.get("recipe", "")),
@@ -182,41 +337,45 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
                 initial_evidence_ids=evidence_ids,
                 priority_score=float(raw.get("priority_score", 0.0)),
                 investigation_status=InvestigationLaneStatus.EVIDENCE_COLLECTED.value,
+                lifecycle_status=LaneLifecycleStatus.CREATED.value,
+                last_transition_reason="Discovered from typed MES exposure Evidence.",
+                lifecycle_history=(
+                    LaneLifecycleTransition(
+                        sequence=1,
+                        lane_id=lane_id,
+                        from_status=None,
+                        to_status=LaneLifecycleStatus.CREATED.value,
+                        reason="Discovered from typed MES exposure Evidence.",
+                        evidence_ids=evidence_ids,
+                    ),
+                ),
             )
         except (TypeError, ValueError, ModelValidationError):
             # Malformed one-Lane payloads are isolated; other factual lanes
             # remain usable and this is not a Planner/orchestration failure.
             continue
-        previous = records_by_id.get(record.lane_id)
-        if previous is not None and previous.investigation_status in {
-            InvestigationLaneStatus.ELIMINATED.value,
-            InvestigationLaneStatus.BLOCKED.value,
-        }:
-            record = replace(
-                record,
-                investigation_status=previous.investigation_status,
-                pruned_reason=previous.pruned_reason,
-            )
-        records_by_id[record.lane_id] = record
         discovered.append(record)
     if not discovered:
         return state
 
+    reconciled = reconcile_lane_inventory(state.causal_lanes, discovered)
     ordered = sorted(
-        records_by_id.values(),
+        reconciled,
         key=lambda item: (-item.priority_score, item.lane_id),
     )
     searchable = [
         item
         for item in ordered
-        if item.investigation_status
-        not in {
-            InvestigationLaneStatus.ELIMINATED.value,
-            InvestigationLaneStatus.BLOCKED.value,
-        }
+        if lane_is_searchable(item)
     ]
-    active = searchable[:3]
-    overflow = searchable[3:]
+    selected_ids = select_diverse_lane_ids(
+        [item.to_dict() for item in searchable],
+        limit=3,
+    )
+    selected_id_set = set(selected_ids)
+    searchable_by_id = {item.lane_id: item for item in searchable}
+    active = [searchable_by_id[lane_id] for lane_id in selected_ids]
+    overflow = [item for item in searchable if item.lane_id not in selected_id_set]
     active_ids = tuple(item.lane_id for item in active)
     overflow_ids = tuple(item.lane_id for item in overflow)
     terminal_eliminated = tuple(
@@ -230,6 +389,12 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
         if item.investigation_status == InvestigationLaneStatus.BLOCKED.value
     )
     unresolved_ids = tuple(item.lane_id for item in overflow)
+    ordered = list(
+        apply_active_lane_snapshot(
+            ordered,
+            active_lane_ids=active_ids,
+        )
+    )
     trace = CompetitionTrace(
         active_lane_ids=active_ids,
         overflow_lane_ids=overflow_ids,
@@ -238,6 +403,41 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
         eliminated_lane_ids=terminal_eliminated,
         blocked_lane_ids=terminal_blocked,
         alternative_search_status=AlternativeSearchStatus.NOT_SEARCHED.value,
+        competition_requirement=(
+            state.competition_trace.competition_requirement
+            if state.competition_trace is not None
+            else CompetitionRequirement.NOT_EVALUATED.value
+        ),
+        competition_status=(
+            state.competition_trace.competition_status
+            if state.competition_trace is not None
+            else CandidateCompetitionStatus.NOT_EVALUATED.value
+        ),
+        competition_type=(
+            state.competition_trace.competition_type
+            if state.competition_trace is not None
+            else CandidateCompetitionType.NOT_EVALUATED.value
+        ),
+        competition_failure_reason=(
+            state.competition_trace.competition_failure_reason
+            if state.competition_trace is not None
+            else None
+        ),
+        competition_gap_reason=(
+            state.competition_trace.competition_gap_reason
+            if state.competition_trace is not None
+            else None
+        ),
+        candidate_semantic_profiles=(
+            state.competition_trace.candidate_semantic_profiles
+            if state.competition_trace is not None
+            else ()
+        ),
+        candidate_lineage=(
+            state.competition_trace.candidate_lineage
+            if state.competition_trace is not None
+            else ()
+        ),
         challenge_round_count=(
             state.competition_trace.challenge_round_count
             if state.competition_trace is not None
@@ -248,6 +448,12 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
         state,
         causal_lanes=ordered,
         competition_trace=trace,
+        findings=_persist_authoritative_lane_inventory(
+            state.findings,
+            lanes=ordered,
+            discovery_finding_id=finding.finding_id,
+            raw_lane_candidate_count=len(raw_candidates),
+        ),
     )
 
 
@@ -307,7 +513,26 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
     raw_challenges = finding.details.get("candidate_challenges", [])
     if not isinstance(raw_generation, dict) or not isinstance(raw_challenges, list):
         return state
-    if raw_generation.get("source") == "not_requested":
+    raw_candidate_generation = finding.details.get(
+        "hypothesis_candidate_generation",
+        {},
+    )
+    if not isinstance(raw_candidate_generation, dict):
+        raw_candidate_generation = {}
+    candidate_competition_status = str(
+        finding.details.get(
+            "competition_status",
+            raw_candidate_generation.get(
+                "competition_status",
+                CandidateCompetitionStatus.NOT_EVALUATED.value,
+            ),
+        )
+    )
+    if (
+        raw_generation.get("source") == "not_requested"
+        and candidate_competition_status
+        == CandidateCompetitionStatus.NOT_EVALUATED.value
+    ):
         return state
     challenges: list[CandidateChallenge] = []
     for raw in raw_challenges:
@@ -330,15 +555,17 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
                 lane_resolutions.append(AlternativeLaneResolution.from_dict(raw))
             except (TypeError, ValueError, ModelValidationError):
                 continue
-    active_before = [
-        lane.lane_id
+    searchable_before = [
+        lane
         for lane in state.causal_lanes
-        if lane.investigation_status
-        not in {
-            InvestigationLaneStatus.ELIMINATED.value,
-            InvestigationLaneStatus.BLOCKED.value,
-        }
-    ][:3]
+        if lane_is_searchable(lane)
+    ]
+    active_before = list(
+        select_diverse_lane_ids(
+            [lane.to_dict() for lane in searchable_before],
+            limit=3,
+        )
+    )
     eliminated_before = [
         lane.lane_id
         for lane in state.causal_lanes
@@ -386,51 +613,63 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
     )
     lane_resolutions = merged_resolutions
     resolutions_by_lane = {item.lane_id: item for item in lane_resolutions}
-    causal_lanes = [
-        (
-            replace(
+    causal_lanes: list[CausalLaneRecord] = []
+    for lane in state.causal_lanes:
+        resolution = resolutions_by_lane.get(lane.lane_id)
+        if resolution is None or resolution.status != (
+            AlternativeLaneResolutionStatus.ELIMINATED.value
+        ):
+            causal_lanes.append(lane)
+            continue
+        reason = resolution.reason or "Python resolved this alternative Lane."
+        causal_lanes.append(
+            transition_lane(
                 lane,
-                investigation_status=(
-                    InvestigationLaneStatus.BLOCKED.value
-                    if resolutions_by_lane[lane.lane_id].status
-                    == AlternativeLaneResolutionStatus.BLOCKED.value
-                    else InvestigationLaneStatus.ELIMINATED.value
-                ),
-                pruned_reason=(
-                    resolutions_by_lane[lane.lane_id].reason
-                    or "Python resolved this alternative Lane."
-                ),
+                lifecycle_status=LaneLifecycleStatus.ELIMINATED.value,
+                investigation_status=InvestigationLaneStatus.ELIMINATED.value,
+                reason=reason,
+                pruned_reason=reason,
+                evidence_ids=resolution.evidence_ids,
             )
-            if lane.lane_id in resolutions_by_lane
-            and resolutions_by_lane[lane.lane_id].status
-            in {
-                AlternativeLaneResolutionStatus.ELIMINATED.value,
-                AlternativeLaneResolutionStatus.BLOCKED.value,
-            }
-            else lane
         )
-        for lane in state.causal_lanes
-    ]
-    active_ids = tuple(
-        lane.lane_id
+    challenge_evidence_by_lane: dict[str, tuple[str, ...]] = {}
+    challenged_lane_ids: list[str] = []
+    for challenge in challenges:
+        lane_id = challenge.evidence_probe_lane_id
+        if lane_id is None:
+            continue
+        challenged_lane_ids.append(lane_id)
+        challenge_evidence_by_lane[lane_id] = tuple(
+            dict.fromkeys(
+                [
+                    *challenge.supporting_evidence_ids,
+                    *challenge.contradicting_evidence_ids,
+                    *challenge.unexplained_precursor_evidence_ids,
+                ]
+            )
+        )
+    causal_lanes = list(
+        mark_lanes_challenged(
+            causal_lanes,
+            challenged_lane_ids=challenged_lane_ids,
+            evidence_ids_by_lane=challenge_evidence_by_lane,
+        )
+    )
+    searchable_after = [
+        lane
         for lane in causal_lanes
-        if lane.lane_id
-        and lane.investigation_status
-        not in {
-            InvestigationLaneStatus.ELIMINATED.value,
-            InvestigationLaneStatus.BLOCKED.value,
-        }
-    )[:3]
+        if lane_is_searchable(lane)
+    ]
+    active_ids = select_diverse_lane_ids(
+        [lane.to_dict() for lane in searchable_after],
+        limit=3,
+    )
     known_ids = {lane.lane_id for lane in causal_lanes}
     overflow_ids = tuple(
         lane.lane_id
         for lane in causal_lanes
         if lane.lane_id not in set(active_ids)
-        and lane.investigation_status
-        not in {
-            InvestigationLaneStatus.ELIMINATED.value,
-            InvestigationLaneStatus.BLOCKED.value,
-        }
+        and lane_is_searchable(lane)
     )
     alternative_ids = tuple(
         challenge.strongest_alternative_lane_id
@@ -464,6 +703,12 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
         for lane in causal_lanes
         if lane.investigation_status == InvestigationLaneStatus.BLOCKED.value
     )
+    causal_lanes = list(
+        apply_active_lane_snapshot(
+            causal_lanes,
+            active_lane_ids=active_ids,
+        )
+    )
     alternative_search_status = derive_alternative_search_status(
         challenges=challenges,
         matrices=(),
@@ -494,6 +739,115 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
             ]
         )
     )
+    competition_requirement = str(
+        finding.details.get(
+            "competition_requirement",
+            raw_candidate_generation.get(
+                "competition_requirement",
+                previous_trace.competition_requirement
+                if previous_trace is not None
+                else CompetitionRequirement.NOT_EVALUATED.value,
+            ),
+        )
+    )
+    competition_status = str(
+        finding.details.get(
+            "competition_status",
+            raw_candidate_generation.get(
+                "competition_status",
+                previous_trace.competition_status
+                if previous_trace is not None
+                else CandidateCompetitionStatus.NOT_EVALUATED.value,
+            ),
+        )
+    )
+    competition_type = str(
+        finding.details.get(
+            "competition_type",
+            raw_candidate_generation.get(
+                "competition_type",
+                previous_trace.competition_type
+                if previous_trace is not None
+                else CandidateCompetitionType.NOT_EVALUATED.value,
+            ),
+        )
+    )
+    raw_competition_axes = finding.details.get(
+        "competition_axes",
+        raw_candidate_generation.get(
+            "competition_axes",
+            list(previous_trace.competition_axes)
+            if previous_trace is not None
+            else [],
+        ),
+    )
+    competition_axes = (
+        tuple(str(item) for item in raw_competition_axes if str(item))
+        if isinstance(raw_competition_axes, list | tuple)
+        else ()
+    )
+    scope_assessment_status = str(
+        finding.details.get(
+            "scope_assessment_status",
+            raw_candidate_generation.get(
+                "scope_assessment_status",
+                previous_trace.scope_assessment_status
+                if previous_trace is not None
+                else "not_evaluated",
+            ),
+        )
+    )
+    raw_failure_reason = finding.details.get(
+        "competition_failure_reason",
+        raw_candidate_generation.get("competition_failure_reason"),
+    )
+    competition_failure_reason = (
+        str(raw_failure_reason) if raw_failure_reason is not None else None
+    )
+    raw_gap_reason = finding.details.get(
+        "competition_gap_reason",
+        raw_candidate_generation.get(
+            "competition_gap_reason",
+            previous_trace.competition_gap_reason
+            if previous_trace is not None
+            else None,
+        ),
+    )
+    competition_gap_reason = (
+        str(raw_gap_reason) if raw_gap_reason is not None else None
+    )
+    raw_semantic_profiles = finding.details.get(
+        "candidate_semantic_profiles",
+        raw_candidate_generation.get("candidate_semantic_profiles", []),
+    )
+    candidate_semantic_profiles: list[CandidateSemanticProfile] = []
+    if isinstance(raw_semantic_profiles, list):
+        for raw_profile in raw_semantic_profiles:
+            if not isinstance(raw_profile, dict):
+                continue
+            try:
+                candidate_semantic_profiles.append(
+                    CandidateSemanticProfile.from_dict(raw_profile)
+                )
+            except (TypeError, ValueError, ModelValidationError):
+                # Semantic metadata is candidate-adjacent audit state. An
+                # invalid profile cannot invalidate the Candidate or State.
+                continue
+    raw_lineage = finding.details.get(
+        "candidate_lineage",
+        raw_candidate_generation.get("candidate_lineage", []),
+    )
+    current_lineage = (
+        [dict(item) for item in raw_lineage if isinstance(item, dict)]
+        if isinstance(raw_lineage, list)
+        else []
+    )
+    candidate_lineage = tuple(
+        [
+            *(previous_trace.candidate_lineage if previous_trace is not None else ()),
+            *current_lineage,
+        ]
+    )
     trace = CompetitionTrace(
         active_lane_ids=active_ids,
         overflow_lane_ids=overflow_ids,
@@ -503,6 +857,15 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
         blocked_lane_ids=blocked_ids,
         lane_resolutions=tuple(lane_resolutions),
         alternative_search_status=alternative_search_status,
+        competition_requirement=competition_requirement,
+        competition_status=competition_status,
+        competition_type=competition_type,
+        competition_axes=competition_axes,
+        scope_assessment_status=scope_assessment_status,
+        competition_failure_reason=competition_failure_reason,
+        competition_gap_reason=competition_gap_reason,
+        candidate_semantic_profiles=tuple(candidate_semantic_profiles),
+        candidate_lineage=candidate_lineage,
         challenge_round_count=previous_count + 1,
         resolution_evidence_ids=resolution_ids,
     )
@@ -511,6 +874,10 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
         causal_lanes=causal_lanes,
         candidate_challenges=[*state.candidate_challenges, *challenges],
         competition_trace=trace,
+        findings=_persist_authoritative_lane_inventory(
+            state.findings,
+            lanes=causal_lanes,
+        ),
     )
 
 
@@ -533,6 +900,26 @@ def _update_causal_chain_state(state: RCAState, finding: AgentFinding) -> RCASta
         # unpersistable; the Confirmation Gate remains the source of truth.
         return state
     return replace(state, causal_chain_completeness=status)
+
+
+def _reasoning_decision_signature(finding: AgentFinding | None) -> str | None:
+    """Return a stable signature of decision state, excluding audit counters."""
+
+    if finding is None or finding.agent != AgentKind.RCA_REASONING.value:
+        return None
+    details = finding.details
+    payload = {
+        "ranked_candidates": details.get("ranked_candidates", []),
+        "conclusion_status": details.get("conclusion_status"),
+        "competition_requirement": details.get("competition_requirement"),
+        "competition_status": details.get("competition_status"),
+        "competition_type": details.get("competition_type"),
+        "competition_failure_reason": details.get(
+            "competition_failure_reason"
+        ),
+        "confirmation_gate": details.get("confirmation_gate", {}),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _llm_call_fallback_diagnostics(error: LLMCallError) -> dict[str, Any]:
@@ -563,14 +950,20 @@ def _open_question_gaps(questions: list[InvestigationQuestion]) -> list[str]:
 
 
 def _conclusion_cap(state: RCAState, goal: InvestigationGoal) -> str:
-    statuses = {hypothesis.status for hypothesis in state.hypotheses}
-    if HypothesisStatus.CONFLICTED.value in statuses:
+    # Iterative RCA keeps historical Hypotheses for audit. Only the explicitly
+    # authoritative Hypothesis may cap the current conclusion; an older
+    # supported/conflicted round must never leak into the terminal result.
+    authoritative = state.authoritative_hypothesis
+    authoritative_status = (
+        authoritative.status if authoritative is not None else None
+    )
+    if authoritative_status == HypothesisStatus.CONFLICTED.value:
         return ConclusionLevel.CONFLICTED.value
-    if HypothesisStatus.SUPPORTED.value in statuses:
+    if authoritative_status == HypothesisStatus.SUPPORTED.value:
         return ConclusionLevel.SUPPORTED.value
-    if HypothesisStatus.CANDIDATE.value in statuses:
+    if authoritative_status == HypothesisStatus.CANDIDATE.value:
         return ConclusionLevel.CANDIDATE.value
-    if statuses & {
+    if authoritative_status in {
         HypothesisStatus.INCONCLUSIVE.value,
         HypothesisStatus.REJECTED.value,
     }:
@@ -1278,29 +1671,71 @@ class Supervisor:
                 return terminal
         observed_tool_latencies = tool_latencies if tool_latencies is not None else []
         while True:
-            try:
-                outcome = planner.decide_with_review(
-                    goal=intent_plan.goal,
-                    questions=state.investigation_questions,
-                    findings=state.findings,
-                    action_records=state.action_history,
-                    tool_call_count=len(observed_tool_latencies),
-                    evidence=state.evidence,
-                    evidence_ids=[item.evidence_id for item in state.evidence],
-                    question_evidence_links=state.question_evidence_links,
-                    capability_notices=state.capability_notices,
-                    hypotheses=state.hypotheses,
-                    prior_decisions=state.planner_decisions,
-                    authoritative_rca_finding_id=(
-                        state.authoritative_rca_finding_id
+            remaining_llm_calls = llm_calls_remaining(planner.llm_client)
+            if remaining_llm_calls is not None and remaining_llm_calls <= 1:
+                outcome = PlannerDecisionOutcome(
+                    decision=PlannerDecision(
+                        decision_id=(
+                            f"{intent_plan.goal.goal_id}:llm-budget-stop:"
+                            f"{len(state.planner_decisions) + 1}"
+                        ),
+                        goal_id=intent_plan.goal.goal_id,
+                        decision_type=DecisionType.STOP.value,
+                        reason=(
+                            "Python stopped before another provider call because "
+                            "the remaining global LLM-call budget cannot safely "
+                            "cover both planning and a possible selected action."
+                        ),
+                        goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
+                        proposed_conclusion_level=(
+                            ConclusionLevel.INCONCLUSIVE.value
+                        ),
+                        stop_reason=StopReason.BUDGET_EXHAUSTED.value,
+                    ),
+                    decision_proposed_by="python_runtime",
+                    action_value_assessments=list(
+                        state.latest_action_value_assessments
                     ),
                 )
                 decision = outcome.decision
+            else:
+                outcome = None
+            try:
+                if outcome is None:
+                    outcome = planner.decide_with_review(
+                        goal=intent_plan.goal,
+                        questions=state.investigation_questions,
+                        findings=state.findings,
+                        action_records=state.action_history,
+                        tool_call_count=len(observed_tool_latencies),
+                        evidence=state.evidence,
+                        evidence_ids=[item.evidence_id for item in state.evidence],
+                        question_evidence_links=state.question_evidence_links,
+                        capability_notices=state.capability_notices,
+                        hypotheses=state.hypotheses,
+                        prior_decisions=state.planner_decisions,
+                        critical_contradictions=(
+                            [
+                                f"{state.authoritative_hypothesis.hypothesis_id}: "
+                                f"{state.authoritative_hypothesis.root_cause}"
+                            ]
+                            if state.authoritative_hypothesis is not None
+                            and state.authoritative_hypothesis.status
+                            == HypothesisStatus.CONFLICTED.value
+                            else []
+                        ),
+                        authoritative_rca_finding_id=(
+                            state.authoritative_rca_finding_id
+                        ),
+                        investigation_gain_history=(
+                            state.investigation_gain_history
+                        ),
+                    )
+                    decision = outcome.decision
             except (QwenNextActionPlannerError, LLMCallError) as exc:
                 if isinstance(exc, LLMCallError) and _is_llm_budget_exhaustion(exc):
-                    terminal = replace(
+                    terminal_state = replace(
                         state,
-                        job=replace(state.job, status=TaskStatus.COMPLETED.value),
                         goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
                         conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
                         evidence_gaps=_open_question_gaps(
@@ -1319,6 +1754,19 @@ class Supervisor:
                             "llm_budget_failure_category": exc.failure_category,
                         },
                     )
+                    terminal_state = finalize_investigation(
+                        terminal_state,
+                        budget_exhausted=True,
+                    )
+                    terminal_state = _align_terminal_planner_stop(terminal_state)
+                    terminal = replace(
+                        terminal_state,
+                        job=replace(
+                            terminal_state.job,
+                            status=TaskStatus.COMPLETED.value,
+                        ),
+                    )
+                    validate_terminal_investigation_state(terminal)
                     if not terminal.evidence:
                         return terminal
                     report = self.report_generator.generate(terminal)
@@ -1371,6 +1819,37 @@ class Supervisor:
                     tool_latencies=observed_tool_latencies,
                 )
 
+            assert outcome is not None
+            if (
+                decision.decision_type == DecisionType.ACT.value
+                and decision.next_action is not None
+                and decision.next_action.kind == "run_rca_reasoning"
+                and not _rca_reasoning_round_budget_available(
+                    planner.llm_client
+                )
+            ):
+                decision = PlannerDecision(
+                    decision_id=f"{decision.decision_id}:rca-budget-stop",
+                    goal_id=decision.goal_id,
+                    decision_type=DecisionType.STOP.value,
+                    reason=(
+                        "Python did not start another RCA reasoning round because "
+                        "the remaining LLM-call budget cannot cover Candidate "
+                        "generation, adversarial Challenge, and the governed "
+                        "post-Action Planner decision."
+                    ),
+                    goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
+                    proposed_conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+                    stop_reason=StopReason.BUDGET_EXHAUSTED.value,
+                )
+                outcome = PlannerDecisionOutcome(
+                    decision=decision,
+                    decision_proposed_by="python_runtime",
+                    question_updates_source="python_evidence_gate",
+                    action_value_assessments=list(
+                        outcome.action_value_assessments
+                    ),
+                )
             if decision.decision_type == DecisionType.STOP.value:
                 state = self._record_planner_outcome(state, outcome)
                 state = replace(
@@ -1389,6 +1868,7 @@ class Supervisor:
                         "terminal_question_updates_validated_by": (
                             "python_evidence_gate"
                             if decision.question_updates
+                            or state.competition_trace is not None
                             else None
                         ),
                     },
@@ -1398,9 +1878,8 @@ class Supervisor:
                     state=state,
                     goal=intent_plan.goal,
                 )
-                terminal = replace(
+                terminal_state = replace(
                     state,
-                    job=replace(state.job, status=TaskStatus.COMPLETED.value),
                     goal_status=decision.goal_status,
                     conclusion_level=conclusion_level,
                     evidence_gaps=_open_question_gaps(
@@ -1408,6 +1887,35 @@ class Supervisor:
                     ),
                     stop_reason=decision.stop_reason,
                 )
+                if terminal_state.competition_trace is not None:
+                    terminal_state = replace(
+                        terminal_state,
+                        execution_metadata={
+                            **terminal_state.execution_metadata,
+                            "terminal_question_updates_source": (
+                                "python_evidence_gate"
+                            ),
+                            "terminal_question_updates_validated_by": (
+                                "python_evidence_gate"
+                            ),
+                        },
+                    )
+                terminal_state = finalize_investigation(
+                    terminal_state,
+                    action_value_assessments=outcome.action_value_assessments,
+                    budget_exhausted=(
+                        decision.stop_reason == StopReason.BUDGET_EXHAUSTED.value
+                    ),
+                )
+                terminal_state = _align_terminal_planner_stop(terminal_state)
+                terminal = replace(
+                    terminal_state,
+                    job=replace(
+                        terminal_state.job,
+                        status=TaskStatus.COMPLETED.value,
+                    ),
+                )
+                validate_terminal_investigation_state(terminal)
                 emit_workflow_event(
                     "planner_stopped",
                     {
@@ -1525,6 +2033,9 @@ class Supervisor:
                 *state.question_update_reviews,
                 *outcome.question_update_reviews,
             ],
+            latest_action_value_assessments=list(
+                outcome.action_value_assessments
+            ),
         )
 
     def _dispatch_llm_react(
@@ -1931,6 +2442,9 @@ class Supervisor:
         action: InvestigationAction,
         finding: AgentFinding,
     ) -> RCAState:
+        prior_reasoning_signature = _reasoning_decision_signature(
+            state.authoritative_rca_finding
+        )
         if finding.agent != action.agent:
             raise SupervisorExecutionError(
                 f"action {action.action_id} expected {action.agent} finding, "
@@ -2040,7 +2554,32 @@ class Supervisor:
         )
         lane_state = _update_causal_lane_state(recorded_state, finding)
         competition_state = _update_competition_state(lane_state, finding)
-        return _update_causal_chain_state(competition_state, finding)
+        updated_state = _update_causal_chain_state(competition_state, finding)
+        prior_gains = list(state.investigation_gain_history)
+        if not prior_gains and state.action_history:
+            prior_gains = list(
+                derive_investigation_gain_history(
+                    action_records=state.action_history,
+                    evidence=state.evidence,
+                    links=state.question_evidence_links,
+                )
+            )
+        gain = classify_investigation_gain(
+            record,
+            earlier_records=state.action_history,
+            evidence_by_id=updated_state.evidence_by_id,
+            links=updated_state.question_evidence_links,
+            earlier_gains=prior_gains,
+            reasoning_state_changed=(
+                finding.agent == AgentKind.RCA_REASONING.value
+                and _reasoning_decision_signature(finding)
+                != prior_reasoning_signature
+            ),
+        )
+        return replace(
+            updated_state,
+            investigation_gain_history=[*prior_gains, gain],
+        )
 
     def execute(self, job: RCAJob, task_plan: TaskPlan) -> RCAState:
         plan_agents = {task.agent for task in task_plan.tasks}

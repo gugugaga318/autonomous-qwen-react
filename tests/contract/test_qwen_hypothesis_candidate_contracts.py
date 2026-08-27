@@ -19,7 +19,14 @@ from yield_rca_core.causal_evidence_matrix import (  # noqa: E402
     build_causal_evidence_matrix,
 )
 from yield_rca_core.causal_hypothesis import CausalClaimStatus, CausalHypothesis  # noqa: E402
-from yield_rca_core.causal_investigation_models import CausalLaneRecord  # noqa: E402
+from yield_rca_core.causal_investigation_models import (  # noqa: E402
+    CandidateCompetitionStatus,
+    CandidateDistinguishingPrediction,
+    CandidateSemanticProfile,
+    CausalLaneRecord,
+    CompetitionGapReason,
+    CompetitionRequirement,
+)
 from yield_rca_core.evidence_models import (  # noqa: E402
     EVIDENCE_SCHEMA_VERSION,
     EntityType,
@@ -30,6 +37,8 @@ from yield_rca_core.evidence_models import (  # noqa: E402
 )
 from yield_rca_core.hypothesis_candidate_generator import (  # noqa: E402
     QwenHypothesisCandidateGenerator,
+    _mechanism_semantics_are_distinct,
+    _scope_semantics_are_distinct,
 )
 from yield_rca_core.hypothesis_engine import HypothesisEngine  # noqa: E402
 from yield_rca_core.llm_gateway import (  # noqa: E402
@@ -169,7 +178,9 @@ def causal_findings() -> list[AgentFinding]:
                 "processing_window": {
                     "start": "2026-01-01T00:00:00",
                     "end": "2026-01-01T01:00:00",
-                }
+                },
+                "causal_support_kind": "matched_comparison",
+                "validation_status": "CONFIRMED",
             },
             timestamp="2026-01-01T00:30:00",
         ),
@@ -205,6 +216,44 @@ def proposal(*, supporting: list[str] | None = None) -> dict[str, object]:
         "supporting_evidence_ids": supporting
         or ["EV_EXPOSURE", "EV_PROCESS", "EV_PRODUCT"],
         "contradicting_evidence_ids": [],
+    }
+
+
+def semantic_profile(
+    candidate_index: int,
+    *,
+    scope_relation: str,
+    claimed_lane_ids: list[str],
+    comparison_lane_ids: list[str],
+    prediction: str,
+    discriminator_kind: str = "product_outcome",
+    primary_mechanism: str = "Plasma-control drift",
+    effect_modifier: str | None = None,
+    mechanism_relation: str | None = None,
+    depends_on_candidate_index: int | None = None,
+) -> dict[str, object]:
+    return {
+        "candidate_index": candidate_index,
+        "claimed_scope": {
+            "scope_relation": scope_relation,
+            "lane_ids": claimed_lane_ids,
+        },
+        "comparison_scope": {"lane_ids": comparison_lane_ids},
+        "mechanism_claim": "Plasma-control drift changes contact etch response.",
+        "primary_mechanism": primary_mechanism,
+        "effect_modifier": effect_modifier,
+        "depends_on_candidate_index": depends_on_candidate_index,
+        "mechanism_relation": (
+            mechanism_relation
+            or ("reference" if candidate_index == 0 else "independent_alternative")
+        ),
+        "distinguishing_predictions": [
+            {
+                "discriminator_kind": discriminator_kind,
+                "lane_ids": comparison_lane_ids,
+                "prediction": prediction,
+            }
+        ],
     }
 
 
@@ -248,6 +297,73 @@ class CandidateProviderFailureClient(FakeLLMClient):
 
 
 class QwenHypothesisCandidateContractTest(unittest.TestCase):
+    def test_scope_collapse_requires_same_declared_scope_and_prediction(self) -> None:
+        shared = CandidateSemanticProfile(
+            candidate_id="REQ:llm:1",
+            scope_relation="shared_effect",
+            claimed_lane_ids=("LANE_A", "LANE_B"),
+            comparison_lane_ids=("LANE_A", "LANE_B"),
+            mechanism_claim="Shared chamber drift changes plasma response.",
+            primary_mechanism="Chamber wall conditioning drift",
+            mechanism_relation="reference",
+            distinguishing_predictions=(
+                CandidateDistinguishingPrediction(
+                    discriminator_kind="product_outcome",
+                    lane_ids=("LANE_A", "LANE_B"),
+                    prediction="Both Lanes produce compatible outcomes.",
+                ),
+            ),
+        )
+        paraphrase = CandidateSemanticProfile.from_dict(
+            {**shared.to_dict(), "candidate_id": "REQ:llm:2"}
+        )
+        sensitive = CandidateSemanticProfile(
+            candidate_id="REQ:llm:2",
+            scope_relation="differential_sensitivity",
+            claimed_lane_ids=("LANE_A",),
+            comparison_lane_ids=("LANE_A", "LANE_B"),
+            mechanism_claim="RCP_A amplifies the shared chamber drift.",
+            distinguishing_predictions=(
+                CandidateDistinguishingPrediction(
+                    discriminator_kind="product_outcome",
+                    lane_ids=("LANE_A", "LANE_B"),
+                    prediction="LANE_A produces a more severe outcome than LANE_B.",
+                ),
+            ),
+        )
+        mechanism_alternative = CandidateSemanticProfile.from_dict(
+            {
+                **shared.to_dict(),
+                "candidate_id": "REQ:llm:2",
+                "mechanism_claim": (
+                    "Recipe timing creates endpoint overshoot independently "
+                    "of chamber conditioning."
+                ),
+                "primary_mechanism": "Recipe timing control fault",
+                "mechanism_relation": "independent_alternative",
+                "distinguishing_predictions": [
+                    {
+                        "discriminator_kind": "temporal_alignment",
+                        "lane_ids": ["LANE_A", "LANE_B"],
+                        "prediction": (
+                            "The anomaly follows recipe timing rather than "
+                            "shared chamber exposure."
+                        ),
+                        "schema_version": "1.0",
+                    }
+                ],
+            }
+        )
+
+        self.assertFalse(_scope_semantics_are_distinct(shared, paraphrase))
+        self.assertTrue(_scope_semantics_are_distinct(shared, sensitive))
+        self.assertFalse(
+            _scope_semantics_are_distinct(shared, mechanism_alternative)
+        )
+        self.assertTrue(
+            _mechanism_semantics_are_distinct(shared, mechanism_alternative)
+        )
+
     def test_comparator_cannot_own_discriminator_gap_selection(self) -> None:
         candidate = proposal()
         matrix = build_causal_evidence_matrix(
@@ -681,7 +797,7 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
 
         self.assertEqual(matrix.claims["equipment"].status, "conflicted")
 
-    def test_matrix_marks_mechanism_source_as_empirical_convergence(self) -> None:
+    def test_matrix_marks_validated_matched_comparison_as_mechanism_support(self) -> None:
         candidate = CausalHypothesis(
             root_cause="EQ_01 chamber temperature control drift",
             causal_explanation=(
@@ -698,7 +814,10 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
         )
 
         self.assertEqual(matrix.mechanism_status, CausalClaimStatus.SUPPORTED.value)
-        self.assertEqual(matrix.mechanism_support_source, "empirical_convergence")
+        self.assertEqual(
+            matrix.mechanism_support_source,
+            "empirical_discrimination",
+        )
         self.assertTrue(
             matrix.claims["mechanism"].facts["proposed_physical_bridge_terms"]
         )
@@ -1614,10 +1733,45 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
         self.assertEqual(mechanism_feedback[0]["mechanism_status"], "supported")
         self.assertEqual(
             mechanism_feedback[0]["mechanism_support_source"],
-            "empirical_convergence",
+            "empirical_discrimination",
         )
         self.assertTrue(mechanism_feedback[0]["proposed_physical_bridge_terms"])
         self.assertNotEqual(second.finding_id, first.finding_id)
+
+        third_product = typed_evidence(
+            evidence_id="EV_PRODUCT_ROUND_3",
+            evidence_type=EvidenceType.METROLOGY_DEVIATION.value,
+            agent=AgentKind.DEFECT_WAT.value,
+            entity_type=EntityType.DEFECT.value,
+            entity_id="edge_void",
+        )
+        third_client = CandidateClient(
+            [
+                {
+                    "candidates": [proposal()],
+                    "analysis_summary": "Third bounded Evidence refresh.",
+                }
+            ]
+        )
+        third = RCAReasoningAgent(
+            llm_client=third_client,
+            agent_mode="llm",
+        ).analyze(
+            request_id="REQ_RCA_ROUND_3",
+            findings=findings,
+            context_evidence=[new_product, third_product],
+            prior_rca_finding=second,
+        )
+
+        self.assertEqual(third.details["reasoning_round"], 3)
+        self.assertEqual(
+            third.details["prior_authoritative_rca_finding_id"],
+            second.finding_id,
+        )
+        self.assertEqual(
+            third.details["new_evidence_ids_since_prior"],
+            ["EV_PRODUCT_ROUND_3"],
+        )
 
     def test_reasoning_refresh_exposes_incomplete_prior_mechanism_feedback(self) -> None:
         weak_prior = {
@@ -1646,6 +1800,929 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
             "llm_explanation_only",
         )
         self.assertEqual(feedback[0]["proposed_physical_bridge_terms"], [])
+
+    def test_two_evidence_bounded_directions_force_candidate_repair(self) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:6000:EQ_B:EQ_B_CH02:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_EXP_DIRECTION_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_EXP_DIRECTION_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_B",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_PROC_DIRECTION_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        process_b = lane_process_evidence(
+            evidence_id="EV_PROC_DIRECTION_B",
+            lane_id=lane_b,
+            recipe="RCP_B",
+            parameter="clean_time",
+            equipment="EQ_B",
+            chamber="EQ_B_CH02",
+            operation="6000",
+        )
+        candidate_a = {
+            "root_cause": "EQ_A plasma oxygen-flow instability",
+            "causal_explanation": (
+                "Oxygen-flow instability changes plasma reaction kinetics and "
+                "produces the observed edge void."
+            ),
+            "supporting_evidence_ids": [
+                "EV_EXP_DIRECTION_A",
+                "EV_PROC_DIRECTION_A",
+                "EV_PRODUCT",
+            ],
+            "contradicting_evidence_ids": [],
+        }
+        response = {
+            "candidates": [candidate_a],
+            "analysis_summary": "Only the first direction was proposed.",
+        }
+        client = CandidateClient([response, response])
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_DIRECTION_REQUIRED",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a, process_b],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "6000",
+                    "equipment": "EQ_B",
+                    "chamber": "EQ_B_CH02",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["clean_time"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+        )
+
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(
+            result.competition_requirement,
+            CompetitionRequirement.DIRECTION_REQUIRED.value,
+        )
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        self.assertIsNone(result.competition_failure_reason)
+        self.assertEqual(
+            result.competition_gap_reason,
+            CompetitionGapReason.ALTERNATIVE_DIRECTION_NOT_GENERATED.value,
+        )
+        self.assertTrue(result.competition_repair_exhausted)
+        feedback = client.requests[1].payload["previous_validation_feedback"]
+        self.assertIn("alternative_direction_not_generated", feedback["message"])
+
+    def test_scope_competition_preserves_recipe_and_chamber_hypotheses(self) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:2500:EQ_A:EQ_A_CH01:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_EXP_SCOPE_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_EXP_SCOPE_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_PROC_SCOPE_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        process_b = lane_process_evidence(
+            evidence_id="EV_PROC_SCOPE_B",
+            lane_id=lane_b,
+            recipe="RCP_B",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        recipe_candidate = {
+            "root_cause": "RCP_A-specific oxygen-flow control instability",
+            "causal_explanation": (
+                "The anomaly is bounded to recipe RCP_A and changes plasma "
+                "reaction kinetics, producing the observed edge void."
+            ),
+            "supporting_evidence_ids": [
+                "EV_EXP_SCOPE_A",
+                "EV_PROC_SCOPE_A",
+                "EV_PRODUCT",
+            ],
+            "contradicting_evidence_ids": [],
+        }
+        chamber_candidate = {
+            "root_cause": "EQ_A_CH01 chamber-wide oxygen-flow instability",
+            "causal_explanation": (
+                "The shared anomaly spans recipes RCP_A and RCP_B, predicting a "
+                "chamber-wide plasma-control scope for the observed edge void."
+            ),
+            "supporting_evidence_ids": [
+                "EV_EXP_SCOPE_A",
+                "EV_PROC_SCOPE_A",
+                "EV_EXP_SCOPE_B",
+                "EV_PROC_SCOPE_B",
+                "EV_PRODUCT",
+            ],
+            "contradicting_evidence_ids": [],
+        }
+        client = CandidateClient(
+            [
+                {
+                    "candidates": [recipe_candidate, chamber_candidate],
+                    "candidate_semantic_profiles": [
+                        semantic_profile(
+                            0,
+                            scope_relation="focal_only",
+                            claimed_lane_ids=[lane_a],
+                            comparison_lane_ids=[lane_a, lane_b],
+                            prediction="Only RCP_A produces the product outcome.",
+                        ),
+                        semantic_profile(
+                            1,
+                            scope_relation="shared_effect",
+                            claimed_lane_ids=[lane_a, lane_b],
+                            comparison_lane_ids=[lane_a, lane_b],
+                            prediction="Both recipes produce compatible outcomes.",
+                        ),
+                    ],
+                    "analysis_summary": (
+                        "Recipe-specific and chamber-wide scope hypotheses compete."
+                    ),
+                }
+            ]
+        )
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_SCOPE_REQUIRED",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a, process_b],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+        )
+
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(
+            result.competition_requirement,
+            CompetitionRequirement.MECHANISM_REQUIRED.value,
+        )
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        self.assertIsNone(result.competition_failure_reason)
+        self.assertFalse(
+            result.competition_assessment["scope_competition_represented"]
+        )
+        self.assertFalse(
+            result.competition_assessment["mechanism_competition_represented"]
+        )
+        self.assertEqual(
+            result.competition_gap_reason,
+            CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value,
+        )
+        variants = result.competition_assessment["scope_assessment_variants"]
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(variants[0]["semantic_profile_status"], "valid_non_root")
+        self.assertEqual(
+            variants[0]["semantic_profile"]["scope_relation"],
+            "shared_effect",
+        )
+
+    def test_incomplete_recipe_comparison_still_requires_scope_candidates(
+        self,
+    ) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:2500:EQ_A:EQ_A_CH01:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_SCOPE_OPPORTUNITY_EXP_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_SCOPE_OPPORTUNITY_EXP_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_SCOPE_OPPORTUNITY_PROC_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        focal = {
+            **proposal(
+                supporting=[
+                    exposure_a.evidence_id,
+                    process_a.evidence_id,
+                    "EV_PRODUCT",
+                ]
+            ),
+            "root_cause": "RCP_A-specific oxygen-flow sensitivity",
+        }
+        shared = {
+            **proposal(
+                supporting=[
+                    exposure_a.evidence_id,
+                    exposure_b.evidence_id,
+                    process_a.evidence_id,
+                    "EV_PRODUCT",
+                ]
+            ),
+            "root_cause": "EQ_A_CH01 chamber-wide oxygen-flow instability",
+        }
+        response = {
+            "candidates": [focal, shared],
+            "candidate_semantic_profiles": [
+                semantic_profile(
+                    0,
+                    scope_relation="focal_only",
+                    claimed_lane_ids=[lane_a],
+                    comparison_lane_ids=[lane_a, lane_b],
+                    prediction=(
+                        "Only RCP_A shows the parameter anomaly and product response."
+                    ),
+                    discriminator_kind="parameter_anomaly",
+                ),
+                semantic_profile(
+                    1,
+                    scope_relation="shared_effect",
+                    claimed_lane_ids=[lane_a, lane_b],
+                    comparison_lane_ids=[lane_a, lane_b],
+                    prediction=(
+                        "Both recipes show a compatible parameter anomaly and response."
+                    ),
+                    discriminator_kind="parameter_anomaly",
+                ),
+            ],
+            "analysis_summary": "Focal and shared Scope hypotheses compete.",
+        }
+        client = CandidateClient([response])
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_SCOPE_OPPORTUNITY",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+        )
+
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(
+            result.competition_requirement,
+            CompetitionRequirement.MECHANISM_REQUIRED.value,
+        )
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        competition = result.evidence_synthesis["candidate_competition"]
+        scope_group = competition["scope_groups"][0]
+        self.assertTrue(scope_group["scope_competition_opportunity"])
+        self.assertFalse(scope_group["scope_evidence_complete"])
+        self.assertEqual(scope_group["missing_process_recipe_ids"], ["RCP_B"])
+        variants = result.competition_assessment["scope_assessment_variants"]
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(variants[0]["semantic_profile_status"], "valid_non_root")
+
+    def test_formal_009_scope_semantics_replay_does_not_infer_claim_from_coverage(
+        self,
+    ) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:2500:EQ_A:EQ_A_CH01:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_SCOPE_COVERAGE_EXP_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_SCOPE_COVERAGE_EXP_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_SCOPE_COVERAGE_PROC_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        process_b = lane_process_evidence(
+            evidence_id="EV_SCOPE_COVERAGE_PROC_B",
+            lane_id=lane_b,
+            recipe="RCP_B",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        shared_support = [
+            "EV_SCOPE_COVERAGE_EXP_A",
+            "EV_SCOPE_COVERAGE_PROC_A",
+            "EV_SCOPE_COVERAGE_EXP_B",
+            "EV_SCOPE_COVERAGE_PROC_B",
+            "EV_PRODUCT",
+        ]
+        chamber_wide = {
+            "root_cause": "Chamber-wide plasma-control drift affects both recipes",
+            "causal_explanation": (
+                "A shared chamber condition changes plasma kinetics in both "
+                "recipes and produces compatible product outcomes."
+            ),
+            "supporting_evidence_ids": shared_support,
+            "contradicting_evidence_ids": [],
+        }
+        recipe_sensitive = {
+            "root_cause": "RCP_A amplifies sensitivity to the chamber drift",
+            "causal_explanation": (
+                "Both recipes are compared, but RCP_A is predicted to amplify "
+                "the same chamber condition into a more severe outcome."
+            ),
+            "supporting_evidence_ids": shared_support,
+            "contradicting_evidence_ids": [],
+        }
+        client = CandidateClient(
+            [
+                {
+                    "candidates": [chamber_wide, recipe_sensitive],
+                    "candidate_semantic_profiles": [
+                        semantic_profile(
+                            0,
+                            scope_relation="shared_effect",
+                            claimed_lane_ids=[lane_a, lane_b],
+                            comparison_lane_ids=[lane_a, lane_b],
+                            prediction="Both recipe Lanes show compatible outcomes.",
+                        ),
+                        semantic_profile(
+                            1,
+                            scope_relation="differential_sensitivity",
+                            claimed_lane_ids=[lane_a],
+                            comparison_lane_ids=[lane_a, lane_b],
+                            prediction="RCP_A shows a materially more severe outcome.",
+                        ),
+                    ],
+                    "analysis_summary": "Shared-effect and sensitivity scopes compete.",
+                }
+            ]
+        )
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_SCOPE_COVERAGE_NE_CLAIM",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a, process_b],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+        )
+
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        profiles = result.competition_assessment["candidate_profiles"]
+        self.assertTrue(
+            all("consumed_discriminator_gap_ids" in profile for profile in profiles)
+        )
+        self.assertTrue(
+            all("discriminator_gap_ids" not in profile for profile in profiles)
+        )
+        self.assertEqual(
+            {profile["scope_relation"] for profile in profiles},
+            {"shared_effect"},
+        )
+        self.assertTrue(
+            all(
+                set(profile["evidence_coverage"]["recipes"])
+                == {"rcp_a", "rcp_b"}
+                for profile in profiles
+            )
+        )
+        variants = result.competition_assessment["scope_assessment_variants"]
+        self.assertEqual(len(variants), 1)
+        sensitivity = variants[0]["semantic_profile"]
+        self.assertEqual(
+            sensitivity["claimed_lane_ids"],
+            [lane_a],
+        )
+        self.assertEqual(
+            set(sensitivity["comparison_lane_ids"]),
+            {lane_a, lane_b},
+        )
+
+    def test_invalid_scope_semantics_keeps_candidates_pending_without_repair(self) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:2500:EQ_A:EQ_A_CH01:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_PENDING_EXP_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_PENDING_EXP_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_PENDING_PROC_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        process_b = lane_process_evidence(
+            evidence_id="EV_PENDING_PROC_B",
+            lane_id=lane_b,
+            recipe="RCP_B",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        support_a = ["EV_PENDING_EXP_A", "EV_PENDING_PROC_A", "EV_PRODUCT"]
+        support_b = ["EV_PENDING_EXP_B", "EV_PENDING_PROC_B", "EV_PRODUCT"]
+        client = CandidateClient(
+            [
+                {
+                    "candidates": [
+                        {
+                            **proposal(supporting=support_a),
+                            "root_cause": "RCP_A plasma response instability",
+                        },
+                        {
+                            **proposal(supporting=support_b),
+                            "root_cause": "RCP_B endpoint response instability",
+                        },
+                    ],
+                    "candidate_semantic_profiles": [
+                        semantic_profile(
+                            0,
+                            scope_relation="focal_only",
+                            claimed_lane_ids=["LANE_UNKNOWN"],
+                            comparison_lane_ids=["LANE_UNKNOWN"],
+                            prediction="The unknown Lane produces the outcome.",
+                        )
+                    ],
+                    "analysis_summary": "Two valid Candidates lack scope metadata.",
+                }
+            ]
+        )
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_SCOPE_PROFILE_PENDING",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a, process_b],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+        )
+
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(len(result.candidates), 1)
+        self.assertFalse(result.candidate_output_invalid)
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        self.assertIsNone(result.competition_failure_reason)
+        self.assertTrue(result.competition_repair_exhausted)
+        self.assertTrue(result.semantic_validation_errors)
+        self.assertTrue(
+            any(
+                "unknown Lane IDs" in error
+                for error in result.semantic_validation_errors
+            )
+        )
+        variants = result.competition_assessment["scope_assessment_variants"]
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(variants[0]["candidate_index"], 1)
+        self.assertEqual(variants[0]["semantic_profile_status"], "missing")
+        self.assertEqual(variants[0]["mechanism_relation"], "unknown")
+        self.assertEqual(
+            variants[0]["supporting_evidence_ids"],
+            support_b,
+        )
+
+    def test_invalid_shared_scope_profile_does_not_fail_valid_candidate(self) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:2500:EQ_A:EQ_A_CH01:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_SHARED_INVALID_EXP_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_SHARED_INVALID_EXP_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_SHARED_INVALID_PROC_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        process_b = lane_process_evidence(
+            evidence_id="EV_SHARED_INVALID_PROC_B",
+            lane_id=lane_b,
+            recipe="RCP_B",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        response = {
+            "candidates": [
+                {
+                    **proposal(
+                        supporting=[
+                            "EV_SHARED_INVALID_EXP_A",
+                            "EV_SHARED_INVALID_PROC_A",
+                            "EV_PRODUCT",
+                        ]
+                    ),
+                    "root_cause": "RCP_A plasma response instability",
+                }
+            ],
+            "candidate_semantic_profiles": [
+                semantic_profile(
+                    0,
+                    scope_relation="shared_effect",
+                    # A shared-effect hypothesis must claim both Lanes.  This
+                    # malformed adjacent profile must not invalidate Candidate A.
+                    claimed_lane_ids=[lane_a],
+                    comparison_lane_ids=[lane_a, lane_b],
+                    prediction="Both recipes should exhibit the same excursion.",
+                )
+            ],
+            "analysis_summary": "One valid Candidate with invalid scope metadata.",
+        }
+        client = CandidateClient([response, response])
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_INVALID_SHARED_SCOPE",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a, process_b],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+        )
+
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(len(result.candidates), 1)
+        self.assertFalse(result.candidate_output_invalid)
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        self.assertIsNone(result.competition_failure_reason)
+        self.assertEqual(
+            result.competition_gap_reason,
+            CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value,
+        )
+        self.assertTrue(result.competition_repair_exhausted)
+        self.assertTrue(
+            any("shared_effect" in error for error in result.semantic_validation_errors)
+        )
+
+    def test_scope_expansion_cannot_silently_replace_prior_candidate(self) -> None:
+        lane_a = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
+        lane_b = "lane:2500:EQ_A:EQ_A_CH01:RCP_B"
+        exposure_a = typed_evidence(
+            evidence_id="EV_SCOPE_LINEAGE_EXP_A",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_a, "recipe": "RCP_A"},
+        )
+        exposure_b = typed_evidence(
+            evidence_id="EV_SCOPE_LINEAGE_EXP_B",
+            evidence_type=EvidenceType.PROCESS_EXPOSURE.value,
+            agent=AgentKind.MES.value,
+            entity_type=EntityType.EQUIPMENT.value,
+            entity_id="EQ_A",
+            metadata={"lane_id": lane_b, "recipe": "RCP_B"},
+        )
+        process_a = lane_process_evidence(
+            evidence_id="EV_SCOPE_LINEAGE_PROC_A",
+            lane_id=lane_a,
+            recipe="RCP_A",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        process_b = lane_process_evidence(
+            evidence_id="EV_SCOPE_LINEAGE_PROC_B",
+            lane_id=lane_b,
+            recipe="RCP_B",
+            parameter="oxygen_flow",
+            equipment="EQ_A",
+            chamber="EQ_A_CH01",
+            operation="2500",
+        )
+        prior = {
+            "candidate_id": "PRIOR:llm:1",
+            "root_cause": "RCP_A-specific oxygen-flow instability",
+            "causal_explanation": (
+                "Recipe RCP_A oxygen-flow instability changes plasma kinetics "
+                "and produces the observed edge void."
+            ),
+            "supporting_evidence_ids": [
+                "EV_SCOPE_LINEAGE_EXP_A",
+                "EV_SCOPE_LINEAGE_PROC_A",
+                "EV_PRODUCT",
+            ],
+            "contradicting_evidence_ids": [],
+        }
+        broadened = {
+            "root_cause": "EQ_A_CH01 chamber-wide oxygen-flow instability",
+            "causal_explanation": (
+                "The anomaly now spans RCP_A and RCP_B and is rewritten as one "
+                "chamber-wide plasma-control cause."
+            ),
+            "supporting_evidence_ids": [
+                "EV_SCOPE_LINEAGE_EXP_A",
+                "EV_SCOPE_LINEAGE_PROC_A",
+                "EV_SCOPE_LINEAGE_EXP_B",
+                "EV_SCOPE_LINEAGE_PROC_B",
+                "EV_PRODUCT",
+            ],
+            "contradicting_evidence_ids": [],
+        }
+        response = {
+            "candidates": [broadened],
+            "candidate_semantic_profiles": [
+                semantic_profile(
+                    0,
+                    scope_relation="shared_effect",
+                    claimed_lane_ids=[lane_a, lane_b],
+                    comparison_lane_ids=[lane_a, lane_b],
+                    prediction="Both recipe Lanes produce the compatible outcome.",
+                )
+            ],
+            "analysis_summary": "The prior candidate was broadened in place.",
+        }
+        client = CandidateClient([response, response])
+        gap_id = "candidate_0.hypothesis_discrimination.parameter_anomaly"
+
+        result = QwenHypothesisCandidateGenerator(client).generate(
+            request_id="REQ_SCOPE_COLLAPSE",
+            findings=causal_findings(),
+            context_evidence=[exposure_a, exposure_b, process_a, process_b],
+            prior_candidates=[prior],
+            prior_semantic_profiles=[
+                {
+                    "candidate_id": "PRIOR:llm:1",
+                    "scope_relation": "focal_only",
+                    "claimed_lane_ids": [lane_a],
+                    "comparison_lane_ids": [lane_a, lane_b],
+                    "mechanism_claim": "RCP_A amplifies chamber drift.",
+                    "distinguishing_predictions": [
+                        {
+                            "discriminator_kind": "product_outcome",
+                            "lane_ids": [lane_a, lane_b],
+                            "prediction": "Only RCP_A produces the product outcome.",
+                            "schema_version": "1.0",
+                        }
+                    ],
+                    "source": "qwen",
+                    "schema_version": "1.0",
+                }
+            ],
+            prior_challenges=[
+                {
+                    "candidate_id": "PRIOR:llm:1",
+                    "strongest_alternative_lane_id": lane_b,
+                    "distinguishing_gap_ids": [gap_id],
+                    "status": "alternative_identified",
+                }
+            ],
+            prior_causal_gaps=[
+                {
+                    "gap_id": gap_id,
+                    "discriminator_kind": "parameter_anomaly",
+                    "target_scope": {"lane_id": lane_b},
+                }
+            ],
+            causal_lanes=[
+                {
+                    "lane_id": lane_a,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_A",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.9,
+                    "investigation_status": "evidence_collected",
+                },
+                {
+                    "lane_id": lane_b,
+                    "operation": "2500",
+                    "equipment": "EQ_A",
+                    "chamber": "EQ_A_CH01",
+                    "recipe": "RCP_B",
+                    "parameter_scope": ["oxygen_flow"],
+                    "priority_score": 0.8,
+                    "investigation_status": "evidence_collected",
+                },
+            ],
+            new_evidence_ids=["EV_SCOPE_LINEAGE_PROC_B"],
+        )
+
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(
+            result.competition_status,
+            CandidateCompetitionStatus.PENDING.value,
+        )
+        self.assertIsNone(result.competition_failure_reason)
+        self.assertEqual(
+            result.competition_gap_reason,
+            CompetitionGapReason.MECHANISM_ALTERNATIVE_NOT_GENERATED.value,
+        )
+        self.assertTrue(
+            any(
+                item["lineage_status"] == "scope_expanded"
+                for item in result.candidate_lineage
+            )
+        )
 
     def test_targeted_alternative_evidence_repairs_candidate_competition(self) -> None:
         findings = causal_findings()
@@ -1914,6 +2991,30 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
             {warning.warning_id for warning in result.warnings},
         )
         self.assertEqual(result.details["hypothesis_engine_result"]["candidates"], [])
+
+    def test_rca_finding_persists_lane_first_competition_synthesis(self) -> None:
+        client = CandidateClient(
+            [
+                {
+                    "candidates": [proposal()],
+                    "analysis_summary": "One evidence-bounded candidate remains.",
+                }
+            ]
+        )
+
+        result = RCAReasoningAgent(
+            llm_client=client,
+            agent_mode="llm",
+        ).analyze(
+            request_id="REQ_RCA_LANE_FIRST_PERSISTENCE",
+            findings=causal_findings(),
+        )
+
+        synthesis = result.details["evidence_synthesis"]
+        self.assertEqual(synthesis["schema"], "lane_first_v1")
+        self.assertIn("candidate_competition", synthesis)
+        self.assertLessEqual(len(synthesis["active_causal_lanes"]), 3)
+        self.assertIn("prompt_evidence_ids", synthesis)
 
     def test_valid_empty_qwen_candidates_do_not_enable_deterministic_root_cause(
         self,

@@ -7,11 +7,15 @@ generated gaps, but it cannot introduce a new candidate or a new Action.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from yield_rca_core.causal_evidence_matrix import CausalEvidenceMatrix
+from yield_rca_core.causal_evidence_matrix import (
+    CausalEvidenceMatrix,
+    compact_causal_evidence_matrix_for_prompt,
+)
 from yield_rca_core.causal_investigation_models import AlternativeSearchStatus
 from yield_rca_core.llm_gateway import LLMClient, LLMOutputValidationError, LLMRequest
 from yield_rca_core.models import AgentKind, ModelValidationError
@@ -22,6 +26,7 @@ _STATUS_SCORE = {
     "unavailable": 0,
     "conflicted": -2,
 }
+_MAX_COMPARISON_PAYLOAD_CHARS = 48_000
 
 
 def _matrix_score(matrix: CausalEvidenceMatrix) -> int:
@@ -141,26 +146,42 @@ class QwenHypothesisCandidateComparator:
             matrices,
             evidence_gaps=evidence_gaps,
         )
+        request_payload = {
+            "request_id": request_id,
+            "candidates": [
+                {
+                    "root_cause": str(item.get("root_cause", "")),
+                    "causal_explanation": str(
+                        item.get("causal_explanation", "")
+                    ),
+                    "causal_evidence_matrix": (
+                        compact_causal_evidence_matrix_for_prompt(matrix)
+                    ),
+                }
+                for item, matrix in zip(candidates, matrices, strict=True)
+            ],
+            "evidence_gaps": [dict(item) for item in evidence_gaps],
+            "python_comparison": python_comparison,
+        }
+        prompt_payload_char_count = len(
+            json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        if prompt_payload_char_count > _MAX_COMPARISON_PAYLOAD_CHARS:
+            raise LLMOutputValidationError(
+                "candidate comparison prompt exceeds the governed payload limit"
+            )
         response = self.llm_client.complete_json(
             LLMRequest(
                 agent=AgentKind.RCA_REASONING.value,
                 prompt_name="causal_candidate_comparator",
                 prompt_version=self.prompt_version,
-                payload={
-                    "request_id": request_id,
-                    "candidates": [
-                        {
-                            "root_cause": str(item.get("root_cause", "")),
-                            "causal_explanation": str(
-                                item.get("causal_explanation", "")
-                            ),
-                            "causal_evidence_matrix": matrix.to_dict(),
-                        }
-                        for item, matrix in zip(candidates, matrices, strict=True)
-                    ],
-                    "evidence_gaps": [dict(item) for item in evidence_gaps],
-                    "python_comparison": python_comparison,
-                },
+                payload=request_payload,
                 temperature=0.0,
             )
         )
@@ -198,6 +219,28 @@ class QwenHypothesisCandidateComparator:
             "selected_gap_id": None,
             "gap_selection_owner": "adversarial_challenge",
             "source": "qwen",
+            "prompt_audit": {
+                "prompt_payload_char_count": prompt_payload_char_count,
+                "prompt_evidence_count": len(
+                    {
+                        evidence_id
+                        for matrix in matrices
+                        for result in matrix.claims.values()
+                        for evidence_id in result.evidence_ids
+                    }
+                ),
+                "omitted_entity_count": sum(
+                    int(
+                        compact_causal_evidence_matrix_for_prompt(matrix)[
+                            "projection_audit"
+                        ]["omitted_claim_fact_groups"]
+                    )
+                    for matrix in matrices
+                ),
+                "omitted_metadata_count": 0,
+                "prompt_budget_applied": True,
+                "prompt_payload_char_limit": _MAX_COMPARISON_PAYLOAD_CHARS,
+            },
         }
 
 
