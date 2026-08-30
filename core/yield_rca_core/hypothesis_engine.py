@@ -939,6 +939,7 @@ class HypothesisEngine:
                     ),
                     evidence_by_id.values(),
                     semantic_profile=semantic_profile,
+                    causal_lanes=causal_lanes,
                 )
             except (TypeError, ValueError):
                 continue

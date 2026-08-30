@@ -14,6 +14,7 @@ from yield_rca_api.app import create_app  # noqa: E402
 from yield_rca_core.investigation_models import (  # noqa: E402
     ConclusionLevel,
     DecisionType,
+    InvestigationAction,
     InvestigationIntent,
     QuestionUpdateReasonCode,
     StopReason,
@@ -25,7 +26,13 @@ from yield_rca_core.llm_gateway import (  # noqa: E402
     LLMResponse,
     LLMSettings,
 )
-from yield_rca_core.models import RCAJob, RCAState, TaskStatus  # noqa: E402
+from yield_rca_core.models import (  # noqa: E402
+    AgentFinding,
+    AgentKind,
+    RCAJob,
+    RCAState,
+    TaskStatus,
+)
 from yield_rca_core.specialist_v2 import SpecialistV2Error  # noqa: E402
 from yield_rca_core.supervisor import SupervisorExecutionError  # noqa: E402
 from yield_rca_core.workflow import build_csv_workflow  # noqa: E402
@@ -158,6 +165,20 @@ class PersistentNextActionCallFailureClient(RecordingFakeClient):
         return super().complete_json(request)
 
 
+class CandidateGenerationTransportFailureClient(RecordingFakeClient):
+    """Fail Candidate generation while keeping Planner/Specialists deterministic."""
+
+    def complete_json(self, request: LLMRequest) -> LLMResponse:
+        if request.prompt_name == "hypothesis_candidate_generator":
+            self.requests.append(request)
+            raise LLMCallError(
+                "candidate provider transport failure",
+                failure_category="transport_error",
+                call_attempt_count=2,
+            )
+        return super().complete_json(request)
+
+
 class InvalidIntentClient(RecordingFakeClient):
     def complete_json(self, request: LLMRequest) -> LLMResponse:
         response = super().complete_json(request)
@@ -270,6 +291,21 @@ class FailingSpecialistExecutor:
         )
 
 
+class ContextRecordingSpecialistExecutor:
+    def __init__(self, finding: AgentFinding) -> None:
+        self.finding = finding
+        self.context: dict[str, object] | None = None
+
+    def execute(
+        self,
+        *args: object,
+        context: dict[str, object],
+        **kwargs: object,
+    ) -> AgentFinding:
+        self.context = dict(context)
+        return self.finding
+
+
 def fake_llm_workflow(client: FakeLLMClient):
     return build_csv_workflow(
         SEED_DIR,
@@ -350,6 +386,62 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
         self.assertNotIn(
             "workflow-secret",
             metadata["orchestration_fallback_provider_message"],
+        )
+
+    def test_candidate_transport_failure_cannot_crash_on_repeated_action_scope(
+        self,
+    ) -> None:
+        client = CandidateGenerationTransportFailureClient()
+        workflow = build_csv_workflow(
+            SEED_DIR,
+            llm_settings=LLMSettings(agent_mode="llm", api_key="test-only-key"),
+            llm_client=client,
+            orchestration_mode="llm_react",
+        )
+
+        state = workflow.run(
+            ROOT_CAUSE_QUERY,
+            job_id="JOB_CANDIDATE_PROVIDER_GOVERNED_STOP",
+            lot_id="LOT_A_001",
+        )
+
+        self.assertEqual(state.job.status, TaskStatus.COMPLETED.value)
+        self.assertEqual(
+            state.execution_metadata["orchestration_mode"],
+            "llm_react",
+        )
+        self.assertNotIn(
+            "orchestration_fallback_reason",
+            state.execution_metadata,
+        )
+        self.assertEqual(
+            state.execution_metadata["planner_stop_proposed_by"],
+            "python_runtime",
+        )
+        self.assertEqual(
+            state.execution_metadata["terminal_question_updates_source"],
+            "python_evidence_gate",
+        )
+        self.assertNotEqual(state.stop_reason, StopReason.GOAL_SATISFIED.value)
+        self.assertEqual(state.conclusion_level, ConclusionLevel.INCONCLUSIVE.value)
+        self.assertEqual(
+            sum(
+                record.action.kind == "run_rca_reasoning"
+                for record in state.action_history
+            ),
+            1,
+        )
+        self.assertIsNotNone(state.competition_trace)
+        assert state.competition_trace is not None
+        self.assertNotIn(
+            state.competition_trace.competition_status,
+            {"active", "pending"},
+        )
+        self.assertTrue(
+            any(
+                request.prompt_name == "hypothesis_candidate_generator"
+                for request in client.requests
+            )
         )
 
     def test_llm_call_cap_ends_llm_react_without_controlled_fallback(self) -> None:
@@ -444,6 +536,56 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
             self.assertEqual(diagnostics[0]["stage"], "intent_planning")
             self.assertEqual(diagnostics[0]["outcome"], "success")
             self.assertIsNone(diagnostics[0]["failure_category"])
+
+    def test_lane_only_fdc_action_propagates_recipe_into_tool_parameters(self) -> None:
+        workflow = fake_llm_workflow(RecordingFakeClient())
+        state = workflow.run(
+            ROOT_CAUSE_QUERY,
+            job_id="JOB_LANE_RECIPE_PROPAGATION",
+            lot_id="LOT_A_001",
+        )
+        mes_finding = next(
+            finding
+            for finding in reversed(state.findings)
+            if finding.agent == AgentKind.MES.value
+        )
+        selected_lane = next(
+            item
+            for item in mes_finding.details["lane_candidates"]
+            if item.get("recipe")
+        )
+        fdc_finding = next(
+            finding
+            for finding in reversed(state.findings)
+            if finding.agent == AgentKind.FDC.value
+        )
+        recorder = ContextRecordingSpecialistExecutor(fdc_finding)
+        supervisor = replace(
+            workflow.supervisor,
+            specialist_v2_executor=recorder,  # type: ignore[arg-type]
+        )
+        action = InvestigationAction(
+            action_id="ACTION_LANE_RECIPE_PROPAGATION",
+            kind="inspect_fdc_spc",
+            agent=AgentKind.FDC.value,
+            reason="Inspect the selected causal Lane.",
+            scope={"lane_id": selected_lane["lane_id"]},
+        )
+
+        supervisor._dispatch_llm_react(  # noqa: SLF001
+            action,
+            state,
+            remaining_tool_calls=2,
+        )
+
+        assert recorder.context is not None
+        assert recorder.context["recipe_id"] == selected_lane["recipe"]
+        actual_executor = workflow.supervisor.specialist_v2_executor
+        assert actual_executor is not None
+        tool_parameters = actual_executor._fdc_parameters(  # noqa: SLF001
+            dict(recorder.context)
+        )
+        assert tool_parameters["recipe_id"] == selected_lane["recipe"]
 
     def test_same_root_cause_intent_replans_from_an_exposure_first_observation(
         self,

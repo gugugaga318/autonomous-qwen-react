@@ -641,6 +641,23 @@ class RCAReasoningAgent:
                     "candidate_lineage": [
                         dict(item) for item in generated.candidate_lineage
                     ],
+                    "candidate_evidence_closure": [
+                        dict(item)
+                        for item in generated.candidate_evidence_closure
+                    ],
+                    "candidate_evidence_closure_history": [
+                        dict(item)
+                        for item in generated.candidate_evidence_closure_history
+                    ],
+                    "evidence_closure_repair_attempted": (
+                        generated.evidence_closure_repair_attempted
+                    ),
+                    "evidence_closure_repair_exhausted": (
+                        generated.evidence_closure_repair_exhausted
+                    ),
+                    "evidence_closure_repair_skipped_due_to_budget": (
+                        generated.evidence_closure_repair_skipped_due_to_budget
+                    ),
                 }
                 competition_requirement = generated.competition_requirement
                 competition_status = generated.competition_status
@@ -725,6 +742,7 @@ class RCAReasoningAgent:
                                         {} if semantic_profiles_expected else None,
                                     )
                                 ),
+                                causal_lanes=lane_contexts,
                             )
                         )
                     challenge_candidates = [
@@ -1188,6 +1206,11 @@ class RCAReasoningAgent:
         )
         candidate_impact_scopes: list[dict[str, Any]] = []
         selected_impact_scope: dict[str, Any] | None = None
+        semantic_profile_by_candidate_id = {
+            str(item.get("candidate_id", "")): item
+            for item in candidate_semantic_profiles
+            if str(item.get("candidate_id", "")).strip()
+        }
         for candidate_index, candidate in enumerate(engine_result["candidates"]):
             candidate_is_authoritative = (
                 supported and candidate["root_cause"] == root_cause
@@ -1201,6 +1224,9 @@ class RCAReasoningAgent:
                     conclusion_status
                     if candidate_is_authoritative
                     else "inconclusive"
+                ),
+                semantic_profile=semantic_profile_by_candidate_id.get(
+                    str(candidate.get("hypothesis_id", ""))
                 ),
             )
             candidate_scope = {

@@ -328,17 +328,21 @@ class FDCAgent:
         equipment_id: str,
         chamber_id: str,
         operation_no: str = "6400",
+        recipe_id: str | None = None,
     ) -> AgentFinding:
+        scoped_parameters: dict[str, Any] = {
+            "lot_ids": lot_ids,
+            "operation_no": operation_no,
+            "equipment_id": equipment_id,
+            "chamber_id": chamber_id,
+        }
+        if recipe_id:
+            scoped_parameters["recipe_id"] = recipe_id
         parameter_output = self.analyze_parameter_shift_tool.run(
             _tool_input(
                 tool_name="analyze_parameter_shift",
                 request_id=f"{request_id}:parameter-shift",
-                parameters={
-                    "lot_ids": lot_ids,
-                    "operation_no": operation_no,
-                    "equipment_id": equipment_id,
-                    "chamber_id": chamber_id,
-                },
+                parameters=dict(scoped_parameters),
                 requested_by=AgentKind.FDC.value,
             )
         )
@@ -354,12 +358,7 @@ class FDCAgent:
                 requested_by=AgentKind.FDC.value,
             )
         )
-        spc_parameters = {
-            "lot_ids": lot_ids,
-            "operation_no": operation_no,
-            "equipment_id": equipment_id,
-            "chamber_id": chamber_id,
-        }
+        spc_parameters = dict(scoped_parameters)
         if self.analyze_spc_evidence_tool is not None:
             advanced_output = self.analyze_spc_evidence_tool.run(
                 _tool_input(
@@ -436,6 +435,7 @@ class FDCAgent:
                 "operation_no": operation_no,
                 "equipment_id": equipment_id,
                 "chamber_id": chamber_id,
+                "recipe_id": recipe_id,
                 "parameter_summary": parameter_summary,
                 "event_count": event_count,
                 "severity_counts": dict(ooc_output.data["severity_counts"]),

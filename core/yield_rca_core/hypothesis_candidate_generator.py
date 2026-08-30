@@ -8,9 +8,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from yield_rca_core.causal_evidence_matrix import build_causal_evidence_matrix
+from yield_rca_core.causal_evidence_matrix import (
+    build_causal_evidence_matrix,
+    is_relevant_mechanism_intermediate,
+)
 from yield_rca_core.causal_hypothesis import CausalHypothesis
 from yield_rca_core.causal_investigation_models import (
+    CandidateClaimedScopeKind,
     CandidateCompetitionStatus,
     CandidateCompetitionType,
     CandidateDistinguishingPrediction,
@@ -75,6 +79,19 @@ _PRODUCT_TYPES = {
 }
 _DUPLICATE_EVIDENCE_OVERLAP_THRESHOLD = 0.75
 _DUPLICATE_MECHANISM_SIMILARITY_THRESHOLD = 0.65
+_MAX_CLOSURE_REPAIR_EVIDENCE = 12
+_MAX_CLOSURE_EVIDENCE_PER_ROLE = 2
+_CLOSURE_EVIDENCE_TYPES = {
+    "exposure": _EXPOSURE_TYPES - {EvidenceType.EXCURSION_WINDOW.value},
+    "parameter": _PROCESS_TYPES,
+    "temporal": {EvidenceType.EXCURSION_WINDOW.value},
+    "outcome": _PRODUCT_TYPES,
+    "mechanism_intermediate": _PRODUCT_TYPES,
+}
+
+
+def _compact_scope_identity(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
 
 
 def _evidence_bucket(evidence: Evidence) -> str:
@@ -252,6 +269,11 @@ class HypothesisCandidateGeneration:
     semantic_validation_errors: tuple[str, ...] = ()
     candidate_lineage: tuple[dict[str, Any], ...] = ()
     evidence_synthesis: dict[str, Any] | None = None
+    candidate_evidence_closure: tuple[dict[str, Any], ...] = ()
+    candidate_evidence_closure_history: tuple[dict[str, Any], ...] = ()
+    evidence_closure_repair_attempted: bool = False
+    evidence_closure_repair_exhausted: bool = False
+    evidence_closure_repair_skipped_due_to_budget: bool = False
 
 
 @dataclass(frozen=True)
@@ -429,8 +451,35 @@ def _candidate_repair_feedback(
     *,
     evidence_by_id: dict[str, Evidence],
     candidate_competition: Mapping[str, Any] | None = None,
+    candidate_evidence_closure: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     eligible_by_lane = _eligible_evidence_ids_by_lane(evidence_by_id)
+    compact_closure = [
+        {
+            "candidate_index": item.get("candidate_index"),
+            "candidate_id": item.get("candidate_id"),
+            "status": item.get("status"),
+            "candidate_snapshot": dict(item.get("candidate_snapshot", {})),
+            "must_preserve_evidence_ids": list(
+                item.get("must_preserve_evidence_ids", [])
+            ),
+            "citation_regression_evidence_ids": list(
+                item.get("citation_regression_evidence_ids", [])
+            ),
+            "closure_gaps": [
+                {
+                    "lane_id": gap.get("lane_id"),
+                    "evidence_role": gap.get("evidence_role"),
+                    "eligible_evidence_ids": list(
+                        gap.get("eligible_evidence_ids", [])
+                    ),
+                }
+                for gap in item.get("closure_gaps", [])
+                if isinstance(gap, Mapping)
+            ],
+        }
+        for item in candidate_evidence_closure
+    ]
     return {
         "message": validation_error,
         "missing_causal_lanes": [],
@@ -449,6 +498,20 @@ def _candidate_repair_feedback(
             "targeted Evidence later. Return candidates=[] only when no causal "
             "candidate is justified at all."
         ),
+        "candidate_evidence_closure": compact_closure,
+        "evidence_closure_instruction": (
+            "For each reported candidate/Lane/role closure gap, decide whether "
+            "one of the listed typed Evidence IDs genuinely supports the "
+            "Candidate's claimed scope. Cite it yourself when relevant, narrow "
+            "the Qwen-owned claimed_scope when that is the accurate claim, or "
+            "return a bounded incomplete/empty candidate when it is not relevant. "
+            "Python has not attached or selected Evidence for you. A Closure repair "
+            "is cumulative: retain every ID in must_preserve_evidence_ids while "
+            "adding only genuinely relevant missing citations. Removing one of "
+            "those still-valid IDs is a citation_regression, not a successful "
+            "repair. Comparison-scope Lanes that are not claimed are never "
+            "citation requirements."
+        ),
         "valid_empty_output": {
             "candidates": [],
             "analysis_summary": (
@@ -456,11 +519,688 @@ def _candidate_repair_feedback(
             ),
         },
         "candidate_competition": (
-            dict(candidate_competition)
+            _bounded_candidate_competition_context(
+                candidate_competition,
+                allowed_evidence_ids=set(evidence_by_id),
+            )
             if candidate_competition is not None
             else None
         ),
     }
+
+
+def _bounded_candidate_competition_context(
+    context: Mapping[str, Any],
+    *,
+    allowed_evidence_ids: set[str],
+) -> dict[str, Any]:
+    """Project competition context onto the exact typed prompt register."""
+
+    def bounded_ids(values: object) -> list[str]:
+        if not isinstance(values, Sequence) or isinstance(values, str | bytes):
+            return []
+        return list(
+            dict.fromkeys(
+                str(item)
+                for item in values
+                if str(item) in allowed_evidence_ids
+            )
+        )
+
+    challenges: list[dict[str, Any]] = []
+    for raw in context.get("prior_candidate_challenges", []):
+        if not isinstance(raw, Mapping):
+            continue
+        challenge = dict(raw)
+        for field_name in (
+            "supporting_evidence_ids",
+            "contradicting_evidence_ids",
+            "unexplained_precursor_evidence_ids",
+        ):
+            challenge[field_name] = bounded_ids(raw.get(field_name, []))
+        challenges.append(challenge)
+
+    targeted_results: list[dict[str, Any]] = []
+    for raw in context.get("targeted_investigation_results", []):
+        if not isinstance(raw, Mapping):
+            continue
+        result = dict(raw)
+        for field_name in (
+            "new_evidence_ids",
+            "new_supporting_evidence_ids",
+            "new_data_missing_evidence_ids",
+        ):
+            result[field_name] = bounded_ids(raw.get(field_name, []))
+        raw_evidence = raw.get("new_evidence", [])
+        result["new_evidence"] = [
+            dict(item)
+            for item in raw_evidence
+            if isinstance(item, Mapping)
+            and str(item.get("evidence_id", "")) in allowed_evidence_ids
+        ] if isinstance(raw_evidence, Sequence) else []
+        result["answered"] = bool(result["new_evidence_ids"])
+        result["support_observed"] = bool(
+            result["new_supporting_evidence_ids"]
+        )
+        targeted_results.append(result)
+
+    targeted_supporting_ids = bounded_ids(
+        context.get("targeted_supporting_evidence_ids", [])
+    )
+    return {
+        "new_evidence_ids_since_prior": bounded_ids(
+            context.get("new_evidence_ids_since_prior", [])
+        ),
+        "prior_candidate_challenges": challenges,
+        "targeted_investigation_results": targeted_results,
+        "relevant_causal_lanes": [
+            dict(item)
+            for item in context.get("relevant_causal_lanes", [])
+            if isinstance(item, Mapping)
+        ],
+        "targeted_supporting_evidence_ids": targeted_supporting_ids,
+        "requires_distinct_candidate_review": bool(targeted_supporting_ids),
+    }
+
+
+def _normalized_lane_scope(lane: Mapping[str, Any]) -> dict[str, Any]:
+    """Return immutable factual scope used only for citation-closure matching."""
+
+    return {
+        "lane_id": str(lane.get("lane_id", "")).strip(),
+        "operation": str(lane.get("operation", "")).strip().casefold(),
+        "equipment": str(lane.get("equipment", "")).strip().casefold(),
+        "chamber": str(lane.get("chamber", "")).strip().casefold(),
+        "recipe": str(lane.get("recipe", "")).strip().casefold(),
+        "exposed_lot_ids": {
+            str(item).strip().casefold()
+            for item in lane.get("exposed_lot_ids", [])
+            if str(item).strip()
+        },
+    }
+
+
+def _explicit_evidence_lane_ids(evidence: Evidence) -> set[str]:
+    lane_ids = {
+        str(value).strip()
+        for value in _metadata_scope_values(evidence, "lane_id")
+        if str(value).strip()
+    }
+    raw_lane = evidence.metadata.get("lane")
+    if isinstance(raw_lane, Mapping):
+        lane_id = str(raw_lane.get("lane_id", "")).strip()
+        if lane_id:
+            lane_ids.add(lane_id.casefold())
+    return {item.casefold() for item in lane_ids}
+
+
+def _evidence_matches_claimed_lane(
+    evidence: Evidence,
+    lane: Mapping[str, Any],
+) -> bool:
+    """Match typed Evidence to one claimed Lane without causal inference."""
+
+    normalized_lane = _normalized_lane_scope(lane)
+    lane_id = str(normalized_lane["lane_id"]).casefold()
+    explicit_lane_ids = _explicit_evidence_lane_ids(evidence)
+    if explicit_lane_ids:
+        return lane_id in explicit_lane_ids
+
+    identity_pairs = (
+        (
+            "operation",
+            _entity_scope_values(evidence, EntityType.OPERATION.value)
+            | _metadata_scope_values(evidence, "operation", "operation_no"),
+        ),
+        (
+            "equipment",
+            _entity_scope_values(evidence, EntityType.EQUIPMENT.value)
+            | _metadata_scope_values(evidence, "equipment", "equipment_id"),
+        ),
+        (
+            "chamber",
+            _entity_scope_values(evidence, EntityType.CHAMBER.value)
+            | _metadata_scope_values(evidence, "chamber", "chamber_id"),
+        ),
+        (
+            "recipe",
+            _entity_scope_values(evidence, EntityType.RECIPE.value)
+            | _metadata_scope_values(evidence, "recipe", "recipe_id"),
+        ),
+    )
+    observed_identity_count = 0
+    matched_identity_count = 0
+    for field_name, observed_values in identity_pairs:
+        expected = str(normalized_lane[field_name])
+        if not observed_values or not expected:
+            continue
+        observed_identity_count += 1
+        if expected not in observed_values:
+            return False
+        matched_identity_count += 1
+
+    evidence_lots = _entity_scope_values(evidence, EntityType.LOT.value)
+    lane_lots = set(normalized_lane["exposed_lot_ids"])
+    lot_overlap = bool(evidence_lots & lane_lots)
+    if evidence.evidence_type in _PRODUCT_TYPES:
+        return lot_overlap or matched_identity_count >= 2
+    return matched_identity_count >= 2 or (
+        observed_identity_count == 1 and lot_overlap
+    )
+
+
+def _lane_matches_claimed_scope(
+    lane: Mapping[str, Any],
+    profile: CandidateSemanticProfile,
+) -> bool:
+    lane_id = str(lane.get("lane_id", "")).strip()
+    if profile.claimed_scope_kind == CandidateClaimedScopeKind.LANE.value:
+        return lane_id in set(profile.claimed_lane_ids)
+    required = {
+        "operation": profile.claimed_operation,
+        "equipment": profile.claimed_equipment,
+        "chamber": profile.claimed_chamber,
+        "recipe": profile.claimed_recipe,
+    }
+    return all(
+        expected is None
+        or _compact_scope_identity(lane.get(field_name, ""))
+        == _compact_scope_identity(expected)
+        for field_name, expected in required.items()
+    )
+
+
+def _evidence_matches_claimed_scope(
+    evidence: Evidence,
+    profile: CandidateSemanticProfile,
+    matching_lanes: Sequence[Mapping[str, Any]],
+) -> bool:
+    if any(
+        _evidence_matches_claimed_lane(evidence, lane)
+        for lane in matching_lanes
+    ):
+        return True
+    if profile.claimed_scope_kind == CandidateClaimedScopeKind.LANE.value:
+        return False
+    identity_pairs = (
+        (
+            profile.claimed_operation,
+            _entity_scope_values(evidence, EntityType.OPERATION.value)
+            | _metadata_scope_values(evidence, "operation", "operation_no"),
+        ),
+        (
+            profile.claimed_equipment,
+            _entity_scope_values(evidence, EntityType.EQUIPMENT.value)
+            | _metadata_scope_values(evidence, "equipment", "equipment_id"),
+        ),
+        (
+            profile.claimed_chamber,
+            _entity_scope_values(evidence, EntityType.CHAMBER.value)
+            | _metadata_scope_values(evidence, "chamber", "chamber_id"),
+        ),
+        (
+            profile.claimed_recipe,
+            _entity_scope_values(evidence, EntityType.RECIPE.value)
+            | _metadata_scope_values(evidence, "recipe", "recipe_id"),
+        ),
+    )
+    observed = 0
+    for expected, actual_values in identity_pairs:
+        if expected is None or not actual_values:
+            continue
+        observed += 1
+        if _compact_scope_identity(expected) not in {
+            _compact_scope_identity(value) for value in actual_values
+        }:
+            return False
+    return observed > 0
+
+
+def _candidate_evidence_closure_assessment(
+    proposals: Sequence[HypothesisCandidateProposal],
+    semantic_profiles: Sequence[CandidateSemanticProfile],
+    *,
+    evidence_by_id: Mapping[str, Evidence],
+    causal_lanes: Sequence[Mapping[str, Any]],
+    raw_scope_by_candidate_index: Mapping[int, Mapping[str, Any]] | None = None,
+    must_preserve_evidence_ids_by_candidate_index: Mapping[
+        int, Sequence[str]
+    ] | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Detect omitted typed citations without changing a Qwen Candidate."""
+
+    lane_by_id = {
+        str(lane.get("lane_id", "")).strip(): lane
+        for lane in causal_lanes
+        if str(lane.get("lane_id", "")).strip()
+    }
+    assessments: list[dict[str, Any]] = []
+    raw_scopes = raw_scope_by_candidate_index or {}
+    preserve_by_index = must_preserve_evidence_ids_by_candidate_index or {}
+    for candidate_index, proposal in enumerate(proposals):
+        profile = (
+            semantic_profiles[candidate_index]
+            if candidate_index < len(semantic_profiles)
+            else None
+        )
+        raw_scope = raw_scopes.get(candidate_index, {})
+        raw_scope_kind = str(
+            raw_scope.get(
+                "claimed_scope_kind",
+                CandidateClaimedScopeKind.LANE.value,
+            )
+        )
+        raw_scope_relation = str(
+            raw_scope.get(
+                "scope_relation",
+                CandidateScopeRelation.UNRESOLVED.value,
+            )
+        )
+        raw_scope_identity = {
+            field_name: raw_scope.get(f"claimed_{field_name}")
+            for field_name in ("operation", "equipment", "chamber", "recipe")
+        }
+        candidate_id = profile.candidate_id if profile is not None else ""
+        claimed_lane_ids = (
+            tuple(profile.claimed_lane_ids)
+            if profile is not None
+            else tuple(str(item) for item in raw_scope.get("claimed_lane_ids", []))
+        )
+        comparison_lane_ids = (
+            tuple(profile.comparison_lane_ids)
+            if profile is not None
+            else tuple(
+                str(item) for item in raw_scope.get("comparison_lane_ids", [])
+            )
+        )
+        scope_reference_source = (
+            "validated_semantic_profile"
+            if profile is not None
+            else (
+                "raw_structurally_valid_scope_reference"
+                if claimed_lane_ids
+                else "unavailable"
+            )
+        )
+        supporting_ids = set(proposal.supporting_evidence_ids)
+        must_preserve_evidence_ids = tuple(
+            dict.fromkeys(
+                str(item)
+                for item in preserve_by_index.get(
+                    candidate_index,
+                    proposal.supporting_evidence_ids,
+                )
+                if str(item) in evidence_by_id
+                and evidence_by_id[str(item)].evidence_type
+                not in _NON_SUPPORTING_TYPES
+            )
+        )
+        gaps: list[dict[str, Any]] = []
+        if profile is not None:
+            matching_scope_lanes = [
+                lane
+                for lane in causal_lanes
+                if _lane_matches_claimed_scope(lane, profile)
+            ]
+        else:
+            if raw_scope_kind != CandidateClaimedScopeKind.LANE.value:
+                matching_scope_lanes = [
+                    lane
+                    for lane in causal_lanes
+                    if all(
+                        expected in (None, "")
+                        or _compact_scope_identity(lane.get(field_name, ""))
+                        == _compact_scope_identity(expected)
+                        for field_name, expected in raw_scope_identity.items()
+                    )
+                ]
+            else:
+                matching_scope_lanes = [
+                    lane_by_id[lane_id]
+                    for lane_id in claimed_lane_ids
+                    if lane_id in lane_by_id
+                ]
+        closure_targets: list[tuple[str | None, Sequence[Mapping[str, Any]]]]
+        if (
+            profile is not None
+            and profile.claimed_scope_kind != CandidateClaimedScopeKind.LANE.value
+        ) or (
+            profile is None
+            and raw_scope_kind != CandidateClaimedScopeKind.LANE.value
+        ):
+            # Exposure, temporal, and physical-intermediate closure can be
+            # grounded at the declared broad identity. A shared-effect claim's
+            # process/outcome coverage is checked per Lane below.
+            closure_targets = [(None, matching_scope_lanes)]
+        else:
+            closure_targets = [
+                (str(lane.get("lane_id", "")), [lane])
+                for lane in matching_scope_lanes
+            ]
+        candidate_hypothesis = CausalHypothesis(
+            root_cause=proposal.root_cause,
+            causal_explanation=proposal.causal_explanation,
+            supporting_evidence_ids=proposal.supporting_evidence_ids,
+            contradicting_evidence_ids=proposal.contradicting_evidence_ids,
+        )
+        shared_effect_scope = (
+            (
+                profile.scope_relation
+                if profile is not None
+                else raw_scope_relation
+            )
+            == CandidateScopeRelation.SHARED_EFFECT.value
+            and (
+                profile.claimed_scope_kind
+                if profile is not None
+                else raw_scope_kind
+            )
+            != CandidateClaimedScopeKind.LANE.value
+        )
+        for evidence_role, evidence_types in _CLOSURE_EVIDENCE_TYPES.items():
+            role_targets = (
+                [
+                    (str(lane.get("lane_id", "")), [lane])
+                    for lane in matching_scope_lanes
+                ]
+                if shared_effect_scope
+                and evidence_role in {"parameter", "outcome"}
+                else closure_targets
+            )
+            for lane_id, target_lanes in role_targets:
+                matching_ids = sorted(
+                    evidence_id
+                    for evidence_id, evidence in evidence_by_id.items()
+                    if evidence.evidence_type in evidence_types
+                    and evidence.evidence_type not in _NON_SUPPORTING_TYPES
+                    and (
+                        evidence_role != "mechanism_intermediate"
+                        or is_relevant_mechanism_intermediate(
+                            evidence,
+                            candidate_hypothesis,
+                        )
+                    )
+                    and (
+                        _evidence_matches_claimed_scope(
+                            evidence,
+                            profile,
+                            target_lanes,
+                        )
+                        if profile is not None
+                        else any(
+                            _evidence_matches_claimed_lane(evidence, lane)
+                            for lane in target_lanes
+                        )
+                    )
+                )
+                cited_ids = sorted(supporting_ids & set(matching_ids))
+                if matching_ids and not cited_ids:
+                    gaps.append(
+                        {
+                            "lane_id": lane_id,
+                            "claimed_scope_kind": (
+                                profile.claimed_scope_kind
+                                if profile is not None
+                                else raw_scope_kind
+                            ),
+                            "evidence_role": evidence_role,
+                            "available_evidence_count": len(matching_ids),
+                            "eligible_evidence_ids": matching_ids[
+                                :_MAX_CLOSURE_EVIDENCE_PER_ROLE
+                            ],
+                            "cited_matching_evidence_ids": [],
+                        }
+                    )
+        citation_regressions = sorted(
+            set(must_preserve_evidence_ids) - supporting_ids
+        )
+        if citation_regressions:
+            gaps.append(
+                {
+                    "lane_id": None,
+                    "claimed_scope_kind": (
+                        profile.claimed_scope_kind
+                        if profile is not None
+                        else raw_scope_kind
+                    ),
+                    "evidence_role": "citation_regression",
+                    "available_evidence_count": len(citation_regressions),
+                    "eligible_evidence_ids": citation_regressions,
+                    "cited_matching_evidence_ids": [],
+                }
+            )
+        assessments.append(
+            {
+                "candidate_index": candidate_index,
+                "candidate_id": candidate_id or None,
+                "status": (
+                    "not_evaluated"
+                    if profile is None and not claimed_lane_ids
+                    else ("incomplete" if gaps else "complete")
+                ),
+                "scope_reference_source": scope_reference_source,
+                "claimed_lane_ids": list(claimed_lane_ids),
+                "claimed_scope_kind": (
+                    profile.claimed_scope_kind
+                    if profile is not None
+                    else raw_scope_kind
+                ),
+                "claimed_scope_identity": (
+                    {
+                        "operation": profile.claimed_operation,
+                        "equipment": profile.claimed_equipment,
+                        "chamber": profile.claimed_chamber,
+                        "recipe": profile.claimed_recipe,
+                    }
+                    if profile is not None
+                    else raw_scope_identity
+                ),
+                "matching_claimed_scope_lane_ids": [
+                    str(lane.get("lane_id", "")) for lane in matching_scope_lanes
+                ],
+                "comparison_lane_ids": list(comparison_lane_ids),
+                "supporting_evidence_ids": list(proposal.supporting_evidence_ids),
+                "must_preserve_evidence_ids": list(
+                    must_preserve_evidence_ids
+                ),
+                "citation_regression_evidence_ids": citation_regressions,
+                "candidate_snapshot": {
+                    "root_cause": proposal.root_cause,
+                    "causal_explanation": proposal.causal_explanation,
+                    "supporting_evidence_ids": list(
+                        proposal.supporting_evidence_ids
+                    ),
+                    "contradicting_evidence_ids": list(
+                        proposal.contradicting_evidence_ids
+                    ),
+                    "semantic_profile": (
+                        profile.to_dict()
+                        if profile is not None
+                        else dict(raw_scope)
+                    ),
+                },
+                "closure_gaps": gaps,
+                "python_mutated_supporting_evidence_ids": False,
+            }
+        )
+    return tuple(assessments)
+
+
+def _raw_candidate_scope_references(
+    payload: object,
+    *,
+    surviving_candidate_indexes: Sequence[int],
+    known_lane_ids: set[str],
+) -> dict[int, dict[str, Any]]:
+    """Read a structurally valid Qwen scope for Closure diagnostics only.
+
+    The result is diagnostic input for Evidence Closure only. It is never a
+    CandidateSemanticProfile and cannot affect competition, ranking, or Gates.
+    """
+
+    if not isinstance(payload, list):
+        return {}
+    raw_to_surviving = {
+        raw_index: surviving_index
+        for surviving_index, raw_index in enumerate(surviving_candidate_indexes)
+    }
+    result: dict[int, dict[str, Any]] = {}
+    ambiguous_indexes: set[int] = set()
+    for raw in payload:
+        if not isinstance(raw, Mapping):
+            continue
+        raw_candidate_index = raw.get("candidate_index")
+        if (
+            not isinstance(raw_candidate_index, int)
+            or isinstance(raw_candidate_index, bool)
+            or raw_candidate_index not in raw_to_surviving
+        ):
+            continue
+        claimed_scope = raw.get("claimed_scope")
+        comparison_scope = raw.get("comparison_scope")
+        if not isinstance(claimed_scope, Mapping) or not isinstance(
+            comparison_scope, Mapping
+        ):
+            continue
+        raw_claimed = claimed_scope.get("lane_ids")
+        raw_comparison = comparison_scope.get("lane_ids")
+        if (
+            not isinstance(raw_claimed, Sequence)
+            or isinstance(raw_claimed, str | bytes)
+            or not isinstance(raw_comparison, Sequence)
+            or isinstance(raw_comparison, str | bytes)
+        ):
+            continue
+        claimed = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_claimed
+                if str(item).strip() in known_lane_ids
+            )
+        )
+        comparison = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw_comparison
+                if str(item).strip() in known_lane_ids
+            )
+        )
+        if not claimed:
+            continue
+        scope_relation = str(
+            claimed_scope.get(
+                "scope_relation",
+                CandidateScopeRelation.UNRESOLVED.value,
+            )
+        ).strip()
+        if scope_relation not in {
+            item.value for item in CandidateScopeRelation
+        }:
+            continue
+        scope_kind = str(
+            claimed_scope.get(
+                "scope_kind",
+                CandidateClaimedScopeKind.LANE.value,
+            )
+        ).strip()
+        if scope_kind not in {
+            item.value for item in CandidateClaimedScopeKind
+        }:
+            continue
+        identity: dict[str, str | None] = {}
+        invalid_identity = False
+        for field_name in ("operation", "equipment", "chamber", "recipe"):
+            raw_value = claimed_scope.get(field_name)
+            if raw_value is None:
+                identity[field_name] = None
+            elif isinstance(raw_value, str) and raw_value.strip():
+                identity[field_name] = raw_value.strip()
+            else:
+                invalid_identity = True
+                break
+        if invalid_identity:
+            continue
+        required_identity_fields = {
+            CandidateClaimedScopeKind.LANE.value: (),
+            CandidateClaimedScopeKind.RECIPE.value: (
+                "operation",
+                "equipment",
+                "chamber",
+                "recipe",
+            ),
+            CandidateClaimedScopeKind.CHAMBER.value: (
+                "operation",
+                "equipment",
+                "chamber",
+            ),
+            CandidateClaimedScopeKind.EQUIPMENT.value: (
+                "operation",
+                "equipment",
+            ),
+            CandidateClaimedScopeKind.OPERATION.value: ("operation",),
+            CandidateClaimedScopeKind.UNRESOLVED.value: (),
+        }[scope_kind]
+        if any(identity[field_name] is None for field_name in required_identity_fields):
+            continue
+        surviving_index = raw_to_surviving[raw_candidate_index]
+        if surviving_index in result:
+            ambiguous_indexes.add(surviving_index)
+            continue
+        result[surviving_index] = {
+            "scope_relation": scope_relation,
+            "claimed_scope_kind": scope_kind,
+            "claimed_operation": identity["operation"],
+            "claimed_equipment": identity["equipment"],
+            "claimed_chamber": identity["chamber"],
+            "claimed_recipe": identity["recipe"],
+            "claimed_lane_ids": claimed,
+            "comparison_lane_ids": comparison,
+        }
+    for index in ambiguous_indexes:
+        result.pop(index, None)
+    return result
+
+
+def _closure_validation_error(
+    assessments: Sequence[Mapping[str, Any]],
+) -> str:
+    fragments = [
+        (
+            f"candidate[{item.get('candidate_index')}] Lane "
+            f"{gap.get('lane_id')} omits available {gap.get('evidence_role')} "
+            f"typed Evidence {gap.get('eligible_evidence_ids')}"
+        )
+        for item in assessments
+        for gap in item.get("closure_gaps", [])
+        if isinstance(gap, Mapping)
+    ]
+    return "candidate Evidence closure is incomplete: " + " | ".join(fragments)
+
+
+def _closure_repair_evidence_ids(
+    assessments: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    must_preserve = list(
+        dict.fromkeys(
+            str(evidence_id)
+            for item in assessments
+            for evidence_id in item.get("must_preserve_evidence_ids", [])
+            if str(evidence_id).strip()
+        )
+    )
+    missing = [
+        evidence_id
+        for evidence_id in dict.fromkeys(
+            str(evidence_id)
+            for item in assessments
+            for gap in item.get("closure_gaps", [])
+            if isinstance(gap, Mapping)
+            for evidence_id in gap.get("eligible_evidence_ids", [])
+            if str(evidence_id).strip()
+        )
+        if evidence_id not in set(must_preserve)
+    ][:_MAX_CLOSURE_REPAIR_EVIDENCE]
+    return tuple([*must_preserve, *missing])
 
 
 def _candidate_similarity_tokens(value: str) -> set[str]:
@@ -1096,6 +1836,21 @@ def _candidate_competition_profile(
             if semantic_profile is not None
             else CandidateScopeRelation.UNRESOLVED.value
         ),
+        "claimed_scope_kind": (
+            semantic_profile.claimed_scope_kind
+            if semantic_profile is not None
+            else CandidateClaimedScopeKind.UNRESOLVED.value
+        ),
+        "claimed_scope_identity": (
+            {
+                "operation": semantic_profile.claimed_operation,
+                "equipment": semantic_profile.claimed_equipment,
+                "chamber": semantic_profile.claimed_chamber,
+                "recipe": semantic_profile.claimed_recipe,
+            }
+            if semantic_profile is not None
+            else None
+        ),
         "primary_mechanism": (
             semantic_profile.primary_mechanism
             if semantic_profile is not None
@@ -1149,6 +1904,11 @@ def _scope_semantics_are_distinct(
 
     claimed_scope_distinct = (
         left.scope_relation != right.scope_relation
+        or left.claimed_scope_kind != right.claimed_scope_kind
+        or left.claimed_operation != right.claimed_operation
+        or left.claimed_equipment != right.claimed_equipment
+        or left.claimed_chamber != right.claimed_chamber
+        or left.claimed_recipe != right.claimed_recipe
         or set(left.claimed_lane_ids) != set(right.claimed_lane_ids)
     )
     predictions_distinct = (
@@ -1748,6 +2508,7 @@ def _parse_candidate_semantic_profiles(
     request_id: str,
     surviving_candidate_indexes: Sequence[int],
     known_lane_ids: set[str],
+    known_lane_contexts: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[tuple[CandidateSemanticProfile, ...], tuple[str, ...]]:
     """Parse Qwen scope meaning without changing Candidate validity.
 
@@ -1777,7 +2538,16 @@ def _parse_candidate_semantic_profiles(
         "mechanism_relation",
         "distinguishing_predictions",
     }
-    expected_scope_fields = {"scope_relation", "lane_ids"}
+    legacy_scope_fields = {"scope_relation", "lane_ids"}
+    expected_scope_fields = {
+        "scope_relation",
+        "scope_kind",
+        "operation",
+        "equipment",
+        "chamber",
+        "recipe",
+        "lane_ids",
+    }
     expected_comparison_fields = {"lane_ids"}
     expected_prediction_fields = {
         "discriminator_kind",
@@ -1816,12 +2586,15 @@ def _parse_candidate_semantic_profiles(
                 )
             claimed_scope = raw.get("claimed_scope")
             comparison_scope = raw.get("comparison_scope")
-            if not isinstance(claimed_scope, dict) or set(
-                claimed_scope
-            ) != expected_scope_fields:
+            if not isinstance(claimed_scope, dict) or frozenset(claimed_scope) not in {
+                frozenset(legacy_scope_fields),
+                frozenset(expected_scope_fields),
+            }:
                 raise LLMOutputValidationError(
                     f"candidate_semantic_profiles[{profile_index}].claimed_scope "
-                    f"must contain exactly {sorted(expected_scope_fields)}"
+                    "must use either the legacy Lane-only fields "
+                    f"{sorted(legacy_scope_fields)} or exactly "
+                    f"{sorted(expected_scope_fields)}"
                 )
             if not isinstance(comparison_scope, dict) or set(
                 comparison_scope
@@ -1873,6 +2646,14 @@ def _parse_candidate_semantic_profiles(
             profile = CandidateSemanticProfile(
                 candidate_id=f"{request_id}:llm:{surviving_index + 1}",
                 scope_relation=claimed_scope["scope_relation"],
+                claimed_scope_kind=claimed_scope.get(
+                    "scope_kind",
+                    CandidateClaimedScopeKind.LANE.value,
+                ),
+                claimed_operation=claimed_scope.get("operation"),
+                claimed_equipment=claimed_scope.get("equipment"),
+                claimed_chamber=claimed_scope.get("chamber"),
+                claimed_recipe=claimed_scope.get("recipe"),
                 claimed_lane_ids=tuple(claimed_scope.get("lane_ids", [])),
                 comparison_lane_ids=tuple(comparison_scope.get("lane_ids", [])),
                 mechanism_claim=raw["mechanism_claim"],
@@ -1913,6 +2694,32 @@ def _parse_candidate_semantic_profiles(
                     f"candidate_semantic_profiles[{profile_index}] references "
                     f"unknown Lane IDs: {unknown_lane_ids}"
                 )
+            if known_lane_contexts is not None:
+                scope_identity = {
+                    "operation": profile.claimed_operation,
+                    "equipment": profile.claimed_equipment,
+                    "chamber": profile.claimed_chamber,
+                    "recipe": profile.claimed_recipe,
+                }
+                mismatched_claimed_lanes = sorted(
+                    lane_id
+                    for lane_id in profile.claimed_lane_ids
+                    if (
+                        lane := known_lane_contexts.get(lane_id)
+                    ) is not None
+                    and any(
+                        expected is not None
+                        and _compact_scope_identity(expected)
+                        != _compact_scope_identity(lane.get(field_name, ""))
+                        for field_name, expected in scope_identity.items()
+                    )
+                )
+                if mismatched_claimed_lanes:
+                    raise LLMOutputValidationError(
+                        f"candidate_semantic_profiles[{profile_index}] claimed "
+                        "Lane identity conflicts with claimed_scope: "
+                        f"{mismatched_claimed_lanes}"
+                    )
             claimed_lane_ids = set(profile.claimed_lane_ids)
             comparison_lane_ids = set(profile.comparison_lane_ids)
             prediction_lane_ids = {
@@ -1923,6 +2730,8 @@ def _parse_candidate_semantic_profiles(
             if (
                 profile.scope_relation
                 == CandidateScopeRelation.SHARED_EFFECT.value
+                and profile.claimed_scope_kind
+                == CandidateClaimedScopeKind.LANE.value
                 and len(claimed_lane_ids) < 2
             ):
                 raise LLMOutputValidationError(
@@ -1933,7 +2742,12 @@ def _parse_candidate_semantic_profiles(
             if (
                 profile.scope_relation == CandidateScopeRelation.FOCAL_ONLY.value
                 and (
-                    len(claimed_lane_ids) != 1
+                    profile.claimed_scope_kind
+                    not in {
+                        CandidateClaimedScopeKind.LANE.value,
+                        CandidateClaimedScopeKind.RECIPE.value,
+                    }
+                    or len(claimed_lane_ids) != 1
                     or not claimed_lane_ids < comparison_lane_ids
                 )
             ):
@@ -1945,7 +2759,14 @@ def _parse_candidate_semantic_profiles(
             if (
                 profile.scope_relation
                 == CandidateScopeRelation.DIFFERENTIAL_SENSITIVITY.value
-                and not claimed_lane_ids < comparison_lane_ids
+                and (
+                    profile.claimed_scope_kind
+                    not in {
+                        CandidateClaimedScopeKind.LANE.value,
+                        CandidateClaimedScopeKind.RECIPE.value,
+                    }
+                    or not claimed_lane_ids < comparison_lane_ids
+                )
             ):
                 raise LLMOutputValidationError(
                     "semantic coherence: "
@@ -2105,10 +2926,26 @@ class QwenHypothesisCandidateGenerator:
                     raw_audit.get("omitted_metadata_count", 0)
                 ),
             }
+        # Protect only the bounded reserved subsets.  Protecting the complete
+        # first-round recent-Evidence inventory made every emitted card
+        # untrimable and allowed repair prompts to hover near the hard 64K
+        # boundary even though only 16 recent IDs receive reserved space.
         protected_prompt_evidence_ids = {
-            *recent_evidence_ids,
-            *prior_candidate_evidence_ids,
-            *challenge_evidence_ids,
+            *_diverse_bounded_ids(
+                recent_evidence_ids,
+                evidence_by_id=evidence_by_id,
+                limit=_MAX_RECENT_EVIDENCE,
+            ),
+            *_diverse_bounded_ids(
+                prior_candidate_evidence_ids,
+                evidence_by_id=evidence_by_id,
+                limit=_MAX_PRIOR_CANDIDATE_EVIDENCE,
+            ),
+            *_diverse_bounded_ids(
+                challenge_evidence_ids,
+                evidence_by_id=evidence_by_id,
+                limit=_MAX_CHALLENGE_EVIDENCE,
+            ),
         }
         prompt_synthesis = compact_lane_first_synthesis_for_prompt(
             evidence_synthesis
@@ -2125,7 +2962,32 @@ class QwenHypothesisCandidateGenerator:
         validation_errors: list[str] = []
         rejected_candidates: list[dict[str, Any]] = []
         competition_repair_skipped_due_to_budget = False
+        pending_closure_feedback: tuple[dict[str, Any], ...] = ()
+        pending_closure_proposals: tuple[HypothesisCandidateProposal, ...] = ()
+        closure_history: list[dict[str, Any]] = []
+        final_closure_assessment: tuple[dict[str, Any], ...] = ()
+        evidence_closure_repair_attempted = False
+        evidence_closure_repair_exhausted = False
+        evidence_closure_repair_skipped_due_to_budget = False
         for attempt in range(1, _OUTPUT_ATTEMPTS + 1):
+            # ``evidence_register`` may change between output attempts when a
+            # Closure repair protects newly surfaced typed Evidence.  Build
+            # every repair projection from the register that this exact
+            # request will expose, never from the previous attempt's mapping.
+            current_prompt_evidence_ids = {
+                str(record.get("evidence_id", ""))
+                for record in evidence_register
+                if str(record.get("evidence_id", "")).strip()
+            }
+            prompt_evidence_by_id = {
+                evidence_id: evidence_by_id[evidence_id]
+                for evidence_id in current_prompt_evidence_ids
+                if evidence_id in evidence_by_id
+            }
+            request_competition_context = _bounded_candidate_competition_context(
+                competition_context,
+                allowed_evidence_ids=set(prompt_evidence_by_id),
+            )
             request = LLMRequest(
                 agent=AgentKind.RCA_REASONING.value,
                 prompt_name="hypothesis_candidate_generator",
@@ -2181,22 +3043,16 @@ class QwenHypothesisCandidateGenerator:
                         if isinstance(item, Mapping)
                     ],
                     "prior_candidate_mechanism_feedback": prior_mechanism_feedback,
-                    "new_evidence_ids_since_prior": competition_context[
+                    "new_evidence_ids_since_prior": request_competition_context[
                         "new_evidence_ids_since_prior"
-                    ]
-                    if not recent_evidence_ids
-                    else [
-                        evidence_id
-                        for evidence_id in recent_evidence_ids
-                        if evidence_id in set(prompt_evidence_ids)
                     ],
-                    "prior_candidate_challenges": competition_context[
+                    "prior_candidate_challenges": request_competition_context[
                         "prior_candidate_challenges"
                     ],
-                    "targeted_investigation_results": competition_context[
+                    "targeted_investigation_results": request_competition_context[
                         "targeted_investigation_results"
                     ],
-                    "relevant_causal_lanes": competition_context[
+                    "relevant_causal_lanes": request_competition_context[
                         "relevant_causal_lanes"
                     ],
                     "max_candidates": _MAX_CANDIDATES,
@@ -2205,7 +3061,10 @@ class QwenHypothesisCandidateGenerator:
                         _candidate_repair_feedback(
                             validation_errors[-1],
                             evidence_by_id=prompt_evidence_by_id,
-                            candidate_competition=competition_context,
+                            candidate_competition=request_competition_context,
+                            candidate_evidence_closure=(
+                                pending_closure_feedback
+                            ),
                         )
                         if validation_errors
                         else None
@@ -2241,6 +3100,45 @@ class QwenHypothesisCandidateGenerator:
                     ]
                     if evidence_id in set(current_ids)
                 ]
+                current_evidence_by_id = {
+                    evidence_id: evidence_by_id[evidence_id]
+                    for evidence_id in current_ids
+                    if evidence_id in evidence_by_id
+                }
+                current_competition_context = (
+                    _bounded_candidate_competition_context(
+                        competition_context,
+                        allowed_evidence_ids=set(current_evidence_by_id),
+                    )
+                )
+                request.payload["new_evidence_ids_since_prior"] = (
+                    current_competition_context["new_evidence_ids_since_prior"]
+                )
+                request.payload["prior_candidate_challenges"] = (
+                    current_competition_context["prior_candidate_challenges"]
+                )
+                request.payload["targeted_investigation_results"] = (
+                    current_competition_context[
+                        "targeted_investigation_results"
+                    ]
+                )
+                request.payload["relevant_causal_lanes"] = (
+                    current_competition_context["relevant_causal_lanes"]
+                )
+                if validation_errors:
+                    # Keep the repair contract atomic with the final typed
+                    # register.  Qwen must never be advised to cite an ID that
+                    # Python just removed to satisfy the prompt budget.
+                    request.payload["previous_validation_feedback"] = (
+                        _candidate_repair_feedback(
+                            validation_errors[-1],
+                            evidence_by_id=current_evidence_by_id,
+                            candidate_competition=current_competition_context,
+                            candidate_evidence_closure=(
+                                pending_closure_feedback
+                            ),
+                        )
+                    )
                 payload_char_count = _payload_char_count(request.payload)
             current_prompt_evidence_ids = {
                 str(record.get("evidence_id", ""))
@@ -2425,6 +3323,21 @@ class QwenHypothesisCandidateGenerator:
                     distinct.append(proposal)
                     distinct_candidate_indexes.append(index)
                 proposals = tuple(distinct)
+                known_lane_ids = {
+                    str(item.get("lane_id", "")).strip()
+                    for item in causal_lanes
+                    if str(item.get("lane_id", "")).strip()
+                }
+                raw_scope_by_distinct_index = _raw_candidate_scope_references(
+                    response.data.get("candidate_semantic_profiles"),
+                    surviving_candidate_indexes=distinct_candidate_indexes,
+                    known_lane_ids=known_lane_ids,
+                )
+                raw_scope_by_proposal = {
+                    proposal: raw_scope_by_distinct_index[index]
+                    for index, proposal in enumerate(proposals)
+                    if index in raw_scope_by_distinct_index
+                }
                 semantic_profiles: tuple[CandidateSemanticProfile, ...] = ()
                 semantic_validation_errors: tuple[str, ...] = ()
                 if proposals:
@@ -2433,8 +3346,9 @@ class QwenHypothesisCandidateGenerator:
                             response.data.get("candidate_semantic_profiles"),
                             request_id=request_id,
                             surviving_candidate_indexes=distinct_candidate_indexes,
-                            known_lane_ids={
-                                str(item.get("lane_id", "")).strip()
+                            known_lane_ids=known_lane_ids,
+                            known_lane_contexts={
+                                str(item.get("lane_id", "")).strip(): item
                                 for item in causal_lanes
                                 if str(item.get("lane_id", "")).strip()
                             },
@@ -2466,6 +3380,151 @@ class QwenHypothesisCandidateGenerator:
                             f"candidate_index={variant['candidate_index']}, "
                             f"relation={variant['mechanism_relation']}"
                         )
+                final_closure_assessment = (
+                    _candidate_evidence_closure_assessment(
+                        proposals,
+                        semantic_profiles,
+                        evidence_by_id=evidence_by_id,
+                        causal_lanes=causal_lanes,
+                        raw_scope_by_candidate_index={
+                            index: raw_scope_by_proposal[proposal]
+                            for index, proposal in enumerate(proposals)
+                            if proposal in raw_scope_by_proposal
+                        },
+                        must_preserve_evidence_ids_by_candidate_index={
+                            index: previous.supporting_evidence_ids
+                            for index, (proposal, previous) in enumerate(
+                                zip(
+                                    proposals,
+                                    pending_closure_proposals,
+                                    strict=False,
+                                )
+                            )
+                            if _token_similarity(
+                                (
+                                    f"{proposal.root_cause} "
+                                    f"{proposal.causal_explanation}"
+                                ),
+                                (
+                                    f"{previous.root_cause} "
+                                    f"{previous.causal_explanation}"
+                                ),
+                            )
+                            >= 0.65
+                        },
+                    )
+                    if proposals
+                    else ()
+                )
+                closure_history.append(
+                    {
+                        "output_attempt": attempt,
+                        "status": next(
+                            (
+                                status
+                                for status in (
+                                    "incomplete",
+                                    "not_evaluated",
+                                    "complete",
+                                )
+                                if any(
+                                    item.get("status") == status
+                                    for item in final_closure_assessment
+                                )
+                            ),
+                            "not_evaluated",
+                        ),
+                        "candidate_assessments": [
+                            dict(item) for item in final_closure_assessment
+                        ],
+                    }
+                )
+                closure_repair_required = any(
+                    item.get("status") == "incomplete"
+                    for item in final_closure_assessment
+                )
+                if closure_repair_required and attempt < _OUTPUT_ATTEMPTS:
+                    closure_error = _closure_validation_error(
+                        final_closure_assessment
+                    )
+                    joint_feedback = [closure_error]
+                    if semantic_validation_errors:
+                        joint_feedback.append(
+                            "candidate semantic profile also requires repair: "
+                            + " | ".join(semantic_validation_errors)
+                        )
+                    validation_errors.append(" | ".join(joint_feedback))
+                    pending_closure_feedback = final_closure_assessment
+                    pending_closure_proposals = proposals
+                    if llm_call_budget_available(
+                        self.llm_client,
+                        required_calls=1,
+                        # Retain one governed post-Action Planner call. Closure
+                        # shares the existing Candidate output-attempt budget.
+                        reserve_calls=1,
+                    ):
+                        repair_ids = _closure_repair_evidence_ids(
+                            final_closure_assessment
+                        )
+                        for evidence_id in repair_ids:
+                            if evidence_id in {
+                                str(card.get("evidence_id", ""))
+                                for card in evidence_register
+                            }:
+                                protected_prompt_evidence_ids.add(evidence_id)
+                                continue
+                            while len(evidence_register) >= _MAX_PROMPT_EVIDENCE:
+                                removable_index = next(
+                                    (
+                                        index
+                                        for index in range(
+                                            len(evidence_register) - 1,
+                                            -1,
+                                            -1,
+                                        )
+                                        if str(
+                                            evidence_register[index].get(
+                                                "evidence_id", ""
+                                            )
+                                        )
+                                        not in protected_prompt_evidence_ids
+                                    ),
+                                    None,
+                                )
+                                if removable_index is None:
+                                    break
+                                evidence_register.pop(removable_index)
+                            if len(evidence_register) >= _MAX_PROMPT_EVIDENCE:
+                                continue
+                            card = compact_evidence_prompt_card(
+                                evidence_by_id[evidence_id]
+                            )
+                            raw_audit = card.pop("projection_audit", {})
+                            projection_audit_by_id[evidence_id] = {
+                                "omitted_entity_count": int(
+                                    raw_audit.get("omitted_entity_count", 0)
+                                ),
+                                "omitted_metadata_count": int(
+                                    raw_audit.get("omitted_metadata_count", 0)
+                                ),
+                            }
+                            evidence_register.append(card)
+                            protected_prompt_evidence_ids.add(evidence_id)
+                        prompt_evidence_ids = tuple(
+                            str(card.get("evidence_id", ""))
+                            for card in evidence_register
+                            if str(card.get("evidence_id", "")).strip()
+                        )
+                        prompt_synthesis["prompt_evidence_ids"] = list(
+                            prompt_evidence_ids
+                        )
+                        evidence_closure_repair_attempted = True
+                        continue
+                    evidence_closure_repair_skipped_due_to_budget = True
+                elif closure_repair_required:
+                    evidence_closure_repair_exhausted = (
+                        evidence_closure_repair_attempted
+                    )
                 competition_assessment = _candidate_competition_assessment(
                     proposals,
                     evidence_by_id=evidence_by_id,
@@ -2623,6 +3682,17 @@ class QwenHypothesisCandidateGenerator:
                     semantic_validation_errors=semantic_validation_errors,
                     candidate_lineage=tuple(candidate_lineage),
                     evidence_synthesis=evidence_synthesis,
+                    candidate_evidence_closure=final_closure_assessment,
+                    candidate_evidence_closure_history=tuple(closure_history),
+                    evidence_closure_repair_attempted=(
+                        evidence_closure_repair_attempted
+                    ),
+                    evidence_closure_repair_exhausted=(
+                        evidence_closure_repair_exhausted
+                    ),
+                    evidence_closure_repair_skipped_due_to_budget=(
+                        evidence_closure_repair_skipped_due_to_budget
+                    ),
                 )
             except (LLMOutputValidationError, TypeError, ValueError) as exc:
                 validation_errors.append(str(exc).strip() or type(exc).__name__)

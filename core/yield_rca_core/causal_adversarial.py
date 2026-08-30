@@ -29,7 +29,7 @@ from yield_rca_core.causal_investigation_models import (
     ChallengeStatus,
     CompetitionRequirement,
 )
-from yield_rca_core.evidence_models import Evidence
+from yield_rca_core.evidence_models import Evidence, EvidenceType
 from yield_rca_core.evidence_synthesis import compact_evidence_prompt_card
 from yield_rca_core.llm_gateway import (
     LLMCallError,
@@ -42,6 +42,27 @@ from yield_rca_core.models import AgentKind, ModelValidationError
 
 _OUTPUT_ATTEMPTS = 2
 _MAX_CHALLENGE_PAYLOAD_CHARS = 64_000
+_PRECURSOR_EVIDENCE_TYPES = {
+    EvidenceType.RECIPE_CHANGE.value,
+    EvidenceType.HOLD_EVENT.value,
+    EvidenceType.PARAMETER_DEVIATION.value,
+    EvidenceType.TREND_DEVIATION.value,
+    EvidenceType.OOC_EVENT.value,
+    EvidenceType.SPC_VIOLATION.value,
+}
+
+
+def _is_typed_precursor(evidence: Evidence) -> bool:
+    role = str(
+        evidence.metadata.get(
+            "causal_role",
+            evidence.metadata.get("mechanism_role", ""),
+        )
+    ).strip().casefold()
+    return evidence.evidence_type in _PRECURSOR_EVIDENCE_TYPES or role in {
+        "mechanism_intermediate",
+        "physical_intermediate",
+    }
 
 
 @dataclass(frozen=True)
@@ -312,6 +333,20 @@ def _normalize_challenge_payload(
             "candidate challenge Evidence cannot be both supporting and contradicting"
         )
     if evidence_by_id is not None:
+        invalid_precursors = sorted(
+            evidence_id
+            for evidence_id in precursor
+            if (
+                evidence := evidence_by_id.get(evidence_id)
+            ) is not None
+            and not _is_typed_precursor(evidence)
+        )
+        if invalid_precursors:
+            raise LLMOutputValidationError(
+                "unexplained precursor references must be typed causal/process "
+                "observations, not excursion windows, missing data, negative "
+                f"signals, or controls: {invalid_precursors}"
+            )
         for evidence_id in referenced_evidence:
             evidence = evidence_by_id.get(evidence_id)
             if evidence is None:

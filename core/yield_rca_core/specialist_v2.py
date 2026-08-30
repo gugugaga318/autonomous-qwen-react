@@ -727,6 +727,9 @@ class SpecialistV2Executor:
         )
         equipment_id = _string(context.get("equipment_id"))
         chamber_id = _string(context.get("chamber_id"))
+        recipe_id = _string(context.get("recipe_id")) or _string(
+            context.get("recipe")
+        )
         if not lot_ids or not operation_no or not equipment_id or not chamber_id:
             raise SpecialistV2Error(
                 "FDC Specialist requires trusted Lot, operation, equipment, and chamber scope",
@@ -734,12 +737,15 @@ class SpecialistV2Executor:
                 reason="missing_fdc_scope",
             )
         _require_source_lot_in_scope(context, lot_ids, agent=AgentKind.FDC.value)
-        return {
+        parameters = {
             "lot_ids": lot_ids,
             "operation_no": operation_no,
             "equipment_id": equipment_id,
             "chamber_id": chamber_id,
         }
+        if recipe_id:
+            parameters["recipe_id"] = recipe_id
+        return parameters
 
     def _fdc_basic_candidate(
         self,
@@ -785,6 +791,11 @@ class SpecialistV2Executor:
                         "operation_no": parameters["operation_no"],
                         "equipment_id": parameters["equipment_id"],
                         "chamber_id": parameters["chamber_id"],
+                        **(
+                            {"recipe_id": parameters["recipe_id"]}
+                            if "recipe_id" in parameters
+                            else {}
+                        ),
                     },
                     "Inspect recorded OOC and containment events for the fixed chamber.",
                 )

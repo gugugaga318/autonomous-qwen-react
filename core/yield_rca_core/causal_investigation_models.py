@@ -205,6 +205,22 @@ class CandidateScopeRelation(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+class CandidateClaimedScopeKind(StrEnum):
+    """Granularity of the causal reach explicitly declared by Qwen.
+
+    ``claimed_lane_ids`` remain useful references into the current bounded
+    investigation snapshot, but they are not an exhaustive enumeration for a
+    broader equipment/chamber/operation claim.
+    """
+
+    LANE = "lane"
+    RECIPE = "recipe"
+    CHAMBER = "chamber"
+    EQUIPMENT = "equipment"
+    OPERATION = "operation"
+    UNRESOLVED = "unresolved"
+
+
 class CandidateMechanismRelation(StrEnum):
     """Qwen-declared relationship to the first Candidate's primary mechanism.
 
@@ -291,6 +307,11 @@ class CandidateSemanticProfile:
     claimed_lane_ids: tuple[str, ...]
     comparison_lane_ids: tuple[str, ...]
     mechanism_claim: str
+    claimed_scope_kind: str = CandidateClaimedScopeKind.LANE.value
+    claimed_operation: str | None = None
+    claimed_equipment: str | None = None
+    claimed_chamber: str | None = None
+    claimed_recipe: str | None = None
     primary_mechanism: str = ""
     effect_modifier: str | None = None
     depends_on_candidate_id: str | None = None
@@ -309,15 +330,71 @@ class CandidateSemanticProfile:
                 f"scope_relation must be one of: {allowed}"
             ) from exc
         object.__setattr__(self, "scope_relation", relation)
+        try:
+            scope_kind = CandidateClaimedScopeKind(self.claimed_scope_kind).value
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in CandidateClaimedScopeKind)
+            raise ModelValidationError(
+                f"claimed_scope_kind must be one of: {allowed}"
+            ) from exc
+        object.__setattr__(self, "claimed_scope_kind", scope_kind)
+        for field_name in (
+            "claimed_operation",
+            "claimed_equipment",
+            "claimed_chamber",
+            "claimed_recipe",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_string(getattr(self, field_name), field_name),
+            )
         for field_name in ("claimed_lane_ids", "comparison_lane_ids"):
             object.__setattr__(
                 self,
                 field_name,
                 _string_tuple(getattr(self, field_name), field_name),
             )
-        if relation != CandidateScopeRelation.UNRESOLVED.value and not self.claimed_lane_ids:
+        resolved = relation != CandidateScopeRelation.UNRESOLVED.value
+        required_identity_fields = {
+            CandidateClaimedScopeKind.LANE.value: (),
+            CandidateClaimedScopeKind.RECIPE.value: (
+                "claimed_operation",
+                "claimed_equipment",
+                "claimed_chamber",
+                "claimed_recipe",
+            ),
+            CandidateClaimedScopeKind.CHAMBER.value: (
+                "claimed_operation",
+                "claimed_equipment",
+                "claimed_chamber",
+            ),
+            CandidateClaimedScopeKind.EQUIPMENT.value: (
+                "claimed_operation",
+                "claimed_equipment",
+            ),
+            CandidateClaimedScopeKind.OPERATION.value: ("claimed_operation",),
+            CandidateClaimedScopeKind.UNRESOLVED.value: (),
+        }[scope_kind]
+        if resolved and scope_kind == CandidateClaimedScopeKind.UNRESOLVED.value:
             raise ModelValidationError(
-                "a resolved scope_relation requires claimed_lane_ids"
+                "a resolved scope_relation cannot use claimed_scope_kind=unresolved"
+            )
+        if resolved and scope_kind == CandidateClaimedScopeKind.LANE.value and not (
+            self.claimed_lane_ids
+        ):
+            raise ModelValidationError(
+                "a resolved lane scope requires claimed_lane_ids"
+            )
+        missing_identity_fields = [
+            field_name
+            for field_name in required_identity_fields
+            if getattr(self, field_name) is None
+        ]
+        if resolved and missing_identity_fields:
+            raise ModelValidationError(
+                "resolved claimed scope is missing identity fields: "
+                + ", ".join(missing_identity_fields)
             )
         if not set(self.claimed_lane_ids) <= set(self.comparison_lane_ids):
             raise ModelValidationError(
@@ -410,6 +487,11 @@ class CandidateSemanticProfile:
         return {
             "candidate_id": self.candidate_id,
             "scope_relation": self.scope_relation,
+            "claimed_scope_kind": self.claimed_scope_kind,
+            "claimed_operation": self.claimed_operation,
+            "claimed_equipment": self.claimed_equipment,
+            "claimed_chamber": self.claimed_chamber,
+            "claimed_recipe": self.claimed_recipe,
             "claimed_lane_ids": list(self.claimed_lane_ids),
             "comparison_lane_ids": list(self.comparison_lane_ids),
             "mechanism_claim": self.mechanism_claim,
@@ -429,6 +511,14 @@ class CandidateSemanticProfile:
         return cls(
             candidate_id=data["candidate_id"],
             scope_relation=data["scope_relation"],
+            claimed_scope_kind=data.get(
+                "claimed_scope_kind",
+                CandidateClaimedScopeKind.LANE.value,
+            ),
+            claimed_operation=data.get("claimed_operation"),
+            claimed_equipment=data.get("claimed_equipment"),
+            claimed_chamber=data.get("claimed_chamber"),
+            claimed_recipe=data.get("claimed_recipe"),
             claimed_lane_ids=tuple(data.get("claimed_lane_ids", [])),
             comparison_lane_ids=tuple(data.get("comparison_lane_ids", [])),
             mechanism_claim=data["mechanism_claim"],

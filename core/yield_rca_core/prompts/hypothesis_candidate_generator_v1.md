@@ -20,6 +20,11 @@ Return exactly one JSON object:
       "candidate_index": 0,
       "claimed_scope": {
         "scope_relation": "shared_effect | focal_only | differential_sensitivity | unresolved",
+        "scope_kind": "lane | recipe | chamber | equipment | operation | unresolved",
+        "operation": "claimed operation or null",
+        "equipment": "claimed equipment or null",
+        "chamber": "claimed chamber or null",
+        "recipe": "claimed recipe or null",
         "lane_ids": ["existing active Lane ID"]
       },
       "comparison_scope": {
@@ -58,6 +63,16 @@ Rules:
   Evidence covering two recipes does not by itself mean the Candidate claims a
   shared multi-recipe effect. A recipe-sensitivity hypothesis normally compares
   two recipe Lanes while claiming a differential effect.
+- Declare the causal reach directly with ``claimed_scope.scope_kind`` and its
+  identity fields. A chamber-level claim supplies operation, equipment, and
+  chamber while leaving recipe null; an equipment-level claim supplies operation
+  and equipment; a recipe claim supplies all four fields. ``lane_ids`` are
+  references into the currently visible investigation snapshot. For chamber,
+  equipment, and operation scope they are representative, not an exhaustive
+  enumeration of every Recipe Lane that may belong to the declared reach.
+- Never widen ``claimed_scope`` because cited Evidence covers more entities.
+  Conversely, comparison Evidence from another Recipe does not make that Recipe
+  part of the claimed effect unless the declared scope identity says so.
 - Use ``scope_relation=shared_effect`` when the Candidate predicts the same
   causal effect across every claimed Lane; ``focal_only`` when it predicts the
   effect only in the claimed focal Lane; ``differential_sensitivity`` when the
@@ -193,6 +208,20 @@ Rules:
   shared exposure, process anomaly, outcome, temporal, scope, or mechanism facts
   as Evidence Gaps and may run a targeted investigation. Never add an irrelevant
   Evidence ID merely to make the candidate look complete.
+- Candidate citation closure is separate from inventing missing Evidence. For
+  every Lane in the Qwen-owned ``claimed_scope``, cite available matching typed
+  exposure, excursion-window, and observed-outcome Evidence when it genuinely
+  supports that claim. Do not omit an already available causal-chain endpoint
+  while asserting the corresponding Lane. Lanes used only in
+  ``comparison_scope`` are not citation requirements. Python detects omissions
+  and may offer one bounded repair, but it never attaches an Evidence ID or
+  rewrites the claimed scope for you.
+- A typed physical/mechanism intermediate is objective support only when its
+  Evidence card explicitly carries ``causal_role=physical_intermediate`` or
+  ``causal_role=mechanism_intermediate`` (or the compatible boolean marker) with
+  source provenance. Defect codes, pattern codes, metric names, and your prose do
+  not create that role. You may propose an evidence-compatible physical bridge,
+  but do not describe it as observed unless cited typed Evidence records it.
 - Cite only IDs from typed_evidence_register.
 - DATA_MISSING, NEGATIVE_SIGNAL, and SOP guidance cannot be supporting Evidence.
   An engineer-confirmed historical RCA case or engineering note may be cited as
@@ -210,6 +239,12 @@ Rules:
   is justified.
 - On output_attempt > 1, previous_validation_feedback is authoritative. Correct the
   exact schema or Evidence-reference error instead of repeating it.
+  A Candidate Evidence Closure repair is cumulative: preserve the prior
+  ``candidate_snapshot`` and every still-valid ID listed in
+  ``must_preserve_evidence_ids`` while adding only relevant missing citations.
+  Do not replace the support set with only the newly advertised IDs. Python
+  records a removed required citation as ``citation_regression`` and does not
+  silently restore it.
   `eligible_supporting_evidence_ids_by_lane` lists typed IDs that are structurally
   eligible for each missing lane; `mechanism_support` lists only approved
   knowledge IDs. You must still judge whether an ID actually supports the proposed

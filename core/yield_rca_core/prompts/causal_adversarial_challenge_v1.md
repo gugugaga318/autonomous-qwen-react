@@ -64,6 +64,13 @@ attempt, follow the Candidate-and-Lane-specific mappings included in
 ``previous_validation_feedback`` exactly. If changing the probe Lane, also
 change the Gap to one listed for the new Candidate/Lane pair.
 
+``unexplained_precursor_evidence_ids`` may contain only an earlier typed
+process/causal observation or a source-declared physical intermediate that the
+Candidate fails to explain. Never place an excursion-window boundary,
+``data_missing``, ``negative_signal``, normal control, or comparison-only
+Evidence in that field. Those facts remain temporal, availability, or control
+context and cannot block confirmation as an unexplained physical precursor.
+
 The ``causal_lanes`` payload contains Python-owned equipment, chamber,
 operation, recipe, Lot, and time-window facts.  Evidence used to resolve a
 named alternative must belong to that Lane and must be consistent with those

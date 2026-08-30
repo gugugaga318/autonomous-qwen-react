@@ -487,7 +487,10 @@ def assess_action_values(
                 decision_impact == ActionDecisionImpact.RANKING.value,
             )
         )
-        if mechanism_competition_required:
+        is_hypothesis_discrimination = (
+            str(gap.get("gap_type", "")) == "hypothesis_discrimination"
+        )
+        if mechanism_competition_required and is_hypothesis_discrimination:
             can_change_ranking = (
                 can_change_ranking
                 and competition_axis == CandidateCompetitionAxis.MECHANISM.value
@@ -508,6 +511,7 @@ def assess_action_values(
             rejection_reason = "action_cannot_change_decision_state"
         elif (
             mechanism_competition_required
+            and is_hypothesis_discrimination
             and competition_axis != CandidateCompetitionAxis.MECHANISM.value
         ):
             eligible = False
@@ -535,7 +539,7 @@ def assess_action_values(
             ActionDecisionImpact.CONFIRMATION.value,
             ActionDecisionImpact.REASONING_REFRESH.value,
         }
-        if mechanism_competition_required:
+        if mechanism_competition_required and is_hypothesis_discrimination:
             high_value = high_value and can_change_ranking
         if high_value and information_gain >= 0.6:
             tier = ActionValueTier.HIGH.value

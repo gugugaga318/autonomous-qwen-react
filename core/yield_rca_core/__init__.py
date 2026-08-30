@@ -60,6 +60,7 @@ from yield_rca_core.causal_investigation_models import (
     AlternativeLaneResolutionStatus,
     AlternativeSearchStatus,
     CandidateChallenge,
+    CandidateClaimedScopeKind,
     CandidateCompetitionAxis,
     CandidateCompetitionStatus,
     CandidateCompetitionType,
@@ -143,6 +144,7 @@ from yield_rca_core.hypothesis_candidate_generator import (
 )
 from yield_rca_core.hypothesis_engine import HypothesisEngine
 from yield_rca_core.improvement_agent import ImprovementAgent
+from yield_rca_core.incident_evidence import build_incident_observation_evidence
 from yield_rca_core.intent_planner import QwenIntentPlanner, QwenIntentPlannerError
 from yield_rca_core.investigation_decision import (
     action_scope_fingerprint,
@@ -363,6 +365,7 @@ __all__ = [
     "CandidateResolutionStatus",
     "CandidateDistinguishingPrediction",
     "CandidateMechanismRelation",
+    "CandidateClaimedScopeKind",
     "CandidateScopeRelation",
     "CandidateSemanticProfile",
     "ChallengeKind",
@@ -384,6 +387,7 @@ __all__ = [
     "derive_alternative_lane_resolutions",
     "build_causal_evidence_gaps",
     "build_hypothesis_discrimination_gaps",
+    "build_incident_observation_evidence",
     "build_evidence_synthesis",
     "build_lane_first_evidence_synthesis",
     "build_candidate_competition_brief",

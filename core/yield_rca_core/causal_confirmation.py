@@ -11,7 +11,12 @@ from typing import Any, cast
 from yield_rca_core.causal_chain import assess_causal_chain
 from yield_rca_core.causal_evidence_matrix import CausalEvidenceMatrix
 from yield_rca_core.causal_hypothesis import CausalClaim, CausalClaimStatus, CausalHypothesis
-from yield_rca_core.causal_investigation_models import AlternativeSearchStatus
+from yield_rca_core.causal_investigation_models import (
+    AlternativeSearchStatus,
+    CandidateClaimedScopeKind,
+    CandidateScopeRelation,
+    CandidateSemanticProfile,
+)
 from yield_rca_core.evidence_models import (
     EntityType,
     Evidence,
@@ -420,14 +425,48 @@ def _candidate_entity_tokens(candidate: CausalHypothesis, entity_type: str) -> s
 def _compatible_with_candidate(
     item: Evidence,
     candidate: CausalHypothesis,
+    semantic_profile: CandidateSemanticProfile | None = None,
 ) -> bool:
+    semantic_expected = {
+        EntityType.EQUIPMENT.value: (
+            {semantic_profile.claimed_equipment}
+            if semantic_profile is not None
+            and semantic_profile.claimed_equipment is not None
+            else set()
+        ),
+        EntityType.CHAMBER.value: (
+            {semantic_profile.claimed_chamber}
+            if semantic_profile is not None
+            and semantic_profile.claimed_chamber is not None
+            else set()
+        ),
+        EntityType.OPERATION.value: (
+            {semantic_profile.claimed_operation}
+            if semantic_profile is not None
+            and semantic_profile.claimed_operation is not None
+            else set()
+        ),
+        EntityType.RECIPE.value: (
+            {semantic_profile.claimed_recipe}
+            if semantic_profile is not None
+            and semantic_profile.claimed_recipe is not None
+            else set()
+        ),
+    }
     for entity_type in (
         EntityType.EQUIPMENT.value,
         EntityType.CHAMBER.value,
         EntityType.OPERATION.value,
         EntityType.RECIPE.value,
     ):
-        expected = _candidate_entity_tokens(candidate, entity_type)
+        expected = semantic_expected[entity_type] or _candidate_entity_tokens(
+            candidate, entity_type
+        )
+        # A validated semantic profile is the authoritative claimed reach. An
+        # intentionally null Recipe in a chamber/equipment scope must not be
+        # repopulated from prose and accidentally narrow Impact Lots.
+        if semantic_profile is not None:
+            expected = semantic_expected[entity_type]
         actual = _entity_ids(item, entity_type)
         matches = {
             (expected_id, actual_id)
@@ -524,10 +563,39 @@ def _candidate_matches_values(
     raw_text = f"{candidate.root_cause} {candidate.causal_explanation}"
     compact_text = _compact(raw_text)
     candidate_tokens = set(re.findall(r"[a-z0-9]+", raw_text.casefold()))
+
+    def compact_variants(value: str) -> set[str]:
+        compact_value = _compact(value)
+        variants = {compact_value}
+        # Typed parameter names commonly append a measurement/statistic suffix
+        # that engineers omit in causal prose.  Strip only those suffixes; the
+        # physical parameter identity itself must still match the candidate.
+        measurement_suffixes = (
+            "average",
+            "deviation",
+            "repeatability",
+            "delta",
+            "offset",
+            "range",
+            "shift",
+            "sigma",
+            "mean",
+            "avg",
+            "cv",
+        )
+        for suffix in measurement_suffixes:
+            if compact_value.endswith(suffix):
+                base = compact_value[: -len(suffix)]
+                if len(base) >= 6:
+                    variants.add(base)
+        return variants
+
     return any(
         (
-            len(_compact(value)) >= 6
-            and _compact(value) in compact_text
+            any(
+                len(variant) >= 6 and variant in compact_text
+                for variant in compact_variants(value)
+            )
         )
         or (
             bool(value_tokens := set(re.findall(r"[a-z0-9]+", value.casefold())))
@@ -607,6 +675,15 @@ def _evidence_windows(items: Sequence[Evidence]) -> list[tuple[datetime, datetim
     def visit(value: object) -> None:
         if isinstance(value, Mapping):
             normalized = {str(key).casefold(): child for key, child in value.items()}
+            raw_time_window = normalized.get("time_window")
+            if (
+                isinstance(raw_time_window, (list, tuple))
+                and len(raw_time_window) == 2
+            ):
+                start = _parse_time(raw_time_window[0])
+                end = _parse_time(raw_time_window[1])
+                if start is not None and end is not None and start <= end:
+                    windows.append((start, end))
             starts = [
                 normalized[key]
                 for key in (
@@ -645,6 +722,17 @@ def _evidence_windows(items: Sequence[Evidence]) -> list[tuple[datetime, datetim
         for entity in item.entities:
             visit(entity.attributes)
     return list(dict.fromkeys(windows))
+
+
+def _windows_overlap(
+    observed: Sequence[tuple[datetime, datetime]],
+    expected: Sequence[tuple[datetime, datetime]],
+) -> bool:
+    return bool(observed and expected) and any(
+        observed_start <= expected_end and observed_end >= expected_start
+        for observed_start, observed_end in observed
+        for expected_start, expected_end in expected
+    )
 
 
 def _timestamp_inside_window(
@@ -803,6 +891,7 @@ def evaluate_impact_lot_gate(
     evidence: Iterable[Evidence],
     observed_impact_lots: Sequence[str],
     authoritative_conclusion_status: str = CONCLUSION_SUPPORTED,
+    semantic_profile: CandidateSemanticProfile | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate each observed Lot using exposure, excursion, and outcome facts.
 
@@ -829,6 +918,16 @@ def evaluate_impact_lot_gate(
             ),
         )
     )
+    normalized_semantic_profile: CandidateSemanticProfile | None = None
+    if semantic_profile is not None:
+        try:
+            normalized_semantic_profile = (
+                semantic_profile
+                if isinstance(semantic_profile, CandidateSemanticProfile)
+                else CandidateSemanticProfile.from_dict(dict(semantic_profile))
+            )
+        except (KeyError, TypeError, ValueError):
+            normalized_semantic_profile = None
     items = list(
         {
             item.evidence_id: item
@@ -841,8 +940,45 @@ def evaluate_impact_lot_gate(
         for item in items
         if item.evidence_type == EvidenceType.DATA_MISSING.value
         and item.source_type in _IMPACT_SCOPE_SOURCE_TYPES
-        and _compatible_with_candidate(item, normalized)
+        and _compatible_with_candidate(
+            item,
+            normalized,
+            normalized_semantic_profile,
+        )
     ]
+    broad_shared_scope = bool(
+        normalized_semantic_profile is not None
+        and normalized_semantic_profile.scope_relation
+        == CandidateScopeRelation.SHARED_EFFECT.value
+        and normalized_semantic_profile.claimed_scope_kind
+        in {
+            CandidateClaimedScopeKind.CHAMBER.value,
+            CandidateClaimedScopeKind.EQUIPMENT.value,
+            CandidateClaimedScopeKind.OPERATION.value,
+        }
+    )
+    declared_scope_process = [
+        item
+        for item in items
+        if item.evidence_type in _PROCESS_TYPES
+        and _compatible_with_candidate(
+            item,
+            normalized,
+            normalized_semantic_profile,
+        )
+    ]
+    declared_excursion_windows = _evidence_windows(
+        [
+            item
+            for item in items
+            if item.evidence_type == EvidenceType.EXCURSION_WINDOW.value
+            and _compatible_with_candidate(
+                item,
+                normalized,
+                normalized_semantic_profile,
+            )
+        ]
+    )
     rows: list[dict[str, Any]] = []
     for raw_lot in observed_impact_lots:
         lot_id = str(raw_lot)
@@ -869,14 +1005,32 @@ def evaluate_impact_lot_gate(
             item
             for item in lot_items
             if item.evidence_type in _EXPOSURE_TYPES
-            and _compatible_with_candidate(item, normalized)
+            and _compatible_with_candidate(
+                item,
+                normalized,
+                normalized_semantic_profile,
+            )
         ]
-        process = [
+        lot_process = [
             item
             for item in lot_items
             if item.evidence_type in _PROCESS_TYPES
-            and _compatible_with_candidate(item, normalized)
+            and _compatible_with_candidate(
+                item,
+                normalized,
+                normalized_semantic_profile,
+            )
         ]
+        process = (
+            list(
+                {
+                    item.evidence_id: item
+                    for item in [*lot_process, *declared_scope_process]
+                }.values()
+            )
+            if broad_shared_scope
+            else lot_process
+        )
         outcomes = [item for item in lot_items if item.evidence_type in _OUTCOME_TYPES]
         candidate_parameters = {
             value
@@ -900,11 +1054,22 @@ def evaluate_impact_lot_gate(
         process_recipes = {
             value for item in process for value in _typed_values(item, EntityType.RECIPE.value)
         }
-        recipe_consistent = not (exposure_recipes or process_recipes) or bool(
+        recipe_consistent = (
+            broad_shared_scope
+            and normalized_semantic_profile is not None
+            and normalized_semantic_profile.claimed_recipe is None
+        ) or not (exposure_recipes or process_recipes) or bool(
             {_compact(value) for value in exposure_recipes}
             & {_compact(value) for value in process_recipes}
         )
-        windows = _evidence_windows([*exposure, *process])
+        windows = declared_excursion_windows or _evidence_windows(
+            [*exposure, *process]
+        )
+        exposure_windows = _evidence_windows(exposure)
+        exposure_time_consistent = _windows_overlap(exposure_windows, windows) or any(
+            _timestamp_inside_window((item,), windows)
+            for item in exposure
+        )
         time_consistent = _timestamp_inside_window(process, windows)
         candidate_direction = _candidate_direction(normalized)
         evidence_directions = _evidence_directions(process)
@@ -914,6 +1079,9 @@ def evaluate_impact_lot_gate(
             or candidate_direction in evidence_directions
         )
         supporting = [*exposure, *process, *compatible_outcomes]
+        parameter_scope_projection_used = bool(
+            broad_shared_scope and not lot_process and process
+        )
         scope_checks = {
             "exposure": bool(exposure),
             "excursion": bool(process),
@@ -924,6 +1092,7 @@ def evaluate_impact_lot_gate(
             "parameter": bool(candidate_parameters),
             "parameter_direction": direction_consistent,
             "excursion_window": bool(windows),
+            "exposure_temporal": exposure_time_consistent,
             "temporal": time_consistent,
             "outcome": bool(compatible_outcomes),
         }
@@ -959,6 +1128,9 @@ def evaluate_impact_lot_gate(
                     "non_blocking_data_missing_evidence_ids": [
                         item.evidence_id for item in non_blocking_data_missing
                     ],
+                    "parameter_scope_projection_used": (
+                        parameter_scope_projection_used
+                    ),
                     "checks": checks,
                 }
             )
@@ -988,6 +1160,9 @@ def evaluate_impact_lot_gate(
                     "non_blocking_data_missing_evidence_ids": [
                         item.evidence_id for item in non_blocking_data_missing
                     ],
+                    "parameter_scope_projection_used": (
+                        parameter_scope_projection_used
+                    ),
                     "checks": checks,
                 }
             )
@@ -1036,6 +1211,21 @@ def evaluate_impact_lot_gate(
     return {
         "source_lot_id": source_lot_id,
         "candidate_root_cause": normalized.root_cause,
+        "candidate_semantic_scope": (
+            {
+                "scope_kind": normalized_semantic_profile.claimed_scope_kind,
+                "scope_relation": normalized_semantic_profile.scope_relation,
+                "operation": normalized_semantic_profile.claimed_operation,
+                "equipment": normalized_semantic_profile.claimed_equipment,
+                "chamber": normalized_semantic_profile.claimed_chamber,
+                "recipe": normalized_semantic_profile.claimed_recipe,
+                "claimed_lane_ids": list(
+                    normalized_semantic_profile.claimed_lane_ids
+                ),
+            }
+            if normalized_semantic_profile is not None
+            else None
+        ),
         "authoritative_conclusion_status": authoritative_conclusion_status,
         "scope_status": scope_status,
         "candidate_scope_status": scope_status,

@@ -94,6 +94,13 @@ _METADATA_ALLOWLIST = frozenset(
         "target_row_count",
         "unit",
         "validation_status",
+        "causal_role",
+        "mechanism_role",
+        "mechanism_intermediate",
+        "causal_role_provenance",
+        "observation_role",
+        "observation_role_provenance",
+        "causal_status",
     }
 )
 _ENTITY_ATTRIBUTE_ALLOWLIST = frozenset(
@@ -267,6 +274,13 @@ def compact_evidence_prompt_card(item: Evidence) -> dict[str, Any]:
         "outcome_name",
         "validation_status",
         "required_for_confirmation",
+        "causal_role",
+        "mechanism_role",
+        "mechanism_intermediate",
+        "causal_role_provenance",
+        "observation_role",
+        "observation_role_provenance",
+        "causal_status",
     )
     details = {
         key: _bounded_value(item.metadata[key])

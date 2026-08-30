@@ -358,11 +358,120 @@ def build_causal_evidence_gaps(
 
     gaps: list[dict[str, Any]] = []
     for candidate_index, matrix in enumerate(matrices):
+        scope_result = matrix.claims.get(CausalClaim.SCOPE.value)
+        scope_facts = scope_result.facts if scope_result is not None else {}
+        lane_contexts = scope_facts.get("scope_lane_contexts", {})
+        if not isinstance(lane_contexts, Mapping):
+            lane_contexts = {}
+        coverage_gap_count = 0
+        coverage_specs = (
+            (
+                "scope_missing_process_lane_ids",
+                "parameter_anomaly",
+                ActionKind.INSPECT_FDC_SPC.value,
+                "process_anomaly",
+                _EVIDENCE_TYPES_BY_GROUP["process_anomaly"],
+                0.8,
+            ),
+            (
+                "scope_missing_outcome_lane_ids",
+                "product_outcome",
+                ActionKind.VALIDATE_SHARED_DEFECT_PATTERN.value,
+                "shared_product_signal",
+                _EVIDENCE_TYPES_BY_GROUP["shared_product_signal"],
+                0.75,
+            ),
+        )
+        for (
+            missing_field,
+            discriminator_kind,
+            preferred_action,
+            required_group,
+            expected_evidence_types,
+            information_gain,
+        ) in coverage_specs:
+            raw_missing_lane_ids = scope_facts.get(missing_field, [])
+            if not isinstance(raw_missing_lane_ids, list | tuple):
+                continue
+            for raw_lane_id in raw_missing_lane_ids:
+                lane_id = str(raw_lane_id).strip()
+                raw_context = lane_contexts.get(lane_id, {})
+                lane_context = (
+                    dict(raw_context)
+                    if isinstance(raw_context, Mapping)
+                    else {}
+                )
+                target_scope = {
+                    key: value
+                    for key, value in lane_context.items()
+                    if key
+                    in {
+                        "lane_id",
+                        "operation",
+                        "equipment",
+                        "chamber",
+                        "recipe",
+                        "parameters",
+                        "window_start",
+                        "window_end",
+                    }
+                    and value not in (None, "", [], ())
+                }
+                if not lane_id or not target_scope:
+                    continue
+                lane_token = hashlib.sha256(
+                    lane_id.encode("utf-8")
+                ).hexdigest()[:12]
+                gaps.append(
+                    {
+                        "gap_id": (
+                            f"candidate_{candidate_index}.scope_coverage."
+                            f"{discriminator_kind}.{lane_token}"
+                        ),
+                        "gap_type": "missing_support",
+                        "gap_origin": "scope_coverage",
+                        "priority": 2,
+                        "information_gain": information_gain,
+                        "candidate_index": candidate_index,
+                        "claim": CausalClaim.SCOPE.value,
+                        "status": "incomplete",
+                        "reason": (
+                            "The declared broad shared-effect scope lacks "
+                            f"{discriminator_kind} Evidence for Lane {lane_id}."
+                        ),
+                        "question_kind": "process_mechanism",
+                        "allowed_actions": [
+                            preferred_action,
+                            ActionKind.RUN_RCA_REASONING.value,
+                        ],
+                        "preferred_action": preferred_action,
+                        "required_evidence_groups": [required_group],
+                        "expected_evidence_types": list(
+                            expected_evidence_types
+                        ),
+                        "target_scope": target_scope,
+                        "discriminator_kind": discriminator_kind,
+                        "decision_impact": "confirmation",
+                        "can_change_ranking": False,
+                        "evidence_ids": (
+                            list(scope_result.evidence_ids)
+                            if scope_result is not None
+                            else []
+                        ),
+                        "data_missing_evidence_ids": [],
+                        "unavailable_sources": [],
+                    }
+                )
+                coverage_gap_count += 1
         for claim, result in matrix.claims.items():
             if claim == CausalClaim.CONTROL.value:
                 # Controls are informative, not a mandatory investigation gap.
                 continue
             if result.status == "supported":
+                continue
+            if claim == CausalClaim.SCOPE.value and coverage_gap_count:
+                # Concrete per-Lane coverage Gaps replace an unscoped generic
+                # scope Gap for this Candidate.
                 continue
             question_kind = _CLAIM_TO_QUESTION.get(claim, "process_mechanism")
             definition = QUESTION_CAPABILITY_REGISTRY[question_kind]

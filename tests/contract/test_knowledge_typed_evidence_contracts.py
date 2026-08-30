@@ -157,7 +157,7 @@ class KnowledgeTypedEvidenceContractTest(unittest.TestCase):
             )
         )
 
-    def test_unconfirmed_case_is_data_missing_not_historical_match(self) -> None:
+    def test_available_source_without_confirmed_match_is_negative_signal(self) -> None:
         output = RetrieveSimilarCaseTool(UnconfirmedKnowledgeRepository()).run(
             knowledge_input(
                 "REQ_TYPED_KNOWLEDGE_UNCONFIRMED",
@@ -168,7 +168,9 @@ class KnowledgeTypedEvidenceContractTest(unittest.TestCase):
 
         self.assert_typed_knowledge_output(output)
         evidence = output.evidence[0]
-        self.assertEqual(evidence.evidence_type, EvidenceType.DATA_MISSING.value)
+        self.assertEqual(evidence.evidence_type, EvidenceType.NEGATIVE_SIGNAL.value)
+        self.assertEqual(evidence.metadata["retrieval_status"], "no_match")
+        self.assertIs(evidence.metadata["source_available"], True)
         self.assertEqual(output.data["cases"], [])
         self.assertIsNone(output.data["top_case"])
         self.assertIn(

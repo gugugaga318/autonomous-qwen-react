@@ -1480,6 +1480,11 @@ class QwenNextActionPlanner:
             and isinstance(authoritative_finding.details.get("candidate_challenges", []), list)
             else []
         )
+        candidate_competition_failed = (
+            authoritative_finding is not None
+            and str(authoritative_finding.details.get("competition_status", ""))
+            == "failed"
+        )
         self._validate_runtime_inputs(
             goal=goal,
             questions=questions,
@@ -1604,6 +1609,22 @@ class QwenNextActionPlanner:
                 action_kind: target_ids
                 for action_kind, target_ids in legal_action_targets.items()
                 if action_kind in causal_gap_ids_by_action
+            }
+        if (
+            candidate_competition_failed
+            and not causal_gap_ids_by_action.get(
+                ActionKind.RUN_RCA_REASONING.value,
+            )
+        ):
+            # A Candidate-provider/validation failure is not itself new
+            # ranking Evidence.  The broad Question capability can otherwise
+            # re-advertise generic RCA Reasoning with the exact scope that just
+            # failed.  Only a Python-owned, high-value causal Gap may authorize
+            # a bounded competition-repair round.
+            legal_action_targets = {
+                action_kind: target_ids
+                for action_kind, target_ids in legal_action_targets.items()
+                if action_kind != ActionKind.RUN_RCA_REASONING.value
             }
         executable_discrimination_gap = (
             _has_executable_hypothesis_discrimination_gap(
@@ -1748,11 +1769,6 @@ class QwenNextActionPlanner:
             critical_contradictions=contradictions,
         )
         active_causal_gaps = _active_causal_gaps(causal_gaps)
-        candidate_competition_failed = (
-            authoritative_finding is not None
-            and str(authoritative_finding.details.get("competition_status", ""))
-            == "failed"
-        )
         bounded_causal_investigation = any(
             gap.get("challenge_selected") is True
             or bool(gap.get("target_scope"))
@@ -1802,6 +1818,11 @@ class QwenNextActionPlanner:
         if (
             candidate_competition_failed
             and set(legal_action_targets) == {ActionKind.RUN_RCA_REASONING.value}
+            and bool(
+                causal_gap_ids_by_action.get(
+                    ActionKind.RUN_RCA_REASONING.value,
+                )
+            )
         ):
             action_kind = ActionKind.RUN_RCA_REASONING.value
             definition = self.registry[action_kind]

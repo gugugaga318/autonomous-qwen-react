@@ -110,6 +110,58 @@ def _evidence_id(prefix: str, value: str) -> str:
     return f"{prefix}_{normalized or 'UNKNOWN'}"
 
 
+_MECHANISM_INTERMEDIATE_ROLES = {
+    "mechanism_intermediate",
+    "physical_intermediate",
+}
+
+
+def _explicit_mechanism_intermediate_metadata(
+    rows: list[Row],
+    *,
+    source_table: str,
+) -> dict[str, Any]:
+    """Propagate only source-declared physical intermediates.
+
+    A defect code, metric name, pattern, or model-authored explanation is never
+    interpreted here.  Aggregated Evidence receives a causal role only when
+    every contributing source row explicitly carries the same accepted role.
+    """
+
+    if not rows:
+        return {}
+    roles: list[str] = []
+    source_fields: set[str] = set()
+    for row in rows:
+        role = ""
+        for field_name in ("causal_role", "mechanism_role"):
+            raw_value = str(row.get(field_name, "")).strip().casefold()
+            if raw_value:
+                role = raw_value
+                source_fields.add(field_name)
+                break
+        if not role and str(row.get("mechanism_intermediate", "")).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            role = "mechanism_intermediate"
+            source_fields.add("mechanism_intermediate")
+        if role not in _MECHANISM_INTERMEDIATE_ROLES:
+            return {}
+        roles.append(role)
+    if len(set(roles)) != 1:
+        return {}
+    return {
+        "causal_role": roles[0],
+        "causal_role_provenance": {
+            "source_table": source_table,
+            "source_fields": sorted(source_fields),
+            "source_row_count": len(rows),
+        },
+    }
+
+
 def _shared_exposure_lanes(
     process_rows: list[Row],
     lot_ids: list[str],
@@ -1740,6 +1792,7 @@ class AnalyzeParameterShiftTool(BaseTool):
         operation_no = str(tool_input.parameters.get("operation_no", "6400"))
         equipment_id = tool_input.parameters.get("equipment_id")
         chamber_id = tool_input.parameters.get("chamber_id")
+        recipe_id = str(tool_input.parameters.get("recipe_id", "")).strip()
 
         rows = [
             row
@@ -1750,6 +1803,8 @@ class AnalyzeParameterShiftTool(BaseTool):
             rows = [row for row in rows if row["equipment_id"] == equipment_id]
         if chamber_id:
             rows = [row for row in rows if row["chamber_id"] == chamber_id]
+        if recipe_id:
+            rows = [row for row in rows if row["recipe_id"] == recipe_id]
 
         by_parameter: dict[str, list[Row]] = defaultdict(list)
         for row in rows:
@@ -1788,13 +1843,28 @@ class AnalyzeParameterShiftTool(BaseTool):
                 for row in parameter_rows
                 if row["ooc_flag"] == "true" or row["severity"] != "NORMAL"
             ]
+            # A positive parameter-deviation Evidence item may only carry the
+            # rows that actually establish the deviation.  Attaching every
+            # queried Lot here would turn normal exposure controls into false
+            # positive process Evidence.  Negative-signal Evidence retains the
+            # complete queried row set because those rows are the observation.
+            evidence_rows = abnormal_rows or parameter_rows
+            evidence_avg_observed = sum(
+                _float(row["observed_value"]) for row in evidence_rows
+            ) / len(evidence_rows)
+            evidence_avg_baseline = sum(
+                _float(row["baseline_value"]) for row in evidence_rows
+            ) / len(evidence_rows)
+            evidence_avg_delta = sum(
+                _float(row["delta_percent"]) for row in evidence_rows
+            ) / len(evidence_rows)
             parameter_entities = [
                 *[
                     EvidenceEntity(
                         entity_type=EntityType.LOT.value,
                         entity_id=lot_id,
                     )
-                    for lot_id in sorted({row["lot_id"] for row in parameter_rows})
+                    for lot_id in sorted({row["lot_id"] for row in evidence_rows})
                 ],
                 *[
                     EvidenceEntity(
@@ -1802,7 +1872,7 @@ class AnalyzeParameterShiftTool(BaseTool):
                         entity_id=wafer_id,
                     )
                     for wafer_id in sorted(
-                        {row["wafer_id"] for row in parameter_rows if row["wafer_id"]}
+                        {row["wafer_id"] for row in evidence_rows if row["wafer_id"]}
                     )
                 ],
                 EvidenceEntity(
@@ -1814,14 +1884,14 @@ class AnalyzeParameterShiftTool(BaseTool):
                         entity_type=EntityType.EQUIPMENT.value,
                         entity_id=value,
                     )
-                    for value in sorted({row["equipment_id"] for row in parameter_rows})
+                    for value in sorted({row["equipment_id"] for row in evidence_rows})
                 ],
                 *[
                     EvidenceEntity(
                         entity_type=EntityType.CHAMBER.value,
                         entity_id=value,
                     )
-                    for value in sorted({row["chamber_id"] for row in parameter_rows})
+                    for value in sorted({row["chamber_id"] for row in evidence_rows})
                 ],
                 *[
                     EvidenceEntity(
@@ -1834,11 +1904,11 @@ class AnalyzeParameterShiftTool(BaseTool):
                             row["recipe_id"]: sorted(
                                 {
                                     item["recipe_version"]
-                                    for item in parameter_rows
+                                    for item in evidence_rows
                                     if item["recipe_id"] == row["recipe_id"]
                                 }
                             )
-                            for row in parameter_rows
+                            for row in evidence_rows
                             if row["recipe_id"]
                         }.items()
                     )
@@ -1846,12 +1916,13 @@ class AnalyzeParameterShiftTool(BaseTool):
                 EvidenceEntity(
                     entity_type=EntityType.PARAMETER.value,
                     entity_id=parameter_name,
-                    attributes={"unit": parameter_rows[0]["unit"]},
+                    attributes={"unit": evidence_rows[0]["unit"]},
                 ),
             ]
             observation = (
-                f"{parameter_name} average observed {avg_observed:.1f} vs "
-                f"baseline {avg_baseline:.1f}; delta {avg_delta:.1f}% with "
+                f"{parameter_name} average observed {evidence_avg_observed:.1f} vs "
+                f"baseline {evidence_avg_baseline:.1f}; delta "
+                f"{evidence_avg_delta:.1f}% with "
                 f"{len(abnormal_rows)} abnormal feature records."
             )
             evidence.append(
@@ -1873,12 +1944,19 @@ class AnalyzeParameterShiftTool(BaseTool):
                     source_id=f"fdc_feature:{operation_no}:{parameter_name}",
                     source_table="fdc_feature",
                     source_field=parameter_name,
-                    timestamp=max(row["measured_at"] for row in parameter_rows),
+                    timestamp=max(row["measured_at"] for row in evidence_rows),
                     metadata={
                         "operation_no": operation_no,
                         "equipment_id": equipment_id,
                         "chamber_id": chamber_id,
-                        "lot_ids": lot_ids,
+                        "recipe_id": recipe_id or None,
+                        "lot_ids": sorted(
+                            {row["lot_id"] for row in evidence_rows}
+                        ),
+                        "selected_lot_ids": lot_ids,
+                        "abnormal_lot_ids": sorted(
+                            {row["lot_id"] for row in abnormal_rows}
+                        ),
                         "ooc_count": ooc_count,
                         "abnormal_row_count": len(abnormal_rows),
                     },
@@ -1935,6 +2013,7 @@ class AnalyzeParameterShiftTool(BaseTool):
                     "operation_no": operation_no,
                     "equipment_id": equipment_id,
                     "chamber_id": chamber_id,
+                    "recipe_id": recipe_id or None,
                     "lot_ids": lot_ids,
                 },
             )
@@ -1956,6 +2035,7 @@ class AnalyzeParameterShiftTool(BaseTool):
                 "operation_no": operation_no,
                 "equipment_id": equipment_id,
                 "chamber_id": chamber_id,
+                "recipe_id": recipe_id or None,
                 "parameter_summary": parameter_summary,
             },
             evidence,
@@ -2059,6 +2139,7 @@ class PerformBasicSpcAnalysisTool(BaseTool):
         operation_no = str(tool_input.parameters.get("operation_no", "6400"))
         equipment_id = str(tool_input.parameters["equipment_id"])
         chamber_id = str(tool_input.parameters["chamber_id"])
+        recipe_id = str(tool_input.parameters.get("recipe_id", "")).strip()
         minimum_samples = int(tool_input.parameters.get("minimum_baseline_samples", 20))
         sigma_multiplier = float(tool_input.parameters.get("sigma_multiplier", 3.0))
         same_side_run_length = int(tool_input.parameters.get("same_side_run_length", 8))
@@ -2078,6 +2159,7 @@ class PerformBasicSpcAnalysisTool(BaseTool):
             and row["operation_no"] == operation_no
             and row["equipment_id"] == equipment_id
             and row["chamber_id"] == chamber_id
+            and (not recipe_id or row["recipe_id"] == recipe_id)
         ]
         by_parameter: dict[str, list[Row]] = defaultdict(list)
         for row in target_rows:
@@ -2296,6 +2378,7 @@ class PerformBasicSpcAnalysisTool(BaseTool):
                     "minimum_baseline_samples": minimum_samples,
                     "insufficient_parameters": insufficient_parameters,
                     "target_row_count": len(target_rows),
+                    "recipe_id": recipe_id or None,
                 },
             )
             evidence.append(status_evidence)
@@ -2323,6 +2406,7 @@ class PerformBasicSpcAnalysisTool(BaseTool):
                 "operation_no": operation_no,
                 "equipment_id": equipment_id,
                 "chamber_id": chamber_id,
+                "recipe_id": recipe_id or None,
                 "method": {
                     "control_limits": f"mean +/- {sigma_multiplier:g} sigma",
                     "minimum_baseline_samples": minimum_samples,
@@ -2431,6 +2515,7 @@ class AnalyzeSpcEvidenceTool(BaseTool):
         operation_no = str(tool_input.parameters.get("operation_no", "6400"))
         equipment_id = str(tool_input.parameters["equipment_id"])
         chamber_id = str(tool_input.parameters["chamber_id"])
+        recipe_id = str(tool_input.parameters.get("recipe_id", "")).strip()
         requested_lot_ids = set(lot_ids)
         scope_rows = self.repository.rows("spc_excursion_lot")
         matching_excursions = {
@@ -2465,6 +2550,7 @@ class AnalyzeSpcEvidenceTool(BaseTool):
             and row["operation_no"] == operation_no
             and row["equipment_id"] == equipment_id
             and row["chamber_id"] == chamber_id
+            and (not recipe_id or row["recipe_id"] == recipe_id)
         ]
         recipe_keys = {(row["recipe_id"], row["recipe_version"]) for row in target_process}
         profiles = [
@@ -2678,7 +2764,10 @@ class AnalyzeSpcEvidenceTool(BaseTool):
                     f"spc_baseline_profile:{operation_no}:{equipment_id}:{chamber_id}:missing"
                 ),
                 source_table="spc_baseline_profile",
-                metadata={"lot_ids": lot_ids},
+                metadata={
+                    "lot_ids": lot_ids,
+                    "recipe_id": recipe_id or None,
+                },
             )
             evidence.append(missing_profile_evidence)
             warnings.append(
@@ -2735,7 +2824,10 @@ class AnalyzeSpcEvidenceTool(BaseTool):
                     f"spc_baseline_profile:{operation_no}:{equipment_id}:{chamber_id}:insufficient"
                 ),
                 source_table="spc_baseline_profile",
-                metadata={"insufficient_parameters": insufficient},
+                metadata={
+                    "insufficient_parameters": insufficient,
+                    "recipe_id": recipe_id or None,
+                },
             )
             evidence.append(insufficient_evidence)
             warnings.append(
@@ -2755,6 +2847,7 @@ class AnalyzeSpcEvidenceTool(BaseTool):
                 "operation_no": operation_no,
                 "equipment_id": equipment_id,
                 "chamber_id": chamber_id,
+                "recipe_id": recipe_id or None,
                 "method": {
                     "engine": "deterministic_advanced_spc",
                     "rules": "Nelson Rules 1-8",
@@ -3190,6 +3283,11 @@ class SummarizeDefectWatTool(BaseTool):
         if defect_rows:
             dominant_defect, dominant_defect_count = defect_counts.most_common(1)[0]
             dominant_pattern = defect_patterns.most_common(1)[0][0]
+            dominant_defect_rows = [
+                row
+                for row in defect_rows
+                if row["defect_type"] == dominant_defect
+            ]
             evidence.append(
                 EvidenceBuilder.from_tool(
                     tool_input=tool_input,
@@ -3206,14 +3304,18 @@ class SummarizeDefectWatTool(BaseTool):
                                 entity_type=EntityType.LOT.value,
                                 entity_id=lot_id,
                             )
-                            for lot_id in sorted({row["lot_id"] for row in defect_rows})
+                            for lot_id in sorted(
+                                {row["lot_id"] for row in dominant_defect_rows}
+                            )
                         ],
                         *[
                             EvidenceEntity(
                                 entity_type=EntityType.WAFER.value,
                                 entity_id=wafer_id,
                             )
-                            for wafer_id in sorted({row["wafer_id"] for row in defect_rows})
+                            for wafer_id in sorted(
+                                {row["wafer_id"] for row in dominant_defect_rows}
+                            )
                         ],
                         EvidenceEntity(
                             entity_type=EntityType.DEFECT.value,
@@ -3224,11 +3326,18 @@ class SummarizeDefectWatTool(BaseTool):
                     confidence=1.0,
                     source_id=f"defect_summary:{evidence_scope}:{','.join(lot_ids)}",
                     source_table="defect_summary",
-                    timestamp=max((row["inspected_at"] for row in defect_rows), default=None),
+                    timestamp=max(
+                        (row["inspected_at"] for row in dominant_defect_rows),
+                        default=None,
+                    ),
                     metadata={
                         "defect_counts": dict(defect_counts),
                         "pattern_counts": dict(defect_patterns),
                         "evidence_scope": evidence_scope,
+                        **_explicit_mechanism_intermediate_metadata(
+                            dominant_defect_rows,
+                            source_table="defect_summary",
+                        ),
                     },
                 )
             )
@@ -3379,6 +3488,10 @@ class SummarizeDefectWatTool(BaseTool):
                 "unit": metric_rows[0]["unit"],
             }
             metrology_summaries.append(summary)
+            # Positive metrology Evidence is scoped only to the rows that are
+            # actually out of specification. Passing rows must not inherit the
+            # positive deviation merely because they were queried together.
+            evidence_rows = failed_rows or metric_rows
             evidence.append(
                 EvidenceBuilder.from_tool(
                     tool_input=tool_input,
@@ -3404,7 +3517,7 @@ class SummarizeDefectWatTool(BaseTool):
                                 entity_type=EntityType.LOT.value,
                                 entity_id=lot_id,
                             )
-                            for lot_id in sorted({row["lot_id"] for row in metric_rows})
+                            for lot_id in sorted({row["lot_id"] for row in evidence_rows})
                         ],
                         *[
                             EvidenceEntity(
@@ -3424,8 +3537,14 @@ class SummarizeDefectWatTool(BaseTool):
                     source_id=f"metrology_result:{stage}:{metric_name}",
                     source_table="metrology_result",
                     source_field="measured_value",
-                    timestamp=max(row["measured_at"] for row in metric_rows),
-                    metadata=summary,
+                    timestamp=max(row["measured_at"] for row in evidence_rows),
+                    metadata={
+                        **summary,
+                        **_explicit_mechanism_intermediate_metadata(
+                            evidence_rows,
+                            source_table="metrology_result",
+                        ),
+                    },
                 )
             )
         has_quality_impact = bool(
@@ -3615,7 +3734,10 @@ class RetrieveSimilarCaseTool(BaseTool):
             missing_evidence = EvidenceBuilder.from_tool(
                 tool_input=tool_input,
                 evidence_id=missing_evidence_id,
-                evidence_type=EvidenceType.DATA_MISSING,
+                # Retrieval completed against an available governed source.
+                # "No confirmed match" is a negative search observation, not
+                # evidence that the source itself was unavailable.
+                evidence_type=EvidenceType.NEGATIVE_SIGNAL,
                 source_type=EvidenceSourceType.KNOWLEDGE,
                 observation="No engineer-confirmed historical RCA case is available.",
                 entities=[
@@ -3631,7 +3753,11 @@ class RetrieveSimilarCaseTool(BaseTool):
                 confidence=1.0,
                 source_id="confirmed_rca_cases",
                 source_table="rca_case",
-                metadata={"validation_status": "CONFIRMED"},
+                metadata={
+                    "validation_status": "CONFIRMED",
+                    "retrieval_status": "no_match",
+                    "source_available": True,
+                },
             )
             return _tool_output(
                 tool_input,

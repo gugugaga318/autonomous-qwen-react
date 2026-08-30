@@ -7,6 +7,7 @@ from typing import Any
 
 from yield_rca_core.evidence_models import (
     EVIDENCE_SCHEMA_VERSION,
+    EntityType,
     Evidence,
     EvidenceEntity,
     EvidenceSourceType,
@@ -68,6 +69,37 @@ class EvidenceBuilder:
         lane_id = tool_input.parameters.get("lane_id")
         if isinstance(lane_id, str) and lane_id.strip():
             resolved_metadata.setdefault("lane_id", lane_id.strip())
+            expected_identity = {
+                EntityType.OPERATION.value: tool_input.parameters.get(
+                    "operation_no",
+                    tool_input.parameters.get("operation"),
+                ),
+                EntityType.EQUIPMENT.value: tool_input.parameters.get(
+                    "equipment_id",
+                    tool_input.parameters.get("equipment"),
+                ),
+                EntityType.CHAMBER.value: tool_input.parameters.get(
+                    "chamber_id",
+                    tool_input.parameters.get("chamber"),
+                ),
+                EntityType.RECIPE.value: tool_input.parameters.get(
+                    "recipe_id",
+                    tool_input.parameters.get("recipe"),
+                ),
+            }
+            for entity_type, raw_expected in expected_identity.items():
+                expected = str(raw_expected or "").strip().casefold()
+                actual = {
+                    entity.entity_id.strip().casefold()
+                    for entity in entities
+                    if entity.entity_type == entity_type
+                }
+                if expected and actual and actual != {expected}:
+                    raise ModelValidationError(
+                        "Lane-bound Evidence identity conflicts with Tool scope: "
+                        f"lane_id={lane_id!r}, entity_type={entity_type!r}, "
+                        f"expected={raw_expected!r}, actual={sorted(actual)!r}"
+                    )
         return Evidence(
             evidence_id=resolved_evidence_id,
             source_type=_enum_string(source_type),

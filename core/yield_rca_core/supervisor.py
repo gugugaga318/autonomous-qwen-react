@@ -39,6 +39,7 @@ from yield_rca_core.causal_scope import explicit_module_limit_requested
 from yield_rca_core.evidence_collection import EvidenceCollection
 from yield_rca_core.evidence_models import Evidence
 from yield_rca_core.improvement_agent import ImprovementAgent
+from yield_rca_core.incident_evidence import build_incident_observation_evidence
 from yield_rca_core.investigation_decision import (
     classify_investigation_gain,
     derive_investigation_gain_history,
@@ -139,19 +140,28 @@ SPECIALIST_TOOL_ALLOWLISTS = {
 }
 
 
-def _initial_context_evidence(job: RCAJob) -> list[Evidence]:
-    if not job.declared_unavailable_sources:
-        return []
-    if job.source_lot_id is None:
+def _initial_context_evidence(
+    job: RCAJob,
+    *,
+    include_incident_observations: bool = False,
+) -> list[Evidence]:
+    if job.declared_unavailable_sources and job.source_lot_id is None:
         raise ModelValidationError(
             "declared unavailable sources require a source Lot"
         )
-    return list(
-        build_declared_unavailable_evidence(
-            job.declared_unavailable_sources,
-            source_lot_id=job.source_lot_id,
+    evidence = (
+        list(
+            build_declared_unavailable_evidence(
+                job.declared_unavailable_sources,
+                source_lot_id=job.source_lot_id,
+            )
         )
+        if job.declared_unavailable_sources and job.source_lot_id is not None
+        else []
     )
+    if include_incident_observations:
+        evidence.extend(build_incident_observation_evidence(job))
+    return evidence
 
 
 def _align_terminal_planner_stop(state: RCAState) -> RCAState:
@@ -1619,7 +1629,10 @@ class Supervisor:
         state = RCAState(
             job=replace(job, status=TaskStatus.RUNNING.value),
             investigation_goal=intent_plan.goal,
-            evidence=_initial_context_evidence(job),
+            evidence=_initial_context_evidence(
+                job,
+                include_incident_observations=True,
+            ),
             capability_notices=list(intent_plan.capability_notices),
             investigation_questions=list(intent_plan.questions),
             execution_metadata={
@@ -2219,6 +2232,7 @@ class Supervisor:
                     "lot_ids": lot_ids,
                     "equipment_id": str(commonality.get("equipment_id", "")),
                     "chamber_id": str(commonality.get("chamber_id", "")),
+                    "recipe_id": str(commonality.get("recipe_id", "")),
                     "operation_no": str(
                         selected_lane.get("operation", "")
                         if selected_lane is not None
