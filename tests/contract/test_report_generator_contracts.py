@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "core"))
 
+from yield_rca_core.authoritative_result import AuthoritativeRCAResult  # noqa: E402
 from yield_rca_core.causal_investigation_models import (  # noqa: E402
     AlternativeSearchStatus,
     CandidateCompetitionStatus,
@@ -296,6 +297,123 @@ class ReportGeneratorContractTest(unittest.TestCase):
         self.assertNotIn(EXPECTED_ROOT_CAUSE, report.markdown)
         self.assertEqual(state.authoritative_rca_finding, current)
         self.assertEqual(state.authoritative_hypothesis, current_hypothesis)
+
+    def test_report_prefers_typed_authority_over_legacy_finding_conclusion(self) -> None:
+        evidence = Evidence(
+            evidence_id="EV_TYPED_AUTHORITY_REPORT",
+            source_type=EvidenceSourceType.ANALYTICS.value,
+            source_id="authority:report",
+            summary="Typed authority evidence for the final report.",
+        )
+        finding = AgentFinding(
+            finding_id="FINDING_LEGACY_AUTHORITY_REPORT",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="Legacy finding retained for audit details.",
+            confidence=0.83,
+            evidence_ids=[evidence.evidence_id],
+            details={
+                "root_cause": "Legacy finding root cause",
+                "status": "supported",
+                "conclusion_status": "supported",
+                "root_cause_evidence_ids": [evidence.evidence_id],
+                "recommended_actions": [],
+                "evidence_chain": [],
+            },
+        )
+        authority = AuthoritativeRCAResult(
+            result_id="RCA_RESULT_REPORT",
+            source_finding_id=finding.finding_id,
+            source_hypothesis_id=None,
+            conclusion_status="supported",
+            root_cause_candidate_id="CANDIDATE_TYPED_REPORT",
+            root_cause="Typed authoritative root cause",
+            confirmation_status="supported",
+            competition_status="complete_confirmed",
+            terminal_reason="confirmation_gate_supported_unique_candidate",
+            evidence_refs=(evidence.evidence_id,),
+        )
+        state = RCAState(
+            job=RCAJob(job_id="JOB_TYPED_AUTHORITY_REPORT", user_query="Render authority."),
+            affected_lots=["LOT_A_001"],
+            evidence=[evidence],
+            findings=[finding],
+            authoritative_rca_finding_id=finding.finding_id,
+            authoritative_rca_result=authority,
+        )
+
+        report = ReportGenerator().generate(state)
+
+        self.assertIn("- Root Cause: **Typed authoritative root cause**", report.markdown)
+        self.assertNotIn("- Root Cause: **Legacy finding root cause**", report.markdown)
+        self.assertIn("- Confirmation Status: `supported`", report.markdown)
+        self.assertIn("- Competition Status: `complete_confirmed`", report.markdown)
+        self.assertIn(
+            "- Terminal Reason: `confirmation_gate_supported_unique_candidate`",
+            report.markdown,
+        )
+
+    def test_report_does_not_publish_legacy_root_for_inconclusive_authority(self) -> None:
+        evidence = Evidence(
+            evidence_id="EV_INCONCLUSIVE_AUTHORITY_REPORT",
+            source_type=EvidenceSourceType.ANALYTICS.value,
+            source_id="authority:inconclusive-report",
+            summary="Evidence remains auditable without a publishable root cause.",
+        )
+        finding = AgentFinding(
+            finding_id="FINDING_STALE_SUPPORTED_REPORT",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="Historical finding predating terminal authority.",
+            confidence=0.79,
+            evidence_ids=[evidence.evidence_id],
+            details={
+                "root_cause": "Stale supported root cause",
+                "status": "supported",
+                "conclusion_status": "supported",
+                "root_cause_evidence_ids": [evidence.evidence_id],
+                "recommended_actions": [
+                    {
+                        "action": "Apply stale legacy recommendation.",
+                        "evidence_ids": [evidence.evidence_id],
+                    }
+                ],
+                "evidence_chain": [
+                    {
+                        "stage": "rca_reasoning",
+                        "claim": "Stale legacy evidence chain.",
+                        "confidence": 0.79,
+                        "evidence_ids": [evidence.evidence_id],
+                    }
+                ],
+            },
+        )
+        authority = AuthoritativeRCAResult(
+            result_id="RCA_RESULT_INCONCLUSIVE_REPORT",
+            source_finding_id=None,
+            source_hypothesis_id=None,
+            conclusion_status="inconclusive",
+            root_cause_candidate_id=None,
+            root_cause=None,
+            confirmation_status="inconclusive",
+            competition_status="exhausted",
+            terminal_reason="no_high_value_action_remains",
+            evidence_refs=(evidence.evidence_id,),
+        )
+        state = RCAState(
+            job=RCAJob(job_id="JOB_INCONCLUSIVE_REPORT", user_query="Withhold root cause."),
+            affected_lots=["LOT_A_001"],
+            evidence=[evidence],
+            findings=[finding],
+            authoritative_rca_finding_id=finding.finding_id,
+            authoritative_rca_result=authority,
+        )
+
+        report = ReportGenerator().generate(state)
+
+        self.assertIn("- Conclusion Status: `inconclusive`", report.markdown)
+        self.assertIn("- Root Cause: Not published by authoritative result.", report.markdown)
+        self.assertNotIn("- Root Cause: **Stale supported root cause**", report.markdown)
+        self.assertNotIn("Apply stale legacy recommendation.", report.markdown)
+        self.assertNotIn("Stale legacy evidence chain.", report.markdown)
 
     def test_report_exposes_candidate_competition_state_and_lineage(self) -> None:
         state = replace(

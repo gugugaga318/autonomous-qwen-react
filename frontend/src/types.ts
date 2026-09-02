@@ -406,9 +406,37 @@ export interface AlternativeLaneResolutionTrace {
   reason: string;
 }
 
+export interface AuthoritativeRCAResult {
+  result_id: string;
+  source_finding_id: string | null;
+  source_hypothesis_id: string | null;
+  conclusion_status: "supported" | "inconclusive" | "insufficient_evidence";
+  root_cause_candidate_id: string | null;
+  root_cause: string | null;
+  confirmation_status: string;
+  competition_status: string;
+  terminal_reason: string;
+  evidence_refs: string[];
+  schema_version: string;
+}
+
+export interface ImpactPublicationResult {
+  rca_result_id: string;
+  publication_status: "confirmed" | "withheld" | "unconfirmed" | "not_evaluated";
+  confirmed_impact_lots: string[];
+  evidence_refs: string[];
+  schema_version: string;
+}
+
 export interface RcaDiagnosisTrace {
-  finding_id: string;
+  finding_id: string | null;
+  result_id?: string | null;
   conclusion_status: string;
+  root_cause_candidate_id?: string | null;
+  confirmation_status?: string | null;
+  competition_status?: string | null;
+  terminal_reason?: string | null;
+  evidence_refs?: string[];
   causal_chain_completeness?: string | null;
   data_missing_evidence_ids?: string[];
   root_cause: string | null;
@@ -443,6 +471,8 @@ export interface RcaDiagnosisTrace {
     candidate_scopes?: CandidateImpactScopeTrace[];
     rows?: ImpactLotGateRow[];
   };
+  publication_status?: string | null;
+  confirmed_impact_lots?: string[];
 }
 
 export interface Hypothesis {
@@ -593,6 +623,8 @@ export interface RCAState {
   question_update_reviews?: QuestionUpdateReview[];
   authoritative_rca_finding_id?: string | null;
   authoritative_hypothesis_id?: string | null;
+  authoritative_rca_result?: AuthoritativeRCAResult | null;
+  impact_publication_result?: ImpactPublicationResult | null;
   rca_diagnosis?: RcaDiagnosisTrace | null;
   run_evaluation?: RunEvaluation | null;
   goal_status?: GoalStatus | null;

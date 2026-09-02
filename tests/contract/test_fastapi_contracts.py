@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(ROOT / "backend"))
 
-from yield_rca_api.app import create_app  # noqa: E402
+from yield_rca_api.app import _state_api_payload, create_app  # noqa: E402
 from yield_rca_api.schemas import (  # noqa: E402
     CreateRCAJobRequest,
     DecisionEvaluationResponse,
@@ -19,6 +19,17 @@ from yield_rca_api.schemas import (  # noqa: E402
     RcaDiagnosisResponse,
     RCAJobStateResponse,
     RunEvaluationResponse,
+)
+from yield_rca_core.authoritative_result import (  # noqa: E402
+    AuthoritativeRCAResult,
+    ImpactPublicationResult,
+)
+from yield_rca_core.evidence_models import Evidence, EvidenceSourceType  # noqa: E402
+from yield_rca_core.models import (  # noqa: E402
+    AgentFinding,
+    AgentKind,
+    RCAJob,
+    RCAState,
 )
 
 
@@ -316,6 +327,126 @@ class FastAPIContractTest(unittest.TestCase):
             "RcaDiagnosisResponse",
             str(components["RCAJobStateResponse"]["properties"]["rca_diagnosis"]),
         )
+
+    def test_job_state_projects_populated_typed_authority_without_legacy_finding(
+        self,
+    ) -> None:
+        evidence = Evidence(
+            evidence_id="EV_API_AUTHORITY",
+            source_type=EvidenceSourceType.ANALYTICS.value,
+            source_id="authority:api",
+            summary="Evidence for the typed API authority projection.",
+        )
+        authority = AuthoritativeRCAResult(
+            result_id="RCA_RESULT_API",
+            source_finding_id=None,
+            source_hypothesis_id=None,
+            conclusion_status="supported",
+            root_cause_candidate_id="CANDIDATE_API",
+            root_cause="Typed API root cause",
+            confirmation_status="supported",
+            competition_status="not_required",
+            terminal_reason="candidate_competition_not_required",
+            evidence_refs=(evidence.evidence_id,),
+        )
+        publication = ImpactPublicationResult(
+            rca_result_id=authority.result_id,
+            publication_status="confirmed",
+            confirmed_impact_lots=("LOT_IMPACT_API",),
+            evidence_refs=(evidence.evidence_id,),
+        )
+        state = RCAState(
+            job=RCAJob(job_id="JOB_API_AUTHORITY", user_query="Project typed authority."),
+            evidence=[evidence],
+            authoritative_rca_result=authority,
+            impact_publication_result=publication,
+        )
+
+        response = RCAJobStateResponse.model_validate(_state_api_payload(state))
+
+        self.assertEqual(response.authoritative_rca_result.result_id, authority.result_id)
+        self.assertEqual(
+            response.impact_publication_result.confirmed_impact_lots,
+            ["LOT_IMPACT_API"],
+        )
+        self.assertIsNotNone(response.rca_diagnosis)
+        self.assertIsNone(response.rca_diagnosis.finding_id)
+        self.assertEqual(response.rca_diagnosis.result_id, authority.result_id)
+        self.assertEqual(response.rca_diagnosis.root_cause, authority.root_cause)
+        self.assertEqual(response.rca_diagnosis.conclusion_status, "supported")
+        self.assertEqual(response.rca_diagnosis.publication_status, "confirmed")
+        self.assertEqual(response.rca_diagnosis.confirmed_impact_lots, ["LOT_IMPACT_API"])
+
+        components = create_app().openapi()["components"]["schemas"]
+        state_properties = components["RCAJobStateResponse"]["properties"]
+        self.assertIn("authoritative_rca_result", state_properties)
+        self.assertIn("impact_publication_result", state_properties)
+
+    def test_typed_authority_without_source_does_not_project_stale_finding_details(
+        self,
+    ) -> None:
+        evidence = Evidence(
+            evidence_id="EV_API_STALE_FINDING",
+            source_type=EvidenceSourceType.ANALYTICS.value,
+            source_id="authority:api-stale-finding",
+            summary="Evidence retained by a stale legacy Finding.",
+        )
+        stale_finding = AgentFinding(
+            finding_id="FINDING_API_STALE",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="Stale Finding retained for audit history.",
+            confidence=0.8,
+            evidence_ids=[evidence.evidence_id],
+            details={
+                "root_cause": "Stale API root cause",
+                "conclusion_status": "supported",
+                "ranked_candidates": [{"root_cause": "Stale API candidate"}],
+                "confirmation_gate": {"status": "supported"},
+                "impact_lot_gate": {
+                    "publication_status": "confirmed",
+                    "confirmed_impact_lots": ["LOT_STALE_API"],
+                },
+            },
+        )
+        authority = AuthoritativeRCAResult(
+            result_id="RCA_RESULT_API_WITHOUT_SOURCE",
+            source_finding_id=None,
+            source_hypothesis_id=None,
+            conclusion_status="inconclusive",
+            root_cause_candidate_id=None,
+            root_cause=None,
+            confirmation_status="inconclusive",
+            competition_status="exhausted",
+            terminal_reason="no_high_value_action_remains",
+            evidence_refs=(evidence.evidence_id,),
+        )
+        state = RCAState(
+            job=RCAJob(job_id="JOB_API_STALE_FINDING", user_query="Project typed authority."),
+            evidence=[evidence],
+            findings=[stale_finding],
+            authoritative_rca_finding_id=stale_finding.finding_id,
+            authoritative_rca_result=authority,
+        )
+
+        response = RCAJobStateResponse.model_validate(_state_api_payload(state))
+
+        self.assertIsNotNone(response.rca_diagnosis)
+        self.assertIsNone(response.rca_diagnosis.finding_id)
+        self.assertIsNone(response.rca_diagnosis.root_cause)
+        self.assertEqual(response.rca_diagnosis.ranked_candidates, [])
+        self.assertEqual(response.rca_diagnosis.confirmation_gate, {})
+        self.assertEqual(response.rca_diagnosis.impact_lot_gate, {})
+        self.assertEqual(response.rca_diagnosis.confirmed_impact_lots, [])
+
+    def test_legacy_api_state_keeps_new_authority_fields_optional(self) -> None:
+        response = RCAJobStateResponse.model_validate(
+            RCAState(
+                job=RCAJob(job_id="JOB_API_LEGACY", user_query="Project legacy State.")
+            ).to_dict()
+        )
+
+        self.assertIsNone(response.authoritative_rca_result)
+        self.assertIsNone(response.impact_publication_result)
 
 
 if __name__ == "__main__":

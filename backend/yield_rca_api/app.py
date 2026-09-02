@@ -174,15 +174,69 @@ def _state_api_payload(state: RCAState) -> dict[str, object]:
                 definition.allowed_actions if definition is not None else ()
             )
             question["evidence_links"] = question_links
-    finding = state.authoritative_rca_finding
-    if finding is not None:
-        details = finding.details
+    authoritative_result = state.authoritative_rca_result
+    impact_publication = state.impact_publication_result
+    if authoritative_result is not None:
+        finding = (
+            next(
+                (
+                    item
+                    for item in state.findings
+                    if item.finding_id == authoritative_result.source_finding_id
+                ),
+                None,
+            )
+            if authoritative_result.source_finding_id is not None
+            else None
+        )
+    else:
+        finding = state.authoritative_rca_finding
+    if finding is not None or authoritative_result is not None:
+        details = finding.details if finding is not None else {}
         payload["rca_diagnosis"] = {
-            "finding_id": finding.finding_id,
-            "conclusion_status": str(
-                details.get("conclusion_status")
-                or details.get("status")
-                or "inconclusive"
+            "finding_id": (
+                authoritative_result.source_finding_id
+                if authoritative_result is not None
+                else finding.finding_id if finding is not None else None
+            ),
+            "result_id": (
+                authoritative_result.result_id
+                if authoritative_result is not None
+                else None
+            ),
+            "conclusion_status": (
+                authoritative_result.conclusion_status
+                if authoritative_result is not None
+                else str(
+                    details.get("conclusion_status")
+                    or details.get("status")
+                    or "inconclusive"
+                )
+            ),
+            "root_cause_candidate_id": (
+                authoritative_result.root_cause_candidate_id
+                if authoritative_result is not None
+                else None
+            ),
+            "confirmation_status": (
+                authoritative_result.confirmation_status
+                if authoritative_result is not None
+                else None
+            ),
+            "competition_status": (
+                authoritative_result.competition_status
+                if authoritative_result is not None
+                else None
+            ),
+            "terminal_reason": (
+                authoritative_result.terminal_reason
+                if authoritative_result is not None
+                else None
+            ),
+            "evidence_refs": (
+                list(authoritative_result.evidence_refs)
+                if authoritative_result is not None
+                else []
             ),
             "causal_chain_completeness": (
                 str(details["causal_chain_completeness"])
@@ -195,9 +249,13 @@ def _state_api_payload(state: RCAState) -> dict[str, object]:
                 if isinstance(item, str)
             ],
             "root_cause": (
-                str(details["root_cause"])
-                if details.get("root_cause") is not None
-                else None
+                authoritative_result.root_cause
+                if authoritative_result is not None
+                else (
+                    str(details["root_cause"])
+                    if details.get("root_cause") is not None
+                    else None
+                )
             ),
             "ranked_candidates": [
                 dict(item)
@@ -237,6 +295,16 @@ def _state_api_payload(state: RCAState) -> dict[str, object]:
                 dict(details.get("impact_lot_gate", {}))
                 if isinstance(details.get("impact_lot_gate"), dict)
                 else {}
+            ),
+            "publication_status": (
+                impact_publication.publication_status
+                if impact_publication is not None
+                else None
+            ),
+            "confirmed_impact_lots": (
+                list(impact_publication.confirmed_impact_lots)
+                if impact_publication is not None
+                else []
             ),
         }
     else:

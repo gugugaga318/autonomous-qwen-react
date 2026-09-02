@@ -423,6 +423,78 @@ describe("RCAState display selectors", () => {
     expect(authoritativeRcaDiagnosisFor(state)).toBeUndefined();
   });
 
+  it("projects typed RCA authority without requiring a legacy Finding", () => {
+    const state = stateFixture();
+    state.findings = [];
+    state.authoritative_rca_finding_id = null;
+    state.authoritative_rca_result = {
+      result_id: "RCA_RESULT_TYPED_UI",
+      source_finding_id: null,
+      source_hypothesis_id: null,
+      conclusion_status: "supported",
+      root_cause_candidate_id: "CANDIDATE_TYPED_UI",
+      root_cause: "Typed UI root cause",
+      confirmation_status: "supported",
+      competition_status: "not_required",
+      terminal_reason: "candidate_competition_not_required",
+      evidence_refs: ["EV_TYPED_UI"],
+      schema_version: "1.0",
+    };
+    state.impact_publication_result = {
+      rca_result_id: "RCA_RESULT_TYPED_UI",
+      publication_status: "confirmed",
+      confirmed_impact_lots: ["LOT_TYPED_UI"],
+      evidence_refs: ["EV_TYPED_UI"],
+      schema_version: "1.0",
+    };
+
+    const diagnosis = authoritativeRcaDiagnosisFor(state);
+
+    expect(diagnosis?.finding_id).toBeNull();
+    expect(diagnosis?.result_id).toBe("RCA_RESULT_TYPED_UI");
+    expect(diagnosis?.conclusion_status).toBe("supported");
+    expect(diagnosis?.root_cause).toBe("Typed UI root cause");
+    expect(diagnosis?.impact_lot_gate.publication_status).toBe("confirmed");
+    expect(diagnosis?.impact_lot_gate.confirmed_impact_lots).toEqual(["LOT_TYPED_UI"]);
+  });
+
+  it("does not fall back to a stale Finding when typed authority has no source", () => {
+    const state = stateFixture();
+    const staleFinding = state.findings.find(
+      (finding) => finding.finding_id === "RCA_FINDING",
+    );
+    expect(staleFinding).toBeDefined();
+    staleFinding!.details = {
+      evidence_chain: [
+        {
+          stage: "rca_reasoning",
+          claim: "Stale UI evidence chain.",
+          confidence: 0.8,
+          evidence_ids: ["EV_STALE_UI"],
+        },
+      ],
+      ranked_candidates: [{ root_cause: "Stale UI candidate" }],
+    };
+    state.authoritative_rca_finding_id = staleFinding!.finding_id;
+    state.authoritative_rca_result = {
+      result_id: "RCA_RESULT_UI_WITHOUT_SOURCE",
+      source_finding_id: null,
+      source_hypothesis_id: null,
+      conclusion_status: "inconclusive",
+      root_cause_candidate_id: null,
+      root_cause: null,
+      confirmation_status: "inconclusive",
+      competition_status: "exhausted",
+      terminal_reason: "no_high_value_action_remains",
+      evidence_refs: [],
+      schema_version: "1.0",
+    };
+
+    expect(authoritativeRcaFindingFor(state)).toBeUndefined();
+    expect(getEvidenceChain(state)).toEqual([]);
+    expect(authoritativeRcaDiagnosisFor(state)?.ranked_candidates).toEqual([]);
+  });
+
   it("returns empty display data when optional backend fields are absent", () => {
     const state = stateFixture();
     state.findings = [];

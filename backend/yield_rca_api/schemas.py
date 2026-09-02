@@ -313,6 +313,37 @@ class HypothesisResponse(APIModel):
     schema_version: str | None = None
 
 
+class AuthoritativeRCAResultResponse(APIModel):
+    """Finalized RCA authority projected without reinterpreting legacy fields."""
+
+    result_id: str
+    source_finding_id: str | None = None
+    source_hypothesis_id: str | None = None
+    conclusion_status: Literal["supported", "inconclusive", "insufficient_evidence"]
+    root_cause_candidate_id: str | None = None
+    root_cause: str | None = None
+    confirmation_status: str
+    competition_status: str
+    terminal_reason: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    schema_version: str | None = None
+
+
+class ImpactPublicationResultResponse(APIModel):
+    """Publishable Impact-Lot scope bound to one authoritative RCA result."""
+
+    rca_result_id: str
+    publication_status: Literal[
+        "confirmed",
+        "withheld",
+        "unconfirmed",
+        "not_evaluated",
+    ]
+    confirmed_impact_lots: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    schema_version: str | None = None
+
+
 class RcaDiagnosisResponse(APIModel):
     """Public projection of the Python-owned RCA diagnosis trace.
 
@@ -323,8 +354,14 @@ class RcaDiagnosisResponse(APIModel):
     authoritative Finding themselves.
     """
 
-    finding_id: str
+    finding_id: str | None = None
+    result_id: str | None = None
     conclusion_status: str
+    root_cause_candidate_id: str | None = None
+    confirmation_status: str | None = None
+    competition_status: str | None = None
+    terminal_reason: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
     causal_chain_completeness: str | None = None
     data_missing_evidence_ids: list[str] = Field(default_factory=list)
     root_cause: str | None = None
@@ -337,6 +374,8 @@ class RcaDiagnosisResponse(APIModel):
     competition_trace: dict[str, Any] | None = None
     confirmation_gate: dict[str, Any] = Field(default_factory=dict)
     impact_lot_gate: dict[str, Any] = Field(default_factory=dict)
+    publication_status: str | None = None
+    confirmed_impact_lots: list[str] = Field(default_factory=list)
 
 
 class ReportResponse(APIModel):
@@ -481,6 +520,8 @@ class RCAJobStateResponse(APIModel):
     question_update_reviews: list[QuestionUpdateReviewResponse] = Field(default_factory=list)
     authoritative_rca_finding_id: str | None = None
     authoritative_hypothesis_id: str | None = None
+    authoritative_rca_result: AuthoritativeRCAResultResponse | None = None
+    impact_publication_result: ImpactPublicationResultResponse | None = None
     rca_diagnosis: RcaDiagnosisResponse | None = None
     run_evaluation: RunEvaluationResponse | None = None
     goal_status: str | None = None

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from yield_rca_core.authoritative_result import AuthoritativeRCAResult
 from yield_rca_core.models import (
     AgentFinding,
     AgentKind,
@@ -65,6 +66,18 @@ def _rca_finding(state: RCAState) -> AgentFinding | None:
     # RCA reasoning is iterative.  RCAState owns the explicit authority
     # pointer; historical Findings remain available for the evidence chain
     # and audit but are never treated as the final result.
+    result = state.authoritative_rca_result
+    if result is not None:
+        if result.source_finding_id is None:
+            return None
+        return next(
+            (
+                item
+                for item in state.findings
+                if item.finding_id == result.source_finding_id
+            ),
+            None,
+        )
     return state.authoritative_rca_finding
 
 
@@ -568,10 +581,38 @@ def _spc_section(state: RCAState) -> tuple[list[str], list[str]]:
 
 
 def _root_cause_sections(
+    authoritative_result: AuthoritativeRCAResult | None,
     rca_finding: AgentFinding | None,
 ) -> tuple[list[str], list[str]]:
     lines = ["## Root Cause", ""]
     confidence_lines = ["## Confidence", ""]
+    if authoritative_result is not None:
+        evidence_ids = list(authoritative_result.evidence_refs)
+        root_cause_line = (
+            f"- Root Cause: **{authoritative_result.root_cause}**"
+            if authoritative_result.root_cause is not None
+            else "- Root Cause: Not published by authoritative result."
+        )
+        lines.extend(
+            [
+                f"- RCA Result ID: `{authoritative_result.result_id}`",
+                f"- Status: `{authoritative_result.conclusion_status}`",
+                f"- Conclusion Status: `{authoritative_result.conclusion_status}`",
+                f"- Confirmation Status: `{authoritative_result.confirmation_status}`",
+                f"- Competition Status: `{authoritative_result.competition_status}`",
+                f"- Terminal Reason: `{authoritative_result.terminal_reason}`",
+                root_cause_line,
+                f"- Evidence: {_format_evidence_ids(evidence_ids)}",
+            ]
+        )
+        confidence_lines.extend(
+            [
+                "- Confidence: Not represented in AuthoritativeRCAResult.",
+                f"- Evidence: {_format_evidence_ids(evidence_ids)}",
+            ]
+        )
+        return lines + [""] + confidence_lines, evidence_ids
+
     if rca_finding is None:
         lines.extend(
             [
@@ -949,7 +990,7 @@ class ReportGenerator:
             generated_warnings.append(
                 ("WARN_REPORT_NO_AFFECTED_LOTS", "Affected lots are not available in RCAState.")
             )
-        if rca_finding is None:
+        if rca_finding is None and state.authoritative_rca_result is None:
             generated_warnings.append(
                 ("WARN_REPORT_NO_RCA_RESULT", "RCA reasoning result is not available in RCAState.")
             )
@@ -988,7 +1029,10 @@ class ReportGenerator:
         sections.append(chain_section)
         spc_section, spc_citations = _spc_section(state)
         sections.append(spc_section)
-        root_sections, root_citations = _root_cause_sections(rca_finding)
+        root_sections, root_citations = _root_cause_sections(
+            state.authoritative_rca_result,
+            rca_finding,
+        )
         sections.append(root_sections)
         competition_section = _competition_section(state)
         if competition_section:
