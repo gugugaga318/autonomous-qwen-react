@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -13,6 +14,7 @@ from yield_rca_core.causal_adversarial import (
 from yield_rca_core.causal_chain import build_declared_unavailable_evidence
 from yield_rca_core.causal_competition import select_diverse_lane_ids
 from yield_rca_core.causal_investigation_models import (
+    ActionValueAssessment,
     AlternativeLaneResolution,
     AlternativeLaneResolutionStatus,
     AlternativeSearchStatus,
@@ -79,7 +81,6 @@ from yield_rca_core.models import (
     AgentTask,
     FindingKind,
     Hypothesis,
-    HypothesisStatus,
     InvestigationMode,
     LotDrivenRCAError,
     ModelValidationError,
@@ -93,6 +94,13 @@ from yield_rca_core.next_action_planner import (
     LLM_REACT_EXECUTABLE_ACTION_KINDS,
     QwenNextActionPlanner,
     QwenNextActionPlannerError,
+)
+from yield_rca_core.planner_interface import (
+    PROVENANCE_LLM_QWEN,
+    ControlledPlannerAdapter,
+    PlannerProposal,
+    QwenPlannerAdapter,
+    build_planner_context,
 )
 from yield_rca_core.question_evidence import QuestionEvidenceResolver
 from yield_rca_core.rca_reasoning_agent import RCAReasoningAgent
@@ -962,6 +970,92 @@ def _reconcile_satisfied_questions(state: RCAState) -> list[InvestigationQuestio
     ]
 
 
+@dataclass(frozen=True)
+class ReactStopBundle:
+    """Terminal input for the unified React loop.
+
+    ``origin`` distinguishes a planner-proposed stop from a runtime
+    termination; both flow through the same terminal governance. Runtime
+    terminations carry the pre-existing audit outcome so ``planner_decisions``
+    and telemetry keep their pre-refactor content; they are never expressed
+    as planner proposals.
+    """
+
+    origin: str  # "planner" | "runtime"
+    reason: str
+    goal_status: str
+    proposed_conclusion_level: str
+    stop_reason: str | None
+    evidence_gaps: list[str]
+    decision_id: str | None = None
+    decision_proposed_by: str | None = None
+    question_updates_source: str | None = None
+    has_question_updates: bool = False
+    action_value_assessments: list[ActionValueAssessment] | None = None
+    audit_outcome: PlannerDecisionOutcome | None = None
+
+    @classmethod
+    def from_proposal(cls, proposal: PlannerProposal) -> ReactStopBundle:
+        return cls(
+            origin="planner",
+            reason=proposal.reason,
+            goal_status=(
+                proposal.proposed_goal_status
+                if proposal.proposed_goal_status is not None
+                else GoalStatus.BLOCKED.value
+            ),
+            proposed_conclusion_level=proposal.proposed_conclusion_level,
+            stop_reason=proposal.stop_reason,
+            evidence_gaps=list(proposal.evidence_gaps),
+            decision_id=proposal.decision_id,
+            decision_proposed_by=proposal.decision_proposed_by,
+            question_updates_source=proposal.question_updates_source,
+            has_question_updates=bool(proposal.question_updates),
+            # Governed finalize receives the planner's assessments; controlled
+            # proposals keep the finalize default (State's latest assessments)
+            # exactly as the pre-refactor controlled terminal did.
+            action_value_assessments=(
+                list(proposal.action_value_assessments)
+                if proposal.proposed_by == PROVENANCE_LLM_QWEN
+                else None
+            ),
+            # Rebuild the pre-refactor audit outcome only for planner
+            # outcomes that carry one; controlled proposals never inject
+            # PlannerDecision records into planner_decisions.
+            audit_outcome=(
+                Supervisor._planner_audit_outcome(proposal)
+                if proposal.decision_proposed_by is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ReactExecutionProfile:
+    """Explicit per-mode behavior for the unified React loop.
+
+    The shared loop never infers mode from planner provenance or from the
+    concrete native decision type; every mode difference is an explicit
+    profile field selected at entry and swapped explicitly at fallback.
+    """
+
+    name: str
+    stop_event: str
+    dispatch: Callable[..., AgentFinding]
+    stop_event_payload: Callable[[RCAState, ReactStopBundle], dict[str, Any]]
+    preflight_termination: Callable[[RCAState], PlannerDecisionOutcome | None] | None
+    act_gate: Callable[..., ReactStopBundle | PlannerProposal | None] | None
+    stop_provenance_metadata: (
+        Callable[[RCAState, ReactStopBundle], dict[str, Any]] | None
+    )
+    records_planner_outcome: bool
+    emits_decision_events: bool
+    caps_conclusion: bool
+    reconciles_satisfied_questions: bool
+    pre_finalize_trace_metadata: bool
+    finalize_mode: str  # "always" | "governance_gated"
+
+
 class SupervisorExecutionError(RuntimeError):
     """Raised when a TaskPlan cannot be executed to completion."""
 
@@ -1413,133 +1507,189 @@ class Supervisor:
                 else {}
             ),
         )
-        return self._continue_controlled(
+        return self._react_loop(
             state,
             goal,
-            policy=policy,
+            profile=self._controlled_react_profile(goal=goal),
+            planner=ControlledPlannerAdapter(policy),
+            fallback_policy=None,
             tool_latencies=tool_latencies,
         )
 
-    def _continue_controlled(
+    def _react_loop(
         self,
         state: RCAState,
         goal: InvestigationGoal,
         *,
-        policy: InvestigationPolicy | None = None,
-        tool_latencies: list[dict[str, str | float]] | None = None,
+        profile: ReactExecutionProfile,
+        planner: Any,
+        fallback_policy: InvestigationPolicy | None,
+        tool_latencies: list[dict[str, str | float]] | None,
     ) -> RCAState:
-        """Resume controlled ReAct from the supplied state, including after LLM fallback."""
+        """The single shared ReAct orchestration loop.
 
-        active_policy = policy or InvestigationPolicy()
+        The loop owns orchestration only: it builds the planner context,
+        asks the active planner for one proposal, routes ACT/STOP, records
+        findings through the shared recorder, and routes terminals through
+        the shared Finalizer governance. Mode differences (planner
+        preflight, dispatch strategy, budget preflight, stop-event naming,
+        decision recording) live in the explicit execution profile; fallback
+        swaps both the planner and the profile explicitly inside this loop
+        and never jumps to a second orchestration loop.
+        """
+
         observed_tool_latencies = tool_latencies if tool_latencies is not None else []
         while True:
-            decision = active_policy.next_action(
-                goal=goal,
-                findings=state.findings,
-                action_records=state.action_history,
-                tool_call_count=len(observed_tool_latencies),
+            runtime_outcome = (
+                profile.preflight_termination(state)
+                if profile.preflight_termination is not None
+                else None
             )
-            if decision.next_action is not None:
-                remaining_tool_calls = max(
-                    0,
-                    goal.max_tool_calls - len(observed_tool_latencies),
-                )
-                required_tool_calls = self._controlled_action_tool_cost(
-                    decision.next_action,
-                    state,
-                )
-                if required_tool_calls > remaining_tool_calls:
-                    # Ask the policy for its normal budget terminal so fallback
-                    # execution cannot cross the global Tool-call boundary.
-                    decision = active_policy.next_action(
-                        goal=goal,
-                        findings=state.findings,
-                        action_records=state.action_history,
-                        tool_call_count=goal.max_tool_calls,
-                    )
-            if decision.next_action is None:
-                questions = (
-                    _reconcile_satisfied_questions(state)
-                    if decision.goal_status == GoalStatus.SATISFIED.value
-                    else list(state.investigation_questions)
-                )
-                evidence_gaps = list(
-                    dict.fromkeys(
-                        [
-                            *decision.evidence_gaps,
-                            *_open_question_gaps(questions),
-                        ]
-                    )
-                )
-                terminal = replace(
-                    state,
-                    job=replace(state.job, status=TaskStatus.COMPLETED.value),
-                    investigation_questions=questions,
-                    goal_status=decision.goal_status,
-                    conclusion_level=decision.conclusion_level,
-                    evidence_gaps=evidence_gaps,
-                    stop_reason=decision.stop_reason,
-                )
-                if (
-                    _llm_react_governance_requested(terminal)
-                    and terminal.authoritative_rca_finding is not None
-                ):
-                    terminal = finalize_investigation(terminal)
-                    if terminal.execution_metadata.get("investigation_finalizer") == (
-                        "python_competition_progression"
-                    ):
-                        terminal = replace(
-                            terminal,
-                            execution_metadata={
-                                **terminal.execution_metadata,
-                                "terminal_question_updates_source": (
-                                    "python_evidence_gate"
-                                ),
-                                "terminal_question_updates_validated_by": (
-                                    "python_evidence_gate"
-                                ),
-                            },
+            stop: ReactStopBundle | None = None
+            proposal: PlannerProposal | None = None
+            if runtime_outcome is not None:
+                stop = self._runtime_stop_bundle(runtime_outcome)
+            else:
+                try:
+                    proposal = planner.decide(
+                        build_planner_context(
+                            goal=goal,
+                            state=state,
+                            tool_call_count=len(observed_tool_latencies),
                         )
-                        terminal = _record_finalizer_terminal_projection(terminal)
-                        validate_terminal_investigation_state(terminal)
-                    elif (
-                        terminal.execution_metadata.get("investigation_finalizer")
-                        == "not_applicable"
-                    ):
-                        terminal = finalize_non_competition_llm_react_terminal(
-                            terminal
-                        )
-                        terminal = _record_finalizer_terminal_projection(terminal)
-                        validate_terminal_investigation_state(terminal)
+                    )
+                except (QwenNextActionPlannerError, LLMCallError) as exc:
+                    if isinstance(exc, LLMCallError) and _is_llm_budget_exhaustion(exc):
+                        return self._react_llm_budget_terminal(state, exc)
+                    reason = (
+                        "qwen_next_action_output_invalid"
+                        if isinstance(exc, QwenNextActionPlannerError)
+                        else "qwen_next_action_call_failed"
+                    )
+                    validation_diagnostics = (
+                        {
+                            "orchestration_fallback_failure_category": (
+                                "planner_output_invalid"
+                            ),
+                            "orchestration_fallback_attempt_count": exc.attempts,
+                            "orchestration_fallback_validation_errors": list(
+                                exc.validation_errors
+                            ),
+                            "orchestration_fallback_validation_error_categories": list(
+                                exc.validation_error_categories
+                            ),
+                            "orchestration_fallback_output_parse_error_count": (
+                                exc.output_parse_error_count
+                            ),
+                            "orchestration_fallback_core_validation_error_count": (
+                                exc.core_validation_error_count
+                            ),
+                        }
+                        if isinstance(exc, QwenNextActionPlannerError)
+                        else _llm_call_fallback_diagnostics(exc)
+                    )
+                    state = replace(
+                        state,
+                        execution_metadata={
+                            **state.execution_metadata,
+                            "orchestration_requested_mode": "llm_react",
+                            "orchestration_mode": "controlled_react",
+                            "orchestration_fallback_reason": reason,
+                            "orchestration_fallback_stage": "next_action_planning",
+                            "orchestration_fallback_after_action_count": len(
+                                state.action_history
+                            ),
+                            **validation_diagnostics,
+                        },
+                    )
+                    # Explicit planner and execution-profile swap: fallback
+                    # keeps the same State and this same loop, mirroring the
+                    # pre-refactor controlled continuation. Neither swap is
+                    # implicit in the other.
+                    planner = ControlledPlannerAdapter(
+                        fallback_policy or InvestigationPolicy()
+                    )
+                    profile = self._controlled_react_profile(goal=goal)
+                    continue
+            if stop is None and proposal is not None:
+                if proposal.decision_type == DecisionType.STOP.value:
+                    stop = ReactStopBundle.from_proposal(proposal)
+                elif profile.act_gate is not None:
+                    gated = profile.act_gate(
+                        state,
+                        planner,
+                        proposal,
+                        max(
+                            0,
+                            goal.max_tool_calls - len(observed_tool_latencies),
+                        ),
+                    )
+                    if isinstance(gated, ReactStopBundle):
+                        stop = gated
+                    elif isinstance(gated, PlannerProposal):
+                        proposal = gated
+                        if proposal.decision_type == DecisionType.STOP.value:
+                            stop = ReactStopBundle.from_proposal(proposal)
+            if stop is not None:
+                return self._react_terminal(
+                    state,
+                    stop=stop,
+                    profile=profile,
+                    goal=goal,
+                )
+            assert proposal is not None
+            action = proposal.next_action
+            if action is None:
+                raise SupervisorExecutionError(
+                    "React act proposal lost its next_action",
+                    state=state,
+                )
+            if profile.emits_decision_events:
                 emit_workflow_event(
-                    "investigation_stopped",
+                    "planner_decision",
                     {
-                        "mode": "controlled_react",
-                        "goal_status": terminal.goal_status,
-                        "conclusion_level": terminal.conclusion_level,
-                        "stop_reason": terminal.stop_reason,
-                        "evidence_gaps": list(terminal.evidence_gaps),
+                        "decision_id": proposal.decision_id,
+                        "decision_type": proposal.decision_type,
+                        "reason": proposal.reason,
+                        "action_id": action.action_id,
+                        "action_kind": action.kind,
+                        "agent": action.agent,
+                        "target_question_ids": list(
+                            proposal.target_question_ids
+                        ),
                     },
                 )
-                report = self.report_generator.generate(terminal)
-                return replace(terminal, report=report)
-
             emit_workflow_event(
                 "action_started",
                 {
-                    "action_id": decision.next_action.action_id,
-                    "action_kind": decision.next_action.kind,
-                    "agent": decision.next_action.agent,
-                    "reason": decision.next_action.reason,
+                    "action_id": action.action_id,
+                    "action_kind": action.kind,
+                    "agent": action.agent,
+                    "reason": action.reason,
                 },
             )
-            finding = self._dispatch_controlled(decision.next_action, state)
-            state = self._record_controlled_finding(state, decision.next_action, finding)
+            finding = profile.dispatch(
+                state,
+                action,
+                max(0, goal.max_tool_calls - len(observed_tool_latencies)),
+            )
+            state_with_finding = self._record_controlled_finding(
+                state,
+                action,
+                finding,
+            )
+            if profile.records_planner_outcome:
+                state = self._record_planner_outcome(
+                    state_with_finding,
+                    self._planner_audit_outcome(proposal),
+                )
+            else:
+                state = state_with_finding
             emit_workflow_event(
                 "action_completed",
                 {
-                    "action_id": decision.next_action.action_id,
-                    "action_kind": decision.next_action.kind,
+                    "action_id": action.action_id,
+                    "action_kind": action.kind,
                     "agent": finding.agent,
                     "finding_id": finding.finding_id,
                     "summary": finding.summary,
@@ -1547,6 +1697,422 @@ class Supervisor:
                     "confidence": finding.confidence,
                 },
             )
+
+    @staticmethod
+    def _runtime_stop_bundle(
+        outcome: PlannerDecisionOutcome,
+    ) -> ReactStopBundle:
+        decision = outcome.decision
+        return ReactStopBundle(
+            origin="runtime",
+            reason=decision.reason,
+            goal_status=decision.goal_status,
+            proposed_conclusion_level=decision.proposed_conclusion_level,
+            stop_reason=decision.stop_reason,
+            evidence_gaps=[],
+            decision_id=decision.decision_id,
+            decision_proposed_by=outcome.decision_proposed_by,
+            question_updates_source=outcome.question_updates_source,
+            has_question_updates=bool(decision.question_updates),
+            action_value_assessments=list(outcome.action_value_assessments),
+            audit_outcome=outcome,
+        )
+
+    @staticmethod
+    def _planner_audit_outcome(
+        proposal: PlannerProposal,
+    ) -> PlannerDecisionOutcome:
+        """Rebuild the pre-refactor audit outcome from public fields.
+
+        The shared loop never reads the native decision object; the audit
+        record is reconstructed from the same public proposal contract the
+        loop consumes, so ``planner_decisions`` content is unchanged.
+        """
+
+        decision = PlannerDecision(
+            decision_id=proposal.decision_id or "",
+            goal_id=proposal.goal_id or "",
+            decision_type=proposal.decision_type,
+            reason=proposal.reason,
+            goal_status=(
+                proposal.proposed_goal_status or GoalStatus.IN_PROGRESS.value
+            ),
+            proposed_conclusion_level=proposal.proposed_conclusion_level,
+            next_action=proposal.next_action,
+            target_question_ids=list(proposal.target_question_ids),
+            new_questions=list(proposal.new_questions),
+            stop_reason=proposal.stop_reason,
+            question_updates=list(proposal.question_updates),
+        )
+        return PlannerDecisionOutcome(
+            decision=decision,
+            question_update_reviews=list(proposal.question_update_reviews),
+            raw_question_update_count=proposal.raw_question_update_count,
+            decision_proposed_by=proposal.decision_proposed_by or "qwen",
+            question_updates_source=proposal.question_updates_source,
+            action_value_assessments=list(proposal.action_value_assessments),
+        )
+
+    def _react_terminal(
+        self,
+        state: RCAState,
+        *,
+        stop: ReactStopBundle,
+        profile: ReactExecutionProfile,
+        goal: InvestigationGoal,
+    ) -> RCAState:
+        """Shared terminal governance for planner and runtime stops."""
+
+        working = state
+        if profile.records_planner_outcome and stop.audit_outcome is not None:
+            working = self._record_planner_outcome(working, stop.audit_outcome)
+        if profile.stop_provenance_metadata is not None:
+            working = replace(
+                working,
+                execution_metadata={
+                    **working.execution_metadata,
+                    **profile.stop_provenance_metadata(working, stop),
+                },
+            )
+        conclusion_level = (
+            gate_planner_conclusion_level(
+                stop.proposed_conclusion_level,
+                state=working,
+                goal=goal,
+            )
+            if profile.caps_conclusion
+            else stop.proposed_conclusion_level
+        )
+        questions = working.investigation_questions
+        if (
+            profile.reconciles_satisfied_questions
+            and stop.goal_status == GoalStatus.SATISFIED.value
+        ):
+            questions = _reconcile_satisfied_questions(working)
+        evidence_gaps = list(
+            dict.fromkeys(
+                [
+                    *stop.evidence_gaps,
+                    *_open_question_gaps(questions),
+                ]
+            )
+        )
+        terminal = replace(
+            working,
+            job=replace(working.job, status=TaskStatus.COMPLETED.value),
+            investigation_questions=questions,
+            goal_status=stop.goal_status,
+            conclusion_level=conclusion_level,
+            evidence_gaps=evidence_gaps,
+            stop_reason=stop.stop_reason,
+        )
+        if profile.pre_finalize_trace_metadata and (
+            terminal.competition_trace is not None
+        ):
+            terminal = replace(
+                terminal,
+                execution_metadata={
+                    **terminal.execution_metadata,
+                    "terminal_question_updates_source": "python_evidence_gate",
+                    "terminal_question_updates_validated_by": (
+                        "python_evidence_gate"
+                    ),
+                },
+            )
+        if profile.finalize_mode == "always":
+            terminal = finalize_investigation(
+                terminal,
+                action_value_assessments=stop.action_value_assessments,
+                budget_exhausted=(
+                    stop.stop_reason == StopReason.BUDGET_EXHAUSTED.value
+                ),
+            )
+            terminal = _record_finalizer_terminal_projection(terminal)
+            validate_terminal_investigation_state(terminal)
+        elif _llm_react_governance_requested(terminal) and (
+            terminal.authoritative_rca_finding is not None
+        ):
+            terminal = finalize_investigation(terminal)
+            if terminal.execution_metadata.get("investigation_finalizer") == (
+                "python_competition_progression"
+            ):
+                terminal = replace(
+                    terminal,
+                    execution_metadata={
+                        **terminal.execution_metadata,
+                        "terminal_question_updates_source": (
+                            "python_evidence_gate"
+                        ),
+                        "terminal_question_updates_validated_by": (
+                            "python_evidence_gate"
+                        ),
+                    },
+                )
+                terminal = _record_finalizer_terminal_projection(terminal)
+                validate_terminal_investigation_state(terminal)
+            elif (
+                terminal.execution_metadata.get("investigation_finalizer")
+                == "not_applicable"
+            ):
+                terminal = finalize_non_competition_llm_react_terminal(terminal)
+                terminal = _record_finalizer_terminal_projection(terminal)
+                validate_terminal_investigation_state(terminal)
+        emit_workflow_event(
+            profile.stop_event,
+            profile.stop_event_payload(terminal, stop),
+        )
+        if not terminal.evidence:
+            return terminal
+        report = self.report_generator.generate(terminal)
+        return replace(terminal, report=report)
+
+    def _react_llm_budget_terminal(
+        self,
+        state: RCAState,
+        exc: LLMCallError,
+    ) -> RCAState:
+        """Runtime termination for exhausted LLM budget (not a planner stop)."""
+
+        terminal_state = replace(
+            state,
+            goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
+            conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+            evidence_gaps=_open_question_gaps(state.investigation_questions),
+            stop_reason=StopReason.BUDGET_EXHAUSTED.value,
+            execution_metadata={
+                **state.execution_metadata,
+                "orchestration_requested_mode": "llm_react",
+                "orchestration_mode": "llm_react",
+                "planner_stop_proposed_by": "python_runtime",
+                "terminal_question_updates_source": "python_evidence_gate",
+                "llm_budget_exhausted": True,
+                "llm_budget_failure_category": exc.failure_category,
+            },
+        )
+        terminal_state = finalize_investigation(
+            terminal_state,
+            budget_exhausted=True,
+        )
+        terminal_state = _record_finalizer_terminal_projection(terminal_state)
+        terminal = replace(
+            terminal_state,
+            job=replace(
+                terminal_state.job,
+                status=TaskStatus.COMPLETED.value,
+            ),
+        )
+        validate_terminal_investigation_state(terminal)
+        if not terminal.evidence:
+            return terminal
+        report = self.report_generator.generate(terminal)
+        return replace(terminal, report=report)
+
+    def _llm_react_profile(
+        self,
+        *,
+        goal: InvestigationGoal,
+        qwen_planner: QwenNextActionPlanner,
+    ) -> ReactExecutionProfile:
+        """llm_react execution profile: Qwen planner + Specialist V2 dispatch."""
+
+        def preflight_termination(
+            state: RCAState,
+        ) -> PlannerDecisionOutcome | None:
+            remaining_llm_calls = llm_calls_remaining(qwen_planner.llm_client)
+            if remaining_llm_calls is not None and remaining_llm_calls <= 1:
+                return PlannerDecisionOutcome(
+                    decision=PlannerDecision(
+                        decision_id=(
+                            f"{goal.goal_id}:llm-budget-stop:"
+                            f"{len(state.planner_decisions) + 1}"
+                        ),
+                        goal_id=goal.goal_id,
+                        decision_type=DecisionType.STOP.value,
+                        reason=(
+                            "Python stopped before another provider call because "
+                            "the remaining global LLM-call budget cannot safely "
+                            "cover both planning and a possible selected action."
+                        ),
+                        goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
+                        proposed_conclusion_level=(
+                            ConclusionLevel.INCONCLUSIVE.value
+                        ),
+                        stop_reason=StopReason.BUDGET_EXHAUSTED.value,
+                    ),
+                    decision_proposed_by="python_runtime",
+                    action_value_assessments=list(
+                        state.latest_action_value_assessments
+                    ),
+                )
+            return None
+
+        def act_gate(
+            state: RCAState,
+            planner: Any,
+            proposal: PlannerProposal,
+            remaining_tool_calls: int,
+        ) -> ReactStopBundle | None:
+            action = proposal.next_action
+            if (
+                action is not None
+                and action.kind == "run_rca_reasoning"
+                and not _rca_reasoning_round_budget_available(
+                    qwen_planner.llm_client
+                )
+            ):
+                decision = PlannerDecision(
+                    decision_id=f"{proposal.decision_id}:rca-budget-stop",
+                    goal_id=goal.goal_id,
+                    decision_type=DecisionType.STOP.value,
+                    reason=(
+                        "Python did not start another RCA reasoning round because "
+                        "the remaining LLM-call budget cannot cover Candidate "
+                        "generation, adversarial Challenge, and the governed "
+                        "post-Action Planner decision."
+                    ),
+                    goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
+                    proposed_conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+                    stop_reason=StopReason.BUDGET_EXHAUSTED.value,
+                )
+                return self._runtime_stop_bundle(
+                    PlannerDecisionOutcome(
+                        decision=decision,
+                        decision_proposed_by="python_runtime",
+                        action_value_assessments=list(
+                            proposal.action_value_assessments
+                        ),
+                    )
+                )
+            return None
+
+        def dispatch(
+            state: RCAState,
+            action: InvestigationAction,
+            remaining_tool_calls: int,
+        ) -> AgentFinding:
+            try:
+                return self._dispatch_llm_react(
+                    action,
+                    state,
+                    remaining_tool_calls=remaining_tool_calls,
+                )
+            except SpecialistV2Error as exc:
+                raise SupervisorExecutionError(str(exc), state=state) from exc
+
+        def stop_event_payload(
+            terminal: RCAState,
+            stop: ReactStopBundle,
+        ) -> dict[str, Any]:
+            return {
+                "decision_id": stop.decision_id,
+                "reason": stop.reason,
+                "goal_status": terminal.goal_status,
+                "conclusion_level": terminal.conclusion_level,
+                "stop_reason": terminal.stop_reason,
+                "evidence_gaps": list(terminal.evidence_gaps),
+            }
+
+        def stop_provenance_metadata(
+            state: RCAState,
+            stop: ReactStopBundle,
+        ) -> dict[str, Any]:
+            return {
+                "planner_stop_proposed_by": stop.decision_proposed_by,
+                "terminal_question_updates_source": (
+                    stop.question_updates_source
+                    or (
+                        "python_evidence_gate"
+                        if stop.decision_proposed_by == "python_runtime"
+                        else None
+                    )
+                ),
+                "terminal_question_updates_validated_by": (
+                    "python_evidence_gate"
+                    if stop.has_question_updates
+                    or state.competition_trace is not None
+                    else None
+                ),
+            }
+
+        return ReactExecutionProfile(
+            name="llm_react",
+            stop_event="planner_stopped",
+            preflight_termination=preflight_termination,
+            act_gate=act_gate,
+            dispatch=dispatch,
+            stop_event_payload=stop_event_payload,
+            stop_provenance_metadata=stop_provenance_metadata,
+            records_planner_outcome=True,
+            emits_decision_events=True,
+            caps_conclusion=True,
+            reconciles_satisfied_questions=False,
+            pre_finalize_trace_metadata=True,
+            finalize_mode="always",
+        )
+
+    def _controlled_react_profile(
+        self,
+        *,
+        goal: InvestigationGoal,
+    ) -> ReactExecutionProfile:
+        """controlled_react profile: deterministic policy + registry dispatch."""
+
+        def act_gate(
+            state: RCAState,
+            planner: Any,
+            proposal: PlannerProposal,
+            remaining_tool_calls: int,
+        ) -> PlannerProposal | None:
+            action = proposal.next_action
+            if action is None:
+                return None
+            required_tool_calls = self._controlled_action_tool_cost(action, state)
+            if required_tool_calls <= remaining_tool_calls:
+                return None
+            # Ask the policy for its normal budget terminal so fallback
+            # execution cannot cross the global Tool-call boundary.
+            return planner.decide(
+                build_planner_context(
+                    goal=goal,
+                    state=state,
+                    tool_call_count=goal.max_tool_calls,
+                )
+            )
+
+        def dispatch(
+            state: RCAState,
+            action: InvestigationAction,
+            remaining_tool_calls: int,
+        ) -> AgentFinding:
+            return self._dispatch_controlled(action, state)
+
+        def stop_event_payload(
+            terminal: RCAState,
+            stop: ReactStopBundle,
+        ) -> dict[str, Any]:
+            return {
+                "mode": "controlled_react",
+                "goal_status": terminal.goal_status,
+                "conclusion_level": terminal.conclusion_level,
+                "stop_reason": terminal.stop_reason,
+                "evidence_gaps": list(terminal.evidence_gaps),
+            }
+
+        return ReactExecutionProfile(
+            name="controlled_react",
+            stop_event="investigation_stopped",
+            preflight_termination=None,
+            act_gate=act_gate,
+            dispatch=dispatch,
+            stop_event_payload=stop_event_payload,
+            stop_provenance_metadata=None,
+            records_planner_outcome=False,
+            emits_decision_events=False,
+            caps_conclusion=False,
+            reconciles_satisfied_questions=True,
+            pre_finalize_trace_metadata=False,
+            finalize_mode="governance_gated",
+        )
 
     def _controlled_action_tool_cost(
         self,
@@ -1637,334 +2203,17 @@ class Supervisor:
                 # No investigation Evidence exists for a pure unsupported
                 # request, so a traceable RCA report would be misleading.
                 return terminal
-        observed_tool_latencies = tool_latencies if tool_latencies is not None else []
-        while True:
-            remaining_llm_calls = llm_calls_remaining(planner.llm_client)
-            if remaining_llm_calls is not None and remaining_llm_calls <= 1:
-                outcome = PlannerDecisionOutcome(
-                    decision=PlannerDecision(
-                        decision_id=(
-                            f"{intent_plan.goal.goal_id}:llm-budget-stop:"
-                            f"{len(state.planner_decisions) + 1}"
-                        ),
-                        goal_id=intent_plan.goal.goal_id,
-                        decision_type=DecisionType.STOP.value,
-                        reason=(
-                            "Python stopped before another provider call because "
-                            "the remaining global LLM-call budget cannot safely "
-                            "cover both planning and a possible selected action."
-                        ),
-                        goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
-                        proposed_conclusion_level=(
-                            ConclusionLevel.INCONCLUSIVE.value
-                        ),
-                        stop_reason=StopReason.BUDGET_EXHAUSTED.value,
-                    ),
-                    decision_proposed_by="python_runtime",
-                    action_value_assessments=list(
-                        state.latest_action_value_assessments
-                    ),
-                )
-                decision = outcome.decision
-            else:
-                outcome = None
-            try:
-                if outcome is None:
-                    outcome = planner.decide_with_review(
-                        goal=intent_plan.goal,
-                        questions=state.investigation_questions,
-                        findings=state.findings,
-                        action_records=state.action_history,
-                        tool_call_count=len(observed_tool_latencies),
-                        evidence=state.evidence,
-                        evidence_ids=[item.evidence_id for item in state.evidence],
-                        question_evidence_links=state.question_evidence_links,
-                        capability_notices=state.capability_notices,
-                        hypotheses=state.hypotheses,
-                        prior_decisions=state.planner_decisions,
-                        critical_contradictions=(
-                            [
-                                f"{state.authoritative_hypothesis.hypothesis_id}: "
-                                f"{state.authoritative_hypothesis.root_cause}"
-                            ]
-                            if state.authoritative_hypothesis is not None
-                            and state.authoritative_hypothesis.status
-                            == HypothesisStatus.CONFLICTED.value
-                            else []
-                        ),
-                        authoritative_rca_finding_id=(
-                            state.authoritative_rca_finding_id
-                        ),
-                        investigation_gain_history=(
-                            state.investigation_gain_history
-                        ),
-                    )
-                    decision = outcome.decision
-            except (QwenNextActionPlannerError, LLMCallError) as exc:
-                if isinstance(exc, LLMCallError) and _is_llm_budget_exhaustion(exc):
-                    terminal_state = replace(
-                        state,
-                        goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
-                        conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
-                        evidence_gaps=_open_question_gaps(
-                            state.investigation_questions
-                        ),
-                        stop_reason=StopReason.BUDGET_EXHAUSTED.value,
-                        execution_metadata={
-                            **state.execution_metadata,
-                            "orchestration_requested_mode": "llm_react",
-                            "orchestration_mode": "llm_react",
-                            "planner_stop_proposed_by": "python_runtime",
-                            "terminal_question_updates_source": (
-                                "python_evidence_gate"
-                            ),
-                            "llm_budget_exhausted": True,
-                            "llm_budget_failure_category": exc.failure_category,
-                        },
-                    )
-                    terminal_state = finalize_investigation(
-                        terminal_state,
-                        budget_exhausted=True,
-                    )
-                    terminal_state = _record_finalizer_terminal_projection(
-                        terminal_state
-                    )
-                    terminal = replace(
-                        terminal_state,
-                        job=replace(
-                            terminal_state.job,
-                            status=TaskStatus.COMPLETED.value,
-                        ),
-                    )
-                    validate_terminal_investigation_state(terminal)
-                    if not terminal.evidence:
-                        return terminal
-                    report = self.report_generator.generate(terminal)
-                    return replace(terminal, report=report)
-                reason = (
-                    "qwen_next_action_output_invalid"
-                    if isinstance(exc, QwenNextActionPlannerError)
-                    else "qwen_next_action_call_failed"
-                )
-                validation_diagnostics = (
-                    {
-                        "orchestration_fallback_failure_category": (
-                            "planner_output_invalid"
-                        ),
-                        "orchestration_fallback_attempt_count": exc.attempts,
-                        "orchestration_fallback_validation_errors": list(
-                            exc.validation_errors
-                        ),
-                        "orchestration_fallback_validation_error_categories": list(
-                            exc.validation_error_categories
-                        ),
-                        "orchestration_fallback_output_parse_error_count": (
-                            exc.output_parse_error_count
-                        ),
-                        "orchestration_fallback_core_validation_error_count": (
-                            exc.core_validation_error_count
-                        ),
-                    }
-                    if isinstance(exc, QwenNextActionPlannerError)
-                    else _llm_call_fallback_diagnostics(exc)
-                )
-                fallback_state = replace(
-                    state,
-                    execution_metadata={
-                        **state.execution_metadata,
-                        "orchestration_requested_mode": "llm_react",
-                        "orchestration_mode": "controlled_react",
-                        "orchestration_fallback_reason": reason,
-                        "orchestration_fallback_stage": "next_action_planning",
-                        "orchestration_fallback_after_action_count": len(
-                            state.action_history
-                        ),
-                        **validation_diagnostics,
-                    },
-                )
-                return self._continue_controlled(
-                    fallback_state,
-                    intent_plan.goal,
-                    policy=fallback_policy,
-                    tool_latencies=observed_tool_latencies,
-                )
-
-            assert outcome is not None
-            if (
-                decision.decision_type == DecisionType.ACT.value
-                and decision.next_action is not None
-                and decision.next_action.kind == "run_rca_reasoning"
-                and not _rca_reasoning_round_budget_available(
-                    planner.llm_client
-                )
-            ):
-                decision = PlannerDecision(
-                    decision_id=f"{decision.decision_id}:rca-budget-stop",
-                    goal_id=decision.goal_id,
-                    decision_type=DecisionType.STOP.value,
-                    reason=(
-                        "Python did not start another RCA reasoning round because "
-                        "the remaining LLM-call budget cannot cover Candidate "
-                        "generation, adversarial Challenge, and the governed "
-                        "post-Action Planner decision."
-                    ),
-                    goal_status=GoalStatus.BUDGET_EXHAUSTED.value,
-                    proposed_conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
-                    stop_reason=StopReason.BUDGET_EXHAUSTED.value,
-                )
-                outcome = PlannerDecisionOutcome(
-                    decision=decision,
-                    decision_proposed_by="python_runtime",
-                    question_updates_source="python_evidence_gate",
-                    action_value_assessments=list(
-                        outcome.action_value_assessments
-                    ),
-                )
-            if decision.decision_type == DecisionType.STOP.value:
-                state = self._record_planner_outcome(state, outcome)
-                state = replace(
-                    state,
-                    execution_metadata={
-                        **state.execution_metadata,
-                        "planner_stop_proposed_by": outcome.decision_proposed_by,
-                        "terminal_question_updates_source": (
-                            outcome.question_updates_source
-                            or (
-                                "python_evidence_gate"
-                                if outcome.decision_proposed_by == "python_runtime"
-                                else None
-                            )
-                        ),
-                        "terminal_question_updates_validated_by": (
-                            "python_evidence_gate"
-                            if decision.question_updates
-                            or state.competition_trace is not None
-                            else None
-                        ),
-                    },
-                )
-                conclusion_level = gate_planner_conclusion_level(
-                    decision.proposed_conclusion_level,
-                    state=state,
-                    goal=intent_plan.goal,
-                )
-                terminal_state = replace(
-                    state,
-                    goal_status=decision.goal_status,
-                    conclusion_level=conclusion_level,
-                    evidence_gaps=_open_question_gaps(
-                        state.investigation_questions
-                    ),
-                    stop_reason=decision.stop_reason,
-                )
-                if terminal_state.competition_trace is not None:
-                    terminal_state = replace(
-                        terminal_state,
-                        execution_metadata={
-                            **terminal_state.execution_metadata,
-                            "terminal_question_updates_source": (
-                                "python_evidence_gate"
-                            ),
-                            "terminal_question_updates_validated_by": (
-                                "python_evidence_gate"
-                            ),
-                        },
-                    )
-                terminal_state = finalize_investigation(
-                    terminal_state,
-                    action_value_assessments=outcome.action_value_assessments,
-                    budget_exhausted=(
-                        decision.stop_reason == StopReason.BUDGET_EXHAUSTED.value
-                    ),
-                )
-                terminal_state = _record_finalizer_terminal_projection(
-                    terminal_state
-                )
-                terminal = replace(
-                    terminal_state,
-                    job=replace(
-                        terminal_state.job,
-                        status=TaskStatus.COMPLETED.value,
-                    ),
-                )
-                validate_terminal_investigation_state(terminal)
-                emit_workflow_event(
-                    "planner_stopped",
-                    {
-                        "decision_id": decision.decision_id,
-                        "reason": decision.reason,
-                        "goal_status": decision.goal_status,
-                        "conclusion_level": conclusion_level,
-                        "stop_reason": decision.stop_reason,
-                        "evidence_gaps": list(terminal.evidence_gaps),
-                    },
-                )
-                if not terminal.evidence:
-                    return terminal
-                report = self.report_generator.generate(terminal)
-                return replace(terminal, report=report)
-
-            action = decision.next_action
-            if action is None:
-                raise SupervisorExecutionError(
-                    "LLM act decision lost its next_action",
-                    state=state,
-                )
-            emit_workflow_event(
-                "planner_decision",
-                {
-                    "decision_id": decision.decision_id,
-                    "decision_type": decision.decision_type,
-                    "reason": decision.reason,
-                    "action_id": action.action_id,
-                    "action_kind": action.kind,
-                    "agent": action.agent,
-                    "target_question_ids": list(decision.target_question_ids),
-                },
-            )
-            emit_workflow_event(
-                "action_started",
-                {
-                    "action_id": action.action_id,
-                    "action_kind": action.kind,
-                    "agent": action.agent,
-                    "reason": action.reason,
-                },
-            )
-            remaining_tool_calls = max(
-                0,
-                intent_plan.goal.max_tool_calls - len(observed_tool_latencies),
-            )
-            try:
-                finding = self._dispatch_llm_react(
-                    action,
-                    state,
-                    remaining_tool_calls=remaining_tool_calls,
-                )
-            except SpecialistV2Error as exc:
-                raise SupervisorExecutionError(str(exc), state=state) from exc
-
-            # Build both immutable state projections before advancing the loop. A
-            # Specialist or Finding validation failure therefore exposes the
-            # pre-action state without a dangling Decision or Review.
-            state_with_finding = self._record_controlled_finding(
-                state,
-                action,
-                finding,
-            )
-            state = self._record_planner_outcome(state_with_finding, outcome)
-            emit_workflow_event(
-                "action_completed",
-                {
-                    "action_id": action.action_id,
-                    "action_kind": action.kind,
-                    "agent": finding.agent,
-                    "finding_id": finding.finding_id,
-                    "summary": finding.summary,
-                    "evidence_ids": list(finding.evidence_ids),
-                    "confidence": finding.confidence,
-                },
-            )
+        return self._react_loop(
+            state,
+            intent_plan.goal,
+            profile=self._llm_react_profile(
+                goal=intent_plan.goal,
+                qwen_planner=planner,
+            ),
+            planner=QwenPlannerAdapter(planner),
+            fallback_policy=fallback_policy,
+            tool_latencies=tool_latencies,
+        )
 
     @staticmethod
     def _record_planner_outcome(
