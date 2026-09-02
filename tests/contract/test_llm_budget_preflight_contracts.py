@@ -22,8 +22,8 @@ from yield_rca_core.llm_gateway import (
 )
 from yield_rca_core.models import RCAJob, RCAState
 from yield_rca_core.supervisor import (
-    _align_terminal_planner_stop,
     _rca_reasoning_round_budget_available,
+    _record_finalizer_terminal_projection,
 )
 
 
@@ -115,7 +115,7 @@ def test_rca_round_requires_generation_challenge_and_post_action_reserve() -> No
     )
 
 
-def test_terminal_projection_preserves_audit_and_aligns_effective_stop() -> None:
+def test_terminal_projection_preserves_planner_proposal_and_records_override() -> None:
     goal = InvestigationGoal(
         goal_id="GOAL_BUDGET",
         intent=InvestigationIntent.ROOT_CAUSE,
@@ -132,6 +132,7 @@ def test_terminal_projection_preserves_audit_and_aligns_effective_stop() -> None
     )
     state = RCAState(
         job=RCAJob(job_id="JOB_BUDGET", user_query="Investigate."),
+        execution_metadata={"planner_stop_proposed_by": "qwen"},
         investigation_goal=goal,
         planner_decisions=[original],
         goal_status=GoalStatus.BLOCKED,
@@ -139,12 +140,19 @@ def test_terminal_projection_preserves_audit_and_aligns_effective_stop() -> None
         stop_reason=StopReason.NO_HIGH_VALUE_ACTION,
     )
 
-    aligned = _align_terminal_planner_stop(state)
+    aligned = _record_finalizer_terminal_projection(state)
 
     assert len(aligned.planner_decisions) == 1
-    assert aligned.planner_decisions[-1].stop_reason == aligned.stop_reason
-    assert aligned.planner_decisions[-1].goal_status == aligned.goal_status
-    assert aligned.execution_metadata["planner_stop_proposed_by"] == "python_runtime"
+    assert aligned.planner_decisions[-1] == original
+    assert aligned.planner_decisions[-1].stop_reason != aligned.stop_reason
+    assert aligned.planner_decisions[-1].goal_status != aligned.goal_status
+    assert aligned.execution_metadata["planner_stop_proposed_by"] == "qwen"
+    assert aligned.execution_metadata["terminal_stop_projected_by"] == (
+        "python_investigation_finalizer"
+    )
+    assert aligned.execution_metadata["terminal_stop_projection_trace"] == (
+        "execution_metadata_only"
+    )
     assert (
         aligned.execution_metadata["superseded_terminal_planner_decision"]
         == original.to_dict()

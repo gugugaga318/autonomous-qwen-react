@@ -25,6 +25,7 @@ def clean_result() -> dict[str, object]:
         "provider_failures": [],
         "llm_call_cap_exceeded": False,
         "planner_stop_proposed_by": "qwen",
+        "terminal_stop_projected_by": None,
         "planner_stop_reason": "goal_satisfied",
         "terminal_question_updates_source": "python_evidence_gate",
     }
@@ -56,6 +57,21 @@ def test_strict_qwen_accepts_a_clean_llm_react_case() -> None:
         requested_mode="llm_react",
         agent_mode="llm",
     ) == []
+
+
+def test_strict_qwen_rejects_unknown_terminal_projection_source() -> None:
+    result = {
+        **clean_result(),
+        "terminal_stop_projected_by": "unknown_terminal_writer",
+    }
+
+    reasons = _strict_qwen_acceptance_reasons(
+        result,
+        requested_mode="llm_react",
+        agent_mode="llm",
+    )
+
+    assert "terminal_stop_projection_source_invalid" in reasons
 
 
 def test_process_completion_does_not_hide_internal_qwen_fallbacks() -> None:
@@ -278,6 +294,29 @@ def test_execution_layer_reports_governed_python_stop_separately() -> None:
     assert layer["qwen_stop_proposal_count"] == 0
     assert layer["governed_python_stop_count"] == 1
     assert layer["governed_python_stop_rate"] == 1.0
+
+
+def test_execution_layer_separates_qwen_proposal_from_finalizer_projection() -> None:
+    governed = {
+        **clean_result(),
+        "workflow_completed": True,
+        "strict_qwen_accepted": True,
+        "planner_stop_proposed_by": "qwen",
+        "terminal_stop_projected_by": "python_investigation_finalizer",
+        "planner_stop_reason": "no_high_value_action",
+    }
+
+    assert _strict_qwen_acceptance_reasons(
+        governed,
+        requested_mode="llm_react",
+        agent_mode="llm",
+    ) == []
+
+    layer = _execution_layer([governed])
+
+    assert layer["qwen_stop_proposal_count"] == 1
+    assert layer["governed_python_stop_count"] == 1
+    assert layer["finalizer_terminal_projection_count"] == 1
 
 
 def test_execution_layer_keeps_candidate_competition_semantics_separate() -> None:

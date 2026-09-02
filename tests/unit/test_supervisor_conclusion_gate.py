@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "core"))
 
 from yield_rca_core.evidence_models import Evidence, EvidenceSourceType  # noqa: E402
+from yield_rca_core.investigation_finalizer import (  # noqa: E402
+    gate_planner_conclusion_level,
+)
 from yield_rca_core.investigation_models import (  # noqa: E402
     ConclusionLevel,
     InvestigationGoal,
@@ -18,7 +21,6 @@ from yield_rca_core.models import (  # noqa: E402
     RCAJob,
     RCAState,
 )
-from yield_rca_core.supervisor import _gate_conclusion_level  # noqa: E402
 
 
 def _hypothesis(hypothesis_id: str, status: str) -> Hypothesis:
@@ -63,7 +65,7 @@ def test_historical_supported_hypothesis_cannot_raise_current_conclusion() -> No
         authoritative_status=HypothesisStatus.INCONCLUSIVE.value,
     )
 
-    assert _gate_conclusion_level(
+    assert gate_planner_conclusion_level(
         ConclusionLevel.SUPPORTED.value,
         state=state,
         goal=_goal(),
@@ -76,7 +78,7 @@ def test_historical_conflict_cannot_override_current_supported_hypothesis() -> N
         authoritative_status=HypothesisStatus.SUPPORTED.value,
     )
 
-    assert _gate_conclusion_level(
+    assert gate_planner_conclusion_level(
         ConclusionLevel.SUPPORTED.value,
         state=state,
         goal=_goal(),

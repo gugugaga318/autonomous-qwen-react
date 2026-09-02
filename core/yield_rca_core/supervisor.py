@@ -46,6 +46,8 @@ from yield_rca_core.investigation_decision import (
 )
 from yield_rca_core.investigation_finalizer import (
     finalize_investigation,
+    finalize_non_competition_llm_react_terminal,
+    gate_planner_conclusion_level,
     validate_terminal_investigation_state,
 )
 from yield_rca_core.investigation_models import (
@@ -57,7 +59,6 @@ from yield_rca_core.investigation_models import (
     IntentPlan,
     InvestigationAction,
     InvestigationGoal,
-    InvestigationIntent,
     InvestigationQuestion,
     PlannerDecision,
     PlannerDecisionOutcome,
@@ -123,41 +124,39 @@ def _llm_react_governance_requested(state: RCAState) -> bool:
     return str(requested_mode or "").strip() == "llm_react"
 
 
-def _align_non_competition_llm_react_terminal(state: RCAState) -> RCAState:
-    """Withhold supported publication when formal Competition never started."""
+def _record_finalizer_terminal_projection(state: RCAState) -> RCAState:
+    """Record a Finalizer override without rewriting Planner-owned history."""
 
-    authoritative = state.authoritative_rca_finding
-    if authoritative is None:
+    last = state.planner_decisions[-1] if state.planner_decisions else None
+    if (
+        last is not None
+        and last.decision_type == DecisionType.STOP.value
+        and last.stop_reason == state.stop_reason
+        and last.goal_status == state.goal_status
+    ):
         return state
-    conclusion_status = str(authoritative.details.get("conclusion_status", "")).strip()
-    if conclusion_status == "supported":
-        return state
-    aligned = replace(
-        state,
-        goal_status=GoalStatus.BLOCKED.value,
-        conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
-        stop_reason=StopReason.NO_HIGH_VALUE_ACTION.value,
-        execution_metadata={
-            **state.execution_metadata,
-            "terminal_question_updates_source": "python_evidence_gate",
-            "terminal_question_updates_validated_by": "python_evidence_gate",
-            "terminal_conclusion_status_source": "authoritative_rca_finding",
-        },
+    superseded_stop = (
+        last.to_dict()
+        if last is not None and last.decision_type == DecisionType.STOP.value
+        else None
     )
-    return _mark_fallback_python_terminal(aligned)
-
-
-def _mark_fallback_python_terminal(state: RCAState) -> RCAState:
-    """Record Python ownership without rewriting the preserved Qwen prefix."""
-
+    metadata = {
+        **state.execution_metadata,
+        "terminal_stop_projection_applied": True,
+        "terminal_stop_projection_trace": "execution_metadata_only",
+        "terminal_stop_projected_by": "python_investigation_finalizer",
+        "terminal_state_owner": "python_investigation_finalizer",
+        **(
+            {"superseded_terminal_planner_decision": superseded_stop}
+            if superseded_stop is not None
+            else {}
+        ),
+    }
+    if last is None or last.decision_type != DecisionType.STOP.value:
+        metadata.setdefault("planner_stop_proposed_by", "python_runtime")
     return replace(
         state,
-        execution_metadata={
-            **state.execution_metadata,
-            "planner_stop_proposed_by": "python_runtime",
-            "terminal_stop_projection_applied": True,
-            "terminal_stop_projection_trace": "execution_metadata_only",
-        },
+        execution_metadata=metadata,
     )
 
 
@@ -210,79 +209,6 @@ def _initial_context_evidence(
     if include_incident_observations:
         evidence.extend(build_incident_observation_evidence(job))
     return evidence
-
-
-def _align_terminal_planner_stop(state: RCAState) -> RCAState:
-    """Project a Python terminal decision when the final Gate changes a stop.
-
-    A superseded stop is retained in execution metadata for audit rather than as
-    a second typed stop (which would make the Planner trace invalid).  The last
-    effective PlannerDecision, State fields, and Competition terminal state then
-    describe the same outcome.
-    """
-
-    if (
-        state.stop_reason is None
-        or state.goal_status is None
-        or state.conclusion_level is None
-    ):
-        return state
-    last = state.planner_decisions[-1] if state.planner_decisions else None
-    if (
-        last is not None
-        and last.decision_type == DecisionType.STOP.value
-        and last.stop_reason == state.stop_reason
-        and last.goal_status == state.goal_status
-    ):
-        return state
-    goal_id = (
-        state.investigation_goal.goal_id
-        if state.investigation_goal is not None
-        else state.job.job_id
-    )
-    projection = PlannerDecision(
-        decision_id=(
-            last.decision_id
-            if last is not None and last.decision_type == DecisionType.STOP.value
-            else (
-                f"{goal_id}:python-terminal-projection:"
-                f"{len(state.planner_decisions) + 1}"
-            )
-        ),
-        goal_id=goal_id,
-        decision_type=DecisionType.STOP.value,
-        reason=(
-            "Python projected the authoritative Competition/Confirmation Gate "
-            "terminal state after preserving the original Planner decision."
-        ),
-        goal_status=state.goal_status,
-        proposed_conclusion_level=state.conclusion_level,
-        stop_reason=state.stop_reason,
-    )
-    superseded_stop = (
-        last.to_dict()
-        if last is not None and last.decision_type == DecisionType.STOP.value
-        else None
-    )
-    planner_decisions = (
-        [*state.planner_decisions[:-1], projection]
-        if superseded_stop is not None
-        else [*state.planner_decisions, projection]
-    )
-    return replace(
-        state,
-        planner_decisions=planner_decisions,
-        execution_metadata={
-            **state.execution_metadata,
-            "planner_stop_proposed_by": "python_runtime",
-            "terminal_stop_projection_applied": True,
-            **(
-                {"superseded_terminal_planner_decision": superseded_stop}
-                if superseded_stop is not None
-                else {}
-            ),
-        },
-    )
 
 
 def _is_llm_budget_exhaustion(error: LLMCallError) -> bool:
@@ -1006,72 +932,6 @@ def _open_question_gaps(questions: list[InvestigationQuestion]) -> list[str]:
     ]
 
 
-def _conclusion_cap(state: RCAState, goal: InvestigationGoal) -> str:
-    # Iterative RCA keeps historical Hypotheses for audit. Only the explicitly
-    # authoritative Hypothesis may cap the current conclusion; an older
-    # supported/conflicted round must never leak into the terminal result.
-    authoritative = state.authoritative_hypothesis
-    authoritative_status = (
-        authoritative.status if authoritative is not None else None
-    )
-    if authoritative_status == HypothesisStatus.CONFLICTED.value:
-        return ConclusionLevel.CONFLICTED.value
-    if authoritative_status == HypothesisStatus.SUPPORTED.value:
-        return ConclusionLevel.SUPPORTED.value
-    if authoritative_status == HypothesisStatus.CANDIDATE.value:
-        return ConclusionLevel.CANDIDATE.value
-    if authoritative_status in {
-        HypothesisStatus.INCONCLUSIVE.value,
-        HypothesisStatus.REJECTED.value,
-    }:
-        return ConclusionLevel.INCONCLUSIVE.value
-    if not state.evidence:
-        return ConclusionLevel.INCONCLUSIVE.value
-
-    finding_agents = {finding.agent for finding in state.findings}
-    if (
-        goal.intent == InvestigationIntent.HISTORICAL_LOOKUP.value
-        and AgentKind.KNOWLEDGE.value in finding_agents
-    ):
-        return ConclusionLevel.CANDIDATE.value
-    if goal.intent in {
-        InvestigationIntent.ROOT_CAUSE.value,
-        InvestigationIntent.FULL_RCA.value,
-    } and {
-        AgentKind.MES.value,
-        AgentKind.FDC.value,
-        AgentKind.DEFECT_WAT.value,
-    } <= finding_agents:
-        return ConclusionLevel.CANDIDATE.value
-    return ConclusionLevel.SIGNAL.value
-
-
-def _gate_conclusion_level(
-    proposed_level: str,
-    *,
-    state: RCAState,
-    goal: InvestigationGoal,
-) -> str:
-    """Bound Qwen's proposed level by the existing Evidence/Hypothesis gate."""
-
-    cap = _conclusion_cap(state, goal)
-    if cap == ConclusionLevel.CONFLICTED.value:
-        return cap
-    if proposed_level == ConclusionLevel.CONFLICTED.value:
-        return ConclusionLevel.INCONCLUSIVE.value
-    if proposed_level == ConclusionLevel.INCONCLUSIVE.value:
-        return proposed_level
-    if cap == ConclusionLevel.INCONCLUSIVE.value:
-        return cap
-
-    ordered = [
-        ConclusionLevel.SIGNAL.value,
-        ConclusionLevel.CANDIDATE.value,
-        ConclusionLevel.SUPPORTED.value,
-    ]
-    return ordered[min(ordered.index(proposed_level), ordered.index(cap))]
-
-
 def _reconcile_satisfied_questions(state: RCAState) -> list[InvestigationQuestion]:
     if not state.investigation_questions or not state.evidence:
         return list(state.investigation_questions)
@@ -1640,13 +1500,16 @@ class Supervisor:
                                 ),
                             },
                         )
-                        terminal = _mark_fallback_python_terminal(terminal)
+                        terminal = _record_finalizer_terminal_projection(terminal)
                         validate_terminal_investigation_state(terminal)
                     elif (
                         terminal.execution_metadata.get("investigation_finalizer")
                         == "not_applicable"
                     ):
-                        terminal = _align_non_competition_llm_react_terminal(terminal)
+                        terminal = finalize_non_competition_llm_react_terminal(
+                            terminal
+                        )
+                        terminal = _record_finalizer_terminal_projection(terminal)
                         validate_terminal_investigation_state(terminal)
                 emit_workflow_event(
                     "investigation_stopped",
@@ -1863,7 +1726,9 @@ class Supervisor:
                         terminal_state,
                         budget_exhausted=True,
                     )
-                    terminal_state = _align_terminal_planner_stop(terminal_state)
+                    terminal_state = _record_finalizer_terminal_projection(
+                        terminal_state
+                    )
                     terminal = replace(
                         terminal_state,
                         job=replace(
@@ -1978,7 +1843,7 @@ class Supervisor:
                         ),
                     },
                 )
-                conclusion_level = _gate_conclusion_level(
+                conclusion_level = gate_planner_conclusion_level(
                     decision.proposed_conclusion_level,
                     state=state,
                     goal=intent_plan.goal,
@@ -2012,7 +1877,9 @@ class Supervisor:
                         decision.stop_reason == StopReason.BUDGET_EXHAUSTED.value
                     ),
                 )
-                terminal_state = _align_terminal_planner_stop(terminal_state)
+                terminal_state = _record_finalizer_terminal_projection(
+                    terminal_state
+                )
                 terminal = replace(
                     terminal_state,
                     job=replace(

@@ -268,6 +268,64 @@ def test_normal_impact_run_has_valid_gain_success_and_correct_stop() -> None:
     assert evaluation.decision_evaluations[1].decision_valid is True
 
 
+def test_finalizer_projection_preserves_valid_planner_proposal_and_terminal_stop() -> None:
+    original = make_successful_impact_state()
+    planner_stop = original.planner_decisions[-1]
+    state = replace(
+        original,
+        execution_metadata={
+            **original.execution_metadata,
+            "planner_stop_proposed_by": "qwen",
+            "terminal_stop_projection_applied": True,
+            "terminal_stop_projection_trace": "execution_metadata_only",
+            "terminal_stop_projected_by": "python_investigation_finalizer",
+            "superseded_terminal_planner_decision": planner_stop.to_dict(),
+            "terminal_state_owner": "python_investigation_finalizer",
+        },
+        goal_status=GoalStatus.BLOCKED.value,
+        conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+        stop_reason=StopReason.NO_HIGH_VALUE_ACTION.value,
+    )
+
+    evaluation = evaluate(state)
+
+    assert evaluation is not None
+    assert evaluation.goal_success is False
+    assert evaluation.stop_correct is True
+    assert evaluation.decision_evaluations[-1].decision_valid is True
+    assert "Finalizer terminal projection" in (
+        evaluation.decision_evaluations[-1].reason
+    )
+
+
+def test_unaudited_terminal_mismatch_remains_invalid() -> None:
+    original = make_successful_impact_state()
+    planner_stop = original.planner_decisions[-1]
+    state = replace(
+        original,
+        execution_metadata={
+            **original.execution_metadata,
+            "terminal_stop_projection_applied": True,
+            "terminal_stop_projection_trace": "execution_metadata_only",
+            "terminal_stop_projected_by": "python_investigation_finalizer",
+            "terminal_state_owner": "python_investigation_finalizer",
+            "superseded_terminal_planner_decision": {
+                **planner_stop.to_dict(),
+                "decision_id": "DECISION_TAMPERED",
+            },
+        },
+        goal_status=GoalStatus.BLOCKED.value,
+        conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+        stop_reason=StopReason.NO_HIGH_VALUE_ACTION.value,
+    )
+
+    evaluation = evaluate(state)
+
+    assert evaluation is not None
+    assert evaluation.stop_correct is False
+    assert evaluation.decision_evaluations[-1].decision_valid is False
+
+
 def test_optional_unavailable_question_does_not_fail_a_gated_success() -> None:
     state = make_successful_impact_state()
     unavailable = replace(

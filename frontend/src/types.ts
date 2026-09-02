@@ -568,6 +568,12 @@ export interface ExecutionMetadata {
   orchestration_fallback_attempt_count?: number;
   orchestration_fallback_validation_errors?: string[];
   intent_planner_attempt_diagnostics?: PlannerAttemptDiagnostic[];
+  planner_stop_proposed_by?: "qwen" | "python_runtime";
+  terminal_stop_projection_applied?: boolean;
+  terminal_stop_projection_trace?: "execution_metadata_only";
+  terminal_stop_projected_by?: "python_investigation_finalizer";
+  terminal_state_owner?: "python_investigation_finalizer";
+  superseded_terminal_planner_decision?: PlannerDecision;
   tool_latencies?: ToolLatencyRecord[];
 }
 

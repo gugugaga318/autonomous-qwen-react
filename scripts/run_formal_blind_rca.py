@@ -245,6 +245,44 @@ def _prepare_output(output_dir: Path, *, overwrite: bool) -> None:
     (output_dir / "states").mkdir(parents=True)
 
 
+_FINALIZER_TERMINAL_PROJECTOR = "python_investigation_finalizer"
+
+
+def _python_terminal_stop_is_governed(result: dict[str, Any]) -> bool:
+    stop_proposer = result.get("planner_stop_proposed_by")
+    terminal_projector = result.get("terminal_stop_projected_by")
+    if (
+        stop_proposer != "python_runtime"
+        and terminal_projector != _FINALIZER_TERMINAL_PROJECTOR
+    ):
+        return False
+    governed_stop_reasons = {
+        StopReason.NO_ALLOWED_ACTION.value,
+        StopReason.NO_HIGH_VALUE_ACTION.value,
+        StopReason.BUDGET_EXHAUSTED.value,
+    }
+    governed_legacy_data_unavailable = (
+        result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
+        and result.get("conclusion_status") == "insufficient_evidence"
+        and bool(result.get("required_unavailable_evidence_ids"))
+    )
+    governed_competition_data_unavailable = (
+        result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
+        and result.get("conclusion_status") == "insufficient_evidence"
+        and result.get("competition_status") == "blocked_by_missing_data"
+        and result.get("competition_terminal_reason")
+        == "no_high_value_action_after_required_source_unavailable"
+        and result.get("competition_lifecycle_valid") is True
+        and result.get("investigation_decision_accepted") is True
+        and bool(result.get("decision_critical_unavailable_evidence_ids"))
+    )
+    return (
+        result.get("planner_stop_reason") in governed_stop_reasons
+        or governed_legacy_data_unavailable
+        or governed_competition_data_unavailable
+    )
+
+
 def _strict_qwen_acceptance_reasons(
     result: dict[str, Any],
     *,
@@ -271,35 +309,16 @@ def _strict_qwen_acceptance_reasons(
     if result.get("llm_call_cap_exceeded"):
         reasons.append("llm_call_cap_exceeded")
     stop_proposer = result.get("planner_stop_proposed_by")
-    if stop_proposer == "python_runtime":
-        governed_stop_reasons = {
-            StopReason.NO_ALLOWED_ACTION.value,
-            StopReason.NO_HIGH_VALUE_ACTION.value,
-            StopReason.BUDGET_EXHAUSTED.value,
-        }
-        governed_legacy_data_unavailable = (
-            result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
-            and result.get("conclusion_status") == "insufficient_evidence"
-            and bool(result.get("required_unavailable_evidence_ids"))
-        )
-        governed_competition_data_unavailable = (
-            result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
-            and result.get("conclusion_status") == "insufficient_evidence"
-            and result.get("competition_status") == "blocked_by_missing_data"
-            and result.get("competition_terminal_reason")
-            == "no_high_value_action_after_required_source_unavailable"
-            and result.get("competition_lifecycle_valid") is True
-            and result.get("investigation_decision_accepted") is True
-            and bool(result.get("decision_critical_unavailable_evidence_ids"))
-        )
-        if (
-            result.get("planner_stop_reason") not in governed_stop_reasons
-            and not governed_legacy_data_unavailable
-            and not governed_competition_data_unavailable
-        ):
-            reasons.append("python_runtime_stop_not_governed")
-    elif stop_proposer != "qwen":
+    terminal_projector = result.get("terminal_stop_projected_by")
+    if terminal_projector not in {None, _FINALIZER_TERMINAL_PROJECTOR}:
+        reasons.append("terminal_stop_projection_source_invalid")
+    if stop_proposer not in {"qwen", "python_runtime"}:
         reasons.append("planner_stop_source_invalid")
+    elif (
+        stop_proposer == "python_runtime"
+        or terminal_projector == _FINALIZER_TERMINAL_PROJECTOR
+    ) and not _python_terminal_stop_is_governed(result):
+        reasons.append("python_runtime_stop_not_governed")
     if result.get("terminal_question_updates_source") != "python_evidence_gate":
         reasons.append("terminal_updates_not_python_evidence_gate")
     if result.get("competition_lifecycle_valid") is False:
@@ -358,21 +377,10 @@ def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
     )
     qwen_stop = sum(item.get("planner_stop_proposed_by") == "qwen" for item in results)
     governed_python_stop = sum(
-        item.get("planner_stop_proposed_by") == "python_runtime"
-        and (
-            item.get("planner_stop_reason")
-            in {
-                StopReason.NO_ALLOWED_ACTION.value,
-                StopReason.NO_HIGH_VALUE_ACTION.value,
-                StopReason.BUDGET_EXHAUSTED.value,
-            }
-            or (
-                item.get("planner_stop_reason")
-                == StopReason.DATA_UNAVAILABLE.value
-                and item.get("conclusion_status") == "insufficient_evidence"
-                and bool(item.get("required_unavailable_evidence_ids"))
-            )
-        )
+        _python_terminal_stop_is_governed(item) for item in results
+    )
+    finalizer_terminal_projection = sum(
+        item.get("terminal_stop_projected_by") == _FINALIZER_TERMINAL_PROJECTOR
         for item in results
     )
     python_terminal = sum(
@@ -414,6 +422,10 @@ def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
         "qwen_stop_proposal_rate": ratio(qwen_stop),
         "governed_python_stop_count": governed_python_stop,
         "governed_python_stop_rate": ratio(governed_python_stop),
+        "finalizer_terminal_projection_count": finalizer_terminal_projection,
+        "finalizer_terminal_projection_rate": ratio(
+            finalizer_terminal_projection
+        ),
         "python_terminal_gate_count": python_terminal,
         "python_terminal_gate_rate": ratio(python_terminal),
         "qwen_competition_evaluated_count": competition_evaluated,
@@ -712,6 +724,9 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                     "planner_stop_proposed_by": state.execution_metadata.get(
                         "planner_stop_proposed_by"
                     ),
+                    "terminal_stop_projected_by": state.execution_metadata.get(
+                        "terminal_stop_projected_by"
+                    ),
                     "planner_stop_reason": state.stop_reason,
                     "terminal_question_updates_source": state.execution_metadata.get(
                         "terminal_question_updates_source"
@@ -780,6 +795,7 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                         client.provider_failures if client is not None else []
                     ),
                     "planner_stop_proposed_by": None,
+                    "terminal_stop_projected_by": None,
                     "planner_stop_reason": None,
                     "terminal_question_updates_source": None,
                     "required_unavailable_evidence_ids": [],

@@ -20,12 +20,15 @@ from yield_rca_core.investigation_models import (
     ConclusionLevel,
     EvidenceGapStatus,
     GoalStatus,
+    InvestigationGoal,
+    InvestigationIntent,
     InvestigationQuestion,
     QuestionEvidenceRelation,
     StopReason,
 )
 from yield_rca_core.models import (
     AgentFinding,
+    AgentKind,
     Hypothesis,
     HypothesisStatus,
     ModelValidationError,
@@ -37,6 +40,91 @@ from yield_rca_core.question_capability import QUESTION_CAPABILITY_REGISTRY
 
 class InvestigationFinalizationError(RuntimeError):
     """Raised when a Job attempts to finish with non-terminal investigation state."""
+
+
+def gate_planner_conclusion_level(
+    proposed_level: str,
+    *,
+    state: RCAState,
+    goal: InvestigationGoal,
+) -> str:
+    """Bound a Planner proposal without giving Supervisor conclusion authority."""
+
+    authoritative = state.authoritative_hypothesis
+    authoritative_status = (
+        authoritative.status if authoritative is not None else None
+    )
+    if authoritative_status == HypothesisStatus.CONFLICTED.value:
+        cap = ConclusionLevel.CONFLICTED.value
+    elif authoritative_status == HypothesisStatus.SUPPORTED.value:
+        cap = ConclusionLevel.SUPPORTED.value
+    elif authoritative_status == HypothesisStatus.CANDIDATE.value:
+        cap = ConclusionLevel.CANDIDATE.value
+    elif authoritative_status in {
+        HypothesisStatus.INCONCLUSIVE.value,
+        HypothesisStatus.REJECTED.value,
+    } or not state.evidence:
+        cap = ConclusionLevel.INCONCLUSIVE.value
+    else:
+        finding_agents = {finding.agent for finding in state.findings}
+        if (
+            goal.intent == InvestigationIntent.HISTORICAL_LOOKUP.value
+            and AgentKind.KNOWLEDGE.value in finding_agents
+        ):
+            cap = ConclusionLevel.CANDIDATE.value
+        elif goal.intent in {
+            InvestigationIntent.ROOT_CAUSE.value,
+            InvestigationIntent.FULL_RCA.value,
+        } and {
+            AgentKind.MES.value,
+            AgentKind.FDC.value,
+            AgentKind.DEFECT_WAT.value,
+        } <= finding_agents:
+            cap = ConclusionLevel.CANDIDATE.value
+        else:
+            cap = ConclusionLevel.SIGNAL.value
+
+    if cap == ConclusionLevel.CONFLICTED.value:
+        return cap
+    if proposed_level == ConclusionLevel.CONFLICTED.value:
+        return ConclusionLevel.INCONCLUSIVE.value
+    if proposed_level == ConclusionLevel.INCONCLUSIVE.value:
+        return proposed_level
+    if cap == ConclusionLevel.INCONCLUSIVE.value:
+        return cap
+
+    ordered = [
+        ConclusionLevel.SIGNAL.value,
+        ConclusionLevel.CANDIDATE.value,
+        ConclusionLevel.SUPPORTED.value,
+    ]
+    return ordered[min(ordered.index(proposed_level), ordered.index(cap))]
+
+
+def finalize_non_competition_llm_react_terminal(state: RCAState) -> RCAState:
+    """Withhold unsupported Qwen publication when Competition was not applicable."""
+
+    authoritative = state.authoritative_rca_finding
+    if authoritative is None:
+        return state
+    conclusion_status = str(
+        authoritative.details.get("conclusion_status", "")
+    ).strip()
+    if conclusion_status == "supported":
+        return state
+    return replace(
+        state,
+        goal_status=GoalStatus.BLOCKED.value,
+        conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+        stop_reason=StopReason.NO_HIGH_VALUE_ACTION.value,
+        execution_metadata={
+            **state.execution_metadata,
+            "terminal_question_updates_source": "python_evidence_gate",
+            "terminal_question_updates_validated_by": "python_evidence_gate",
+            "terminal_conclusion_status_source": "authoritative_rca_finding",
+            "terminal_state_owner": "python_investigation_finalizer",
+        },
+    )
 
 
 def _formal_competition_is_applicable(state: RCAState) -> bool:
@@ -491,6 +579,8 @@ def validate_terminal_investigation_state(state: RCAState) -> None:
 
 __all__ = [
     "InvestigationFinalizationError",
+    "finalize_non_competition_llm_react_terminal",
     "finalize_investigation",
+    "gate_planner_conclusion_level",
     "validate_terminal_investigation_state",
 ]

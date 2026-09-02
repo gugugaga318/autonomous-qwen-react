@@ -311,6 +311,27 @@ describe("AgentDecisionTrace server rendering", () => {
     );
   });
 
+  it("renders a Finalizer outcome separately from the preserved Planner proposal", () => {
+    const state = populatedTraceState();
+    state.execution_metadata = {
+      ...state.execution_metadata,
+      terminal_stop_projection_applied: true,
+      terminal_stop_projection_trace: "execution_metadata_only",
+      terminal_stop_projected_by: "python_investigation_finalizer",
+    };
+    state.goal_status = "blocked";
+    state.conclusion_level = "inconclusive";
+    state.stop_reason = "no_high_value_action";
+
+    const html = renderToStaticMarkup(<AgentDecisionTrace state={state} />);
+
+    expect(html).toContain("Python Finalizer outcome");
+    expect(html).toContain(
+      "The Planner proposal is preserved separately from the authoritative terminal state.",
+    );
+    expect(html).toContain("No High Value Action");
+  });
+
   it("renders an immediate stop when the autonomous run has no ActionRecord", () => {
     const state = stateFixture();
     const stop = stopDecision(

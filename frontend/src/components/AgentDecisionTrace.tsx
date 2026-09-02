@@ -1178,6 +1178,12 @@ export function AgentDecisionTrace({ state }: AgentDecisionTraceProps) {
   const hasControlledHandoff =
     trace.evaluationStatus === "fallback" ||
     trace.nodes.some((node) => node.origin === "controlled_fallback");
+  const hasFinalizerProjection =
+    state.execution_metadata.terminal_stop_projection_applied === true &&
+    state.execution_metadata.terminal_stop_projection_trace ===
+      "execution_metadata_only" &&
+    state.execution_metadata.terminal_stop_projected_by ===
+      "python_investigation_finalizer";
   const title = hasControlledHandoff
     ? "Planner Trace + Controlled Handoff"
     : "Autonomous Agent Trace";
@@ -1331,6 +1337,48 @@ export function AgentDecisionTrace({ state }: AgentDecisionTraceProps) {
                 {state.evidence_gaps && state.evidence_gaps.length > 0
                   ? state.evidence_gaps.join(", ")
                   : "None"}
+              </dd>
+            </div>
+          </dl>
+        </aside>
+      )}
+
+      {hasFinalizerProjection && !hasControlledHandoff && (
+        <aside
+          className="agent-trace-handoff-outcome"
+          aria-labelledby="finalizer-outcome-heading"
+        >
+          <div>
+            <CheckCircle2 size={16} aria-hidden="true" />
+            <h3 id="finalizer-outcome-heading">Python Finalizer outcome</h3>
+          </div>
+          <p>
+            The Planner proposal is preserved separately from the authoritative
+            terminal state.
+          </p>
+          <dl>
+            <div>
+              <dt>Goal status</dt>
+              <dd>
+                {state.goal_status
+                  ? formatTraceLabel(state.goal_status)
+                  : "Not available"}
+              </dd>
+            </div>
+            <div>
+              <dt>Conclusion</dt>
+              <dd>
+                {state.conclusion_level
+                  ? formatTraceLabel(state.conclusion_level)
+                  : "Not available"}
+              </dd>
+            </div>
+            <div>
+              <dt>Stop reason</dt>
+              <dd>
+                {state.stop_reason
+                  ? formatTraceLabel(state.stop_reason)
+                  : "Not available"}
               </dd>
             </div>
           </dl>

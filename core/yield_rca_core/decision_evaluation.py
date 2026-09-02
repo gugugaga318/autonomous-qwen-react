@@ -85,6 +85,29 @@ def _finding_evidence_ids(findings: list[AgentFinding]) -> list[str]:
     )
 
 
+def _has_audited_finalizer_projection(
+    state: RCAState,
+    decision: PlannerDecision | None = None,
+) -> bool:
+    metadata = state.execution_metadata
+    if not (
+        metadata.get("terminal_stop_projection_applied") is True
+        and metadata.get("terminal_stop_projection_trace")
+        == "execution_metadata_only"
+        and metadata.get("terminal_stop_projected_by")
+        == "python_investigation_finalizer"
+        and metadata.get("terminal_state_owner")
+        == "python_investigation_finalizer"
+        and state.goal_status is not None
+        and state.stop_reason is not None
+    ):
+        return False
+    if decision is None:
+        return True
+    superseded = metadata.get("superseded_terminal_planner_decision")
+    return isinstance(superseded, dict) and superseded == decision.to_dict()
+
+
 def _evaluate_stop_decision(
     state: RCAState,
     decision: PlannerDecision,
@@ -92,12 +115,14 @@ def _evaluate_stop_decision(
     decision_index: int,
 ) -> DecisionEvaluation:
     issues: list[str] = []
+    terminal_fields_match = (
+        decision.goal_status == state.goal_status
+        and decision.stop_reason == state.stop_reason
+    )
+    audited_projection = _has_audited_finalizer_projection(state, decision)
     if decision_index != len(state.planner_decisions) - 1:
         issues.append("it is not the final Planner decision")
-    if (
-        decision.goal_status != state.goal_status
-        or decision.stop_reason != state.stop_reason
-    ):
+    if not terminal_fields_match and not audited_projection:
         issues.append("its terminal fields do not match the final state")
     committed_action_ids = [
         item.next_action.action_id
@@ -120,9 +145,18 @@ def _evaluate_stop_decision(
         redundant=False,
         reason=(
             (
-                "The stop decision is the final typed Planner decision and "
-                "matches the terminal state. Whether it stopped at the right "
-                "investigation boundary is evaluated at run level."
+                (
+                    "The stop proposal is the final typed Planner decision and "
+                    "is preserved separately from an audited Python Finalizer "
+                    "terminal projection. Whether the final run stopped at the "
+                    "right investigation boundary is evaluated at run level."
+                )
+                if audited_projection and not terminal_fields_match
+                else (
+                    "The stop decision is the final typed Planner decision and "
+                    "matches the terminal state. Whether it stopped at the right "
+                    "investigation boundary is evaluated at run level."
+                )
             )
             if valid
             else (
@@ -411,11 +445,16 @@ def _stop_correct(state: RCAState) -> tuple[bool, str]:
     if goal is None:
         return False, "the run has no typed investigation goal."
     terminal = state.planner_decisions[-1]
-    if terminal.decision_type != DecisionType.STOP.value:
+    audited_projection = _has_audited_finalizer_projection(state)
+    if terminal.decision_type != DecisionType.STOP.value and not audited_projection:
         return False, "the Planner trace has no final stop decision."
     if (
-        terminal.stop_reason != state.stop_reason
-        or terminal.goal_status != state.goal_status
+        terminal.decision_type == DecisionType.STOP.value
+        and (
+            terminal.stop_reason != state.stop_reason
+            or terminal.goal_status != state.goal_status
+        )
+        and not _has_audited_finalizer_projection(state, terminal)
     ):
         return False, "the final stop decision does not match the terminal state."
 
@@ -500,6 +539,32 @@ def _stop_correct(state: RCAState) -> tuple[bool, str]:
             "the deterministic policy confirms that no registered action remains."
             if correct
             else "the deterministic policy still has a registered next action."
+        )
+        return correct, reason
+
+    if actual_reason == StopReason.NO_HIGH_VALUE_ACTION.value:
+        finalizer_owned = audited_projection or (
+            state.execution_metadata.get("investigation_finalizer")
+            == "python_competition_progression"
+        )
+        no_high_value_action = not any(
+            assessment.high_value
+            for assessment in state.latest_action_value_assessments
+        )
+        correct = (
+            state.goal_status == GoalStatus.BLOCKED.value
+            and state.conclusion_level == ConclusionLevel.INCONCLUSIVE.value
+            and finalizer_owned
+            and no_high_value_action
+        )
+        reason = (
+            "the Python Finalizer found no eligible high-value action that could "
+            "change ranking or confirmation."
+            if correct
+            else (
+                "the terminal trace does not prove a Finalizer-owned "
+                "no-high-value-action boundary."
+            )
         )
         return correct, reason
 
