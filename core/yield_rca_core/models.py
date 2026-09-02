@@ -12,6 +12,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Self
 
+from yield_rca_core.authoritative_result import (
+    AuthoritativeRCAResult,
+    ImpactPublicationResult,
+)
 from yield_rca_core.causal_investigation_models import (
     ActionValueAssessment,
     CandidateChallenge,
@@ -883,6 +887,10 @@ class RCAState:
     # report/API/memory/product surfaces.
     authoritative_rca_finding_id: str | None = None
     authoritative_hypothesis_id: str | None = None
+    # Batch 1 authority foundation. These additive containers are intentionally
+    # not populated by current workflows until later ownership migration batches.
+    authoritative_rca_result: AuthoritativeRCAResult | None = None
+    impact_publication_result: ImpactPublicationResult | None = None
     goal_status: str | None = None
     conclusion_level: str | None = None
     evidence_gaps: list[str] = field(default_factory=list)
@@ -1016,6 +1024,7 @@ class RCAState:
         self._validate_task_references()
         self._validate_investigation_trace()
         self._validate_authority_references()
+        self._validate_authoritative_results()
 
     @property
     def evidence_by_id(self) -> dict[str, Evidence]:
@@ -1316,6 +1325,95 @@ class RCAState:
                     "authoritative_hypothesis_id references an unknown Hypothesis"
                 )
 
+    def _validate_authoritative_results(self) -> None:
+        result = self.authoritative_rca_result
+        publication = self.impact_publication_result
+        if result is not None and not isinstance(result, AuthoritativeRCAResult):
+            raise ModelValidationError(
+                "authoritative_rca_result must be an AuthoritativeRCAResult"
+            )
+        if publication is not None and not isinstance(
+            publication,
+            ImpactPublicationResult,
+        ):
+            raise ModelValidationError(
+                "impact_publication_result must be an ImpactPublicationResult"
+            )
+
+        known_evidence_ids = set(self.evidence_by_id)
+        if result is not None:
+            self._validate_reference_set(
+                list(result.evidence_refs),
+                known_evidence_ids,
+                "authoritative RCA result",
+            )
+            if result.source_finding_id is not None:
+                source_finding = next(
+                    (
+                        item
+                        for item in self.findings
+                        if item.finding_id == result.source_finding_id
+                    ),
+                    None,
+                )
+                if source_finding is None:
+                    raise ModelValidationError(
+                        "authoritative RCA result source_finding_id references "
+                        "an unknown Finding"
+                    )
+                if source_finding.agent != AgentKind.RCA_REASONING.value:
+                    raise ModelValidationError(
+                        "authoritative RCA result source_finding_id must reference "
+                        "an RCA Reasoning Finding"
+                    )
+                if (
+                    self.authoritative_rca_finding_id is not None
+                    and result.source_finding_id != self.authoritative_rca_finding_id
+                ):
+                    raise ModelValidationError(
+                        "authoritative RCA result source_finding_id must match "
+                        "authoritative_rca_finding_id"
+                    )
+            if result.source_hypothesis_id is not None:
+                if not any(
+                    item.hypothesis_id == result.source_hypothesis_id
+                    for item in self.hypotheses
+                ):
+                    raise ModelValidationError(
+                        "authoritative RCA result source_hypothesis_id references "
+                        "an unknown Hypothesis"
+                    )
+                if (
+                    self.authoritative_hypothesis_id is not None
+                    and result.source_hypothesis_id != self.authoritative_hypothesis_id
+                ):
+                    raise ModelValidationError(
+                        "authoritative RCA result source_hypothesis_id must match "
+                        "authoritative_hypothesis_id"
+                    )
+
+        if publication is None:
+            return
+        if result is None:
+            raise ModelValidationError(
+                "impact_publication_result requires authoritative_rca_result"
+            )
+        if publication.rca_result_id != result.result_id:
+            raise ModelValidationError(
+                "impact publication rca_result_id must match authoritative RCA result"
+            )
+        self._validate_reference_set(
+            list(publication.evidence_refs),
+            known_evidence_ids,
+            "impact publication result",
+        )
+        if publication.publication_status == "confirmed" and (
+            result.conclusion_status != "supported"
+        ):
+            raise ModelValidationError(
+                "confirmed impact publication requires a supported authoritative RCA result"
+            )
+
     @staticmethod
     def _validate_reference_set(values: list[str], known_values: set[str], context: str) -> None:
         missing = set(values) - known_values
@@ -1599,6 +1697,16 @@ class RCAState:
             ],
             "authoritative_rca_finding_id": self.authoritative_rca_finding_id,
             "authoritative_hypothesis_id": self.authoritative_hypothesis_id,
+            **(
+                {"authoritative_rca_result": self.authoritative_rca_result.to_dict()}
+                if self.authoritative_rca_result is not None
+                else {}
+            ),
+            **(
+                {"impact_publication_result": self.impact_publication_result.to_dict()}
+                if self.impact_publication_result is not None
+                else {}
+            ),
             "goal_status": self.goal_status,
             "conclusion_level": self.conclusion_level,
             "evidence_gaps": list(self.evidence_gaps),
@@ -1728,6 +1836,16 @@ class RCAState:
             authoritative_hypothesis_id=(
                 str(raw_authoritative_hypothesis_id)
                 if raw_authoritative_hypothesis_id is not None
+                else None
+            ),
+            authoritative_rca_result=(
+                AuthoritativeRCAResult.from_dict(data["authoritative_rca_result"])
+                if data.get("authoritative_rca_result") is not None
+                else None
+            ),
+            impact_publication_result=(
+                ImpactPublicationResult.from_dict(data["impact_publication_result"])
+                if data.get("impact_publication_result") is not None
                 else None
             ),
             goal_status=data.get("goal_status"),

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from yield_rca_core.authoritative_result import (
+    AuthoritativeRCAResult,
+    ImpactPublicationResult,
+)
 from yield_rca_core.causal_adversarial import (
     AdversarialChallengeGeneration,
     QwenAdversarialChallenger,
@@ -331,6 +335,7 @@ __all__ = [
     "AgentMode",
     "AgentTask",
     "ApprovalDecision",
+    "AuthoritativeRCAResult",
     "AnalyzeLotGenealogyTool",
     "AnalyzeParameterShiftTool",
     "AnalyzeSpcEvidenceTool",
@@ -427,6 +432,7 @@ __all__ = [
     "HypothesisCandidateProposal",
     "HypothesisEngine",
     "HypothesisStatus",
+    "ImpactPublicationResult",
     "HybridDocumentChunkRetriever",
     "HybridRetrievalConfigurationError",
     "ImprovementAgent",
