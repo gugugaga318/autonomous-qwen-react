@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from yield_rca_core.authoritative_result import (
+    ImpactPublicationResult,
+    ImpactPublicationStatus,
+)
 from yield_rca_core.causal_chain import assess_causal_chain
 from yield_rca_core.causal_evidence_matrix import CausalEvidenceMatrix
 from yield_rca_core.causal_hypothesis import CausalClaim, CausalClaimStatus, CausalHypothesis
@@ -1250,11 +1254,72 @@ def evaluate_impact_lot_gate(
     }
 
 
+def derive_impact_publication_result(
+    impact_gate: Mapping[str, Any],
+    *,
+    rca_result_id: str,
+    conclusion_status: str,
+) -> ImpactPublicationResult:
+    """Re-evaluate a stored Impact Gate assessment against the terminal conclusion.
+
+    The publication rule is identical to :func:`evaluate_impact_lot_gate`.
+    This function exists so the terminal writer can evaluate that rule against
+    the final authoritative conclusion instead of an earlier reasoning-round
+    snapshot, so a downgraded terminal conclusion can never keep publishing
+    confirmed impact Lots. It never re-runs sources or changes gate criteria.
+    """
+
+    gate = impact_gate if isinstance(impact_gate, Mapping) else {}
+    raw_rows = gate.get("rows")
+    rows = (
+        [row for row in raw_rows if isinstance(row, Mapping)]
+        if isinstance(raw_rows, list)
+        else []
+    )
+    raw_matches = gate.get("candidate_impact_lots")
+    candidate_matches = tuple(
+        dict.fromkeys(
+            str(item).strip()
+            for item in (raw_matches if isinstance(raw_matches, list) else [])
+            if str(item).strip()
+        )
+    )
+    publication_allowed = conclusion_status == CONCLUSION_SUPPORTED
+    confirmed = candidate_matches if publication_allowed else ()
+    if confirmed:
+        publication_status = "confirmed"
+    elif candidate_matches:
+        publication_status = "withheld"
+    elif not rows:
+        publication_status = "not_evaluated"
+    else:
+        publication_status = "unconfirmed"
+    confirmed_lots = set(confirmed)
+    evidence_refs: list[str] = []
+    for row in rows:
+        if str(row.get("lot_id", "")).strip() not in confirmed_lots:
+            continue
+        supporting = row.get("supporting_evidence_ids")
+        if not isinstance(supporting, list):
+            continue
+        for evidence_id in supporting:
+            normalized = str(evidence_id).strip()
+            if normalized and normalized not in evidence_refs:
+                evidence_refs.append(normalized)
+    return ImpactPublicationResult(
+        rca_result_id=rca_result_id,
+        publication_status=cast(ImpactPublicationStatus, publication_status),
+        confirmed_impact_lots=confirmed,
+        evidence_refs=tuple(evidence_refs),
+    )
+
+
 __all__ = [
     "CONCLUSION_INCONCLUSIVE",
     "CONCLUSION_INSUFFICIENT_EVIDENCE",
     "CONCLUSION_SUPPORTED",
     "ConfirmationGateResult",
     "confirm_candidate",
+    "derive_impact_publication_result",
     "evaluate_impact_lot_gate",
 ]

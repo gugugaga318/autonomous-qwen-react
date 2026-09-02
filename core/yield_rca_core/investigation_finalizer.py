@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 
+from yield_rca_core.authoritative_result import AuthoritativeRCAResult
 from yield_rca_core.causal_competition_progression import (
     competition_processing_failed,
     progress_competition,
 )
+from yield_rca_core.causal_confirmation import derive_impact_publication_result
 from yield_rca_core.causal_investigation_models import (
     ActionValueAssessment,
     CandidateCompetitionStatus,
@@ -101,6 +103,110 @@ def gate_planner_conclusion_level(
     return ordered[min(ordered.index(proposed_level), ordered.index(cap))]
 
 
+_NON_COMPETITION_SUPPORTED_TERMINAL_REASON = (
+    "Non-competition RCA terminal: the Python confirmation result supports "
+    "the authoritative RCA finding without formal Candidate Competition."
+)
+_NON_COMPETITION_UNSUPPORTED_TERMINAL_REASON = (
+    "Non-competition RCA terminal: formal Candidate Competition does not "
+    "apply and the Python confirmation result does not support a root cause."
+)
+
+
+def build_authoritative_rca_result(
+    state: RCAState,
+    *,
+    conclusion_status: str,
+    competition_status: str,
+    terminal_reason: str,
+) -> AuthoritativeRCAResult:
+    """Construct the terminal RCA authority from governed Finalizer state.
+
+    The Finalizer is the only production writer of the terminal authority
+    object: readers must project it and must not re-derive a conclusion.
+    """
+
+    authoritative = state.authoritative_rca_finding
+    if authoritative is None:
+        raise InvestigationFinalizationError(
+            "authoritative RCA result requires an authoritative RCA Finding"
+        )
+    details = authoritative.details
+    raw_confirmation_gate = details.get("confirmation_gate")
+    confirmation_status = (
+        str(raw_confirmation_gate.get("status", "")).strip()
+        if isinstance(raw_confirmation_gate, dict)
+        else ""
+    )
+    if not confirmation_status:
+        confirmation_status = conclusion_status
+    supported = conclusion_status == "supported"
+    authoritative_hypothesis = state.authoritative_hypothesis
+    return AuthoritativeRCAResult(
+        result_id=f"RCA_RESULT_{authoritative.finding_id}",
+        source_finding_id=authoritative.finding_id,
+        source_hypothesis_id=(
+            authoritative_hypothesis.hypothesis_id
+            if authoritative_hypothesis is not None
+            else None
+        ),
+        conclusion_status=conclusion_status,
+        root_cause_candidate_id=(
+            authoritative_hypothesis.hypothesis_id
+            if supported and authoritative_hypothesis is not None
+            else None
+        ),
+        root_cause=(
+            str(details.get("root_cause", "")).strip() or None
+            if supported
+            else None
+        ),
+        confirmation_status=confirmation_status,
+        competition_status=competition_status,
+        terminal_reason=terminal_reason,
+        evidence_refs=list(dict.fromkeys(authoritative.evidence_ids)),
+    )
+
+
+def _attach_authority_results(
+    state: RCAState,
+    *,
+    conclusion_status: str,
+    competition_status: str,
+    terminal_reason: str,
+) -> RCAState:
+    """Attach terminal authority objects; the Finalizer is their only writer."""
+
+    authoritative = state.authoritative_rca_finding
+    if authoritative is None:
+        raise InvestigationFinalizationError(
+            "authoritative RCA result requires an authoritative RCA Finding"
+        )
+    result = build_authoritative_rca_result(
+        state,
+        conclusion_status=conclusion_status,
+        competition_status=competition_status,
+        terminal_reason=terminal_reason,
+    )
+    raw_impact_gate = authoritative.details.get("impact_lot_gate")
+    publication = derive_impact_publication_result(
+        raw_impact_gate if isinstance(raw_impact_gate, dict) else {},
+        rca_result_id=result.result_id,
+        conclusion_status=result.conclusion_status,
+    )
+    return replace(
+        state,
+        authoritative_rca_result=result,
+        impact_publication_result=publication,
+        execution_metadata={
+            **state.execution_metadata,
+            "authoritative_rca_result_id": result.result_id,
+            "authoritative_rca_result_writer": "python_investigation_finalizer",
+            "impact_publication_result_writer": "python_impact_gate",
+        },
+    )
+
+
 def finalize_non_competition_llm_react_terminal(state: RCAState) -> RCAState:
     """Withhold unsupported Qwen publication when Competition was not applicable."""
 
@@ -111,8 +217,18 @@ def finalize_non_competition_llm_react_terminal(state: RCAState) -> RCAState:
         authoritative.details.get("conclusion_status", "")
     ).strip()
     if conclusion_status == "supported":
-        return state
-    return replace(
+        return _attach_authority_results(
+            state,
+            conclusion_status="supported",
+            competition_status="not_required",
+            terminal_reason=_NON_COMPETITION_SUPPORTED_TERMINAL_REASON,
+        )
+    authority_conclusion_status = (
+        conclusion_status
+        if conclusion_status in {"inconclusive", "insufficient_evidence"}
+        else "inconclusive"
+    )
+    downgraded = replace(
         state,
         goal_status=GoalStatus.BLOCKED.value,
         conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
@@ -124,6 +240,12 @@ def finalize_non_competition_llm_react_terminal(state: RCAState) -> RCAState:
             "terminal_conclusion_status_source": "authoritative_rca_finding",
             "terminal_state_owner": "python_investigation_finalizer",
         },
+    )
+    return _attach_authority_results(
+        downgraded,
+        conclusion_status=authority_conclusion_status,
+        competition_status="not_required",
+        terminal_reason=_NON_COMPETITION_UNSUPPORTED_TERMINAL_REASON,
     )
 
 
@@ -508,7 +630,12 @@ def finalize_investigation(
         updated,
         conclusion_status=progression.conclusion_status,
     )
-    return replace(updated, findings=findings, hypotheses=hypotheses)
+    return _attach_authority_results(
+        replace(updated, findings=findings, hypotheses=hypotheses),
+        conclusion_status=progression.conclusion_status,
+        competition_status=progression.trace.competition_status,
+        terminal_reason=progression.trace.terminal_reason or "",
+    )
 
 
 def validate_terminal_investigation_state(state: RCAState) -> None:
@@ -579,6 +706,7 @@ def validate_terminal_investigation_state(state: RCAState) -> None:
 
 __all__ = [
     "InvestigationFinalizationError",
+    "build_authoritative_rca_result",
     "finalize_non_competition_llm_react_terminal",
     "finalize_investigation",
     "gate_planner_conclusion_level",
