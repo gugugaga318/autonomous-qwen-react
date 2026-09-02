@@ -46,11 +46,17 @@ from yield_rca_core.investigation_models import (  # noqa: E402
     ActionRecord,
     EvidenceGapStatus,
     InvestigationAction,
+    InvestigationGoal,
+    InvestigationIntent,
+    InvestigationQuestion,
     QuestionEvidenceLink,
     QuestionEvidenceRelation,
+    QuestionKind,
     StopReason,
 )
 from yield_rca_core.models import (  # noqa: E402
+    AgentFinding,
+    AgentKind,
     ModelValidationError,
     RCAJob,
     RCAState,
@@ -313,6 +319,74 @@ def test_missing_data_blocks_only_when_no_high_value_action_remains() -> None:
     assert missing.evidence_id in result.trace.resolution_evidence_ids
 
 
+def test_historical_unavailable_gain_does_not_relabel_current_gap_on_same_lane() -> None:
+    old_gap_id = "candidate_0.hypothesis_discrimination.parameter_anomaly.old"
+    current_gap_id = "candidate_0.hypothesis_discrimination.parameter_anomaly.current"
+    historical = _action(
+        "MISSING_OLD_GAP",
+        lane_id="LANE_ALT",
+        gap_id=old_gap_id,
+    )
+    missing = _evidence(historical.produced_evidence_ids[0], missing=True)
+    historical_gain = classify_investigation_gain(
+        historical,
+        earlier_records=[],
+        evidence_by_id={missing.evidence_id: missing},
+        links=[
+            _link(
+                historical,
+                relation=QuestionEvidenceRelation.UNAVAILABLE.value,
+            )
+        ],
+    )
+    trace = CompetitionTrace(
+        active_lane_ids=("LANE_ALT",),
+        represented_lane_ids=("LANE_ALT",),
+        unresolved_lane_ids=("LANE_ALT",),
+        lane_resolutions=(
+            AlternativeLaneResolution(
+                lane_id="LANE_ALT",
+                status=AlternativeLaneResolutionStatus.UNRESOLVED.value,
+                candidate_id="CANDIDATE_0",
+                distinguishing_gap_ids=(current_gap_id,),
+            ),
+        ),
+        competition_requirement=(
+            CompetitionRequirement.ALTERNATIVE_DISCOVERY_REQUIRED.value
+        ),
+        competition_status=CandidateCompetitionStatus.ACTIVE.value,
+    )
+
+    result = progress_competition(
+        trace=trace,
+        authoritative_details={
+            "conclusion_status": "inconclusive",
+            "ranked_candidates": [
+                {
+                    "candidate_id": "CANDIDATE_0",
+                    "root_cause": "The current candidate remains unresolved.",
+                    "status": "candidate",
+                }
+            ],
+            "causal_evidence_gaps": [
+                {"gap_id": current_gap_id, "status": "unresolved"}
+            ],
+            "confirmation_gate": {
+                "status": "inconclusive",
+                "unresolved_gaps": [current_gap_id],
+            },
+        },
+        action_value_assessments=[],
+        gain_history=[historical_gain],
+        force_terminal=False,
+    )
+
+    resolution = result.trace.lane_resolutions[0]
+    assert resolution.status == AlternativeLaneResolutionStatus.UNRESOLVED.value
+    assert resolution.reason_code is None
+    assert resolution.distinguishing_gap_ids == (current_gap_id,)
+
+
 def _formal_trace() -> CompetitionTrace:
     return CompetitionTrace(
         competition_requirement=(
@@ -320,6 +394,116 @@ def _formal_trace() -> CompetitionTrace:
         ),
         competition_status=CandidateCompetitionStatus.ACTIVE.value,
     )
+
+
+def _formal_state_with_question_group(matched_group: str) -> RCAState:
+    evidence = Evidence(
+        evidence_id="EV_PRODUCT_SIGNAL",
+        source_type=EvidenceSourceType.DEFECT.value,
+        source_id="defect:EV_PRODUCT_SIGNAL",
+        summary="A typed product signal was collected.",
+        evidence_type=EvidenceType.DEFECT_SIGNAL.value,
+        source_agent=AgentKind.DEFECT_WAT.value,
+        source_tool="inspect_defect_pattern",
+        observation="The product signal differs from the passing control.",
+        entities=(EvidenceEntity(EntityType.LOT.value, "LOT_01"),),
+        confidence=1.0,
+        evidence_schema_version=EVIDENCE_SCHEMA_VERSION,
+    )
+    question = InvestigationQuestion(
+        question_id="Q_PRODUCT_SIGNAL",
+        goal_id="GOAL_RCA",
+        question="What product signature is present?",
+        rationale="The product signal is required for RCA closure.",
+        question_kind=QuestionKind.DEFECT_SIGNATURE.value,
+    )
+    action = ActionRecord(
+        action=InvestigationAction(
+            action_id="ACTION_PRODUCT_SIGNAL",
+            kind=ActionKind.INSPECT_DEFECT_PATTERN.value,
+            agent=AgentKind.DEFECT_WAT.value,
+            reason="Collect the typed product signal.",
+            inputs={"lot_id": "LOT_01"},
+            scope={"lot_id": "LOT_01"},
+        ),
+        status="completed",
+        produced_evidence_ids=[evidence.evidence_id],
+        decision_summary="The product observation completed.",
+    )
+    link = QuestionEvidenceLink(
+        question_id=question.question_id,
+        evidence_id=evidence.evidence_id,
+        action_id=action.action.action_id,
+        relation=QuestionEvidenceRelation.SUPPORTS.value,
+        matched_evidence_group=matched_group,
+        reason="The typed Evidence addresses the investigation question.",
+    )
+    finding = AgentFinding(
+        finding_id="RCA_AUTH_QUESTION_RECONCILIATION",
+        agent=AgentKind.RCA_REASONING.value,
+        summary="The root cause remains unresolved.",
+        confidence=0.4,
+        evidence_ids=[evidence.evidence_id],
+        evidence=[evidence],
+        details={
+            "status": "inconclusive",
+            "root_cause": "inconclusive",
+            "conclusion_status": "inconclusive",
+            "ranked_candidates": [
+                {
+                    "candidate_id": "CANDIDATE_0",
+                    "root_cause": "An unresolved mechanism.",
+                    "status": "candidate",
+                }
+            ],
+            "confirmation_gate": {"status": "inconclusive"},
+        },
+    )
+    return RCAState(
+        job=RCAJob(
+            job_id="QUESTION_RECONCILIATION",
+            user_query="Complete the evidence-bounded RCA.",
+            status=TaskStatus.RUNNING.value,
+        ),
+        evidence=[evidence],
+        findings=[finding],
+        authoritative_rca_finding_id=finding.finding_id,
+        investigation_goal=InvestigationGoal(
+            goal_id="GOAL_RCA",
+            intent=InvestigationIntent.FULL_RCA.value,
+            summary="Complete the evidence-bounded RCA.",
+        ),
+        action_history=[action],
+        investigation_questions=[question],
+        question_evidence_links=[link],
+        evidence_gaps=[question.question],
+        competition_trace=_formal_trace(),
+    )
+
+
+def test_finalizer_closes_question_when_all_required_groups_are_supported() -> None:
+    finalized = finalize_investigation(
+        _formal_state_with_question_group("product_signal")
+    )
+
+    assert finalized.investigation_questions[0].status == (
+        EvidenceGapStatus.CLOSED.value
+    )
+    assert finalized.investigation_questions[0].evidence_ids == [
+        "EV_PRODUCT_SIGNAL"
+    ]
+    assert finalized.evidence_gaps == []
+
+
+def test_finalizer_keeps_question_open_when_required_group_is_missing() -> None:
+    finalized = finalize_investigation(
+        _formal_state_with_question_group("context")
+    )
+
+    assert finalized.investigation_questions[0].status == (
+        EvidenceGapStatus.OPEN.value
+    )
+    assert finalized.evidence_gaps == ["What product signature is present?"]
 
 
 def test_confirmation_gate_support_completes_competition() -> None:
@@ -482,6 +666,30 @@ def test_candidate_validation_exhaustion_remains_a_processing_failure() -> None:
 
     assert result.trace.competition_status == CandidateCompetitionStatus.FAILED.value
     assert result.trace.terminal_reason == "candidate_competition_processing_failed"
+
+
+def test_candidate_provider_failure_before_requirement_is_processing_failure() -> None:
+    trace = CompetitionTrace(
+        competition_requirement=CompetitionRequirement.NOT_EVALUATED.value,
+        competition_status=CandidateCompetitionStatus.FAILED.value,
+        competition_failure_reason="candidate_provider_failed",
+    )
+
+    result = progress_competition(
+        trace=trace,
+        authoritative_details={
+            "conclusion_status": "insufficient_evidence",
+            "ranked_candidates": [],
+            "confirmation_gate": {"status": "insufficient_evidence"},
+        },
+        action_value_assessments=[],
+        gain_history=[],
+        force_terminal=True,
+    )
+
+    assert result.trace.competition_status == CandidateCompetitionStatus.FAILED.value
+    assert result.trace.terminal_reason == "candidate_competition_processing_failed"
+    assert result.conclusion_status == "inconclusive"
 
 
 def test_budget_exhaustion_is_distinct_from_no_gain_exhaustion() -> None:

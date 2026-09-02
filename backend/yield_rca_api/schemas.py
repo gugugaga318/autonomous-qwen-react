@@ -222,6 +222,7 @@ class PlannerDecisionResponse(APIModel):
             "goal_satisfied",
             "critical_contradiction",
             "no_allowed_action",
+            "no_high_value_action",
             "budget_exhausted",
             "data_unavailable",
         ]

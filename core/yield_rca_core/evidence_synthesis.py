@@ -296,8 +296,119 @@ def compact_evidence_prompt_card(item: Evidence) -> dict[str, Any]:
     return card
 
 
+_FILTERED_PROMPT_VALUE = object()
+
+
+def _prompt_evidence_reference_mode(key: str) -> str | None:
+    normalized = key.lower()
+    if normalized.endswith("_by_evidence_id"):
+        return "keyed_mapping"
+    if "evidence_ids" in normalized:
+        return "collection"
+    if normalized == "evidence_id" or normalized.endswith("_evidence_id"):
+        return "single"
+    return None
+
+
+def _filter_prompt_evidence_references(
+    value: object,
+    *,
+    allowed_evidence_ids: set[str],
+    known_evidence_ids: set[str],
+    reference_mode: str | None = None,
+) -> object:
+    """Copy a prompt value while removing non-referenceable Evidence IDs."""
+
+    if isinstance(value, str):
+        if (
+            reference_mode in {"single", "collection"}
+            and value not in allowed_evidence_ids
+        ):
+            return _FILTERED_PROMPT_VALUE
+        if value in known_evidence_ids and value not in allowed_evidence_ids:
+            return _FILTERED_PROMPT_VALUE
+        return value
+    if isinstance(value, Mapping):
+        if reference_mode == "keyed_mapping":
+            projected_by_evidence_id: dict[str, Any] = {}
+            for raw_key, raw_value in value.items():
+                key = str(raw_key)
+                if key not in allowed_evidence_ids:
+                    continue
+                filtered = _filter_prompt_evidence_references(
+                    raw_value,
+                    allowed_evidence_ids=allowed_evidence_ids,
+                    known_evidence_ids=known_evidence_ids,
+                )
+                if filtered is not _FILTERED_PROMPT_VALUE:
+                    projected_by_evidence_id[key] = filtered
+            return projected_by_evidence_id
+        raw_evidence_id = value.get("evidence_id")
+        if (
+            isinstance(raw_evidence_id, str)
+            and raw_evidence_id not in allowed_evidence_ids
+        ):
+            return _FILTERED_PROMPT_VALUE
+        projected: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            if key in known_evidence_ids and key not in allowed_evidence_ids:
+                continue
+            filtered = _filter_prompt_evidence_references(
+                raw_value,
+                allowed_evidence_ids=allowed_evidence_ids,
+                known_evidence_ids=known_evidence_ids,
+                reference_mode=(
+                    reference_mode
+                    if reference_mode == "collection"
+                    else _prompt_evidence_reference_mode(key)
+                ),
+            )
+            if filtered is not _FILTERED_PROMPT_VALUE:
+                projected[key] = filtered
+        return projected
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        projected_items: list[Any] = []
+        for item in value:
+            filtered = _filter_prompt_evidence_references(
+                item,
+                allowed_evidence_ids=allowed_evidence_ids,
+                known_evidence_ids=known_evidence_ids,
+                reference_mode=reference_mode,
+            )
+            if filtered is not _FILTERED_PROMPT_VALUE:
+                projected_items.append(filtered)
+        return projected_items
+    return value
+
+
+def project_prompt_evidence_references(
+    payload: Mapping[str, Any],
+    *,
+    allowed_evidence_ids: set[str],
+    known_evidence_ids: set[str],
+) -> dict[str, Any]:
+    """Project a prompt payload onto its exact typed Evidence register."""
+
+    if not allowed_evidence_ids <= known_evidence_ids:
+        raise ValueError(
+            "allowed_evidence_ids must be a subset of known_evidence_ids"
+        )
+    projected = _filter_prompt_evidence_references(
+        payload,
+        allowed_evidence_ids=allowed_evidence_ids,
+        known_evidence_ids=known_evidence_ids,
+    )
+    if not isinstance(projected, dict):
+        raise TypeError("prompt payload projection must remain a mapping")
+    return projected
+
+
 def compact_lane_first_synthesis_for_prompt(
     synthesis: Mapping[str, Any],
+    *,
+    allowed_evidence_ids: set[str] | None = None,
+    known_evidence_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Project Lane synthesis to identities, counts, and traceable IDs only."""
 
@@ -366,7 +477,7 @@ def compact_lane_first_synthesis_for_prompt(
                 if isinstance(fact, Mapping)
                 and str(fact.get("evidence_id", "")).strip()
             ]
-    return {
+    projected = {
         "schema": "lane_first_v1",
         "prompt_projection_version": "compact_v1",
         "evidence_count": synthesis.get("evidence_count", 0),
@@ -392,6 +503,17 @@ def compact_lane_first_synthesis_for_prompt(
         "prompt_evidence_ids": list(synthesis.get("prompt_evidence_ids", [])),
         "synthesis_note": synthesis.get("synthesis_note"),
     }
+    if allowed_evidence_ids is None:
+        return projected
+    if known_evidence_ids is None:
+        raise ValueError(
+            "known_evidence_ids is required when prompt Evidence is projected"
+        )
+    return project_prompt_evidence_references(
+        projected,
+        allowed_evidence_ids=allowed_evidence_ids,
+        known_evidence_ids=known_evidence_ids,
+    )
 
 
 def _record(item: Evidence) -> dict[str, Any]:

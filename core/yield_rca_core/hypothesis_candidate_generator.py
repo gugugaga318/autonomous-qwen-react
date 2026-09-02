@@ -18,6 +18,7 @@ from yield_rca_core.causal_investigation_models import (
     CandidateCompetitionStatus,
     CandidateCompetitionType,
     CandidateDistinguishingPrediction,
+    CandidateLaneEffectExpectation,
     CandidateMechanismRelation,
     CandidateScopeRelation,
     CandidateSemanticProfile,
@@ -31,6 +32,7 @@ from yield_rca_core.evidence_synthesis import (
     compact_evidence_prompt_card,
     compact_evidence_record,
     compact_lane_first_synthesis_for_prompt,
+    project_prompt_evidence_references,
 )
 from yield_rca_core.llm_gateway import (
     LLMClient,
@@ -714,6 +716,8 @@ def _evidence_matches_claimed_scope(
     evidence: Evidence,
     profile: CandidateSemanticProfile,
     matching_lanes: Sequence[Mapping[str, Any]],
+    *,
+    allow_broad_identity_fallback: bool = True,
 ) -> bool:
     if any(
         _evidence_matches_claimed_lane(evidence, lane)
@@ -721,6 +725,8 @@ def _evidence_matches_claimed_scope(
     ):
         return True
     if profile.claimed_scope_kind == CandidateClaimedScopeKind.LANE.value:
+        return False
+    if not allow_broad_identity_fallback:
         return False
     identity_pairs = (
         (
@@ -925,6 +931,10 @@ def _candidate_evidence_closure_assessment(
                             evidence,
                             profile,
                             target_lanes,
+                            allow_broad_identity_fallback=not (
+                                shared_effect_scope
+                                and evidence_role in {"parameter", "outcome"}
+                            ),
                         )
                         if profile is not None
                         else any(
@@ -1877,12 +1887,30 @@ def _candidate_competition_profile(
 
 def _prediction_semantic_signature(
     profile: CandidateSemanticProfile,
-) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+) -> tuple[
+    tuple[
+        str,
+        tuple[str, ...],
+        tuple[tuple[str, str, str], ...],
+        str,
+    ],
+    ...,
+]:
     return tuple(
         sorted(
             (
                 prediction.discriminator_kind,
                 tuple(sorted(prediction.lane_ids)),
+                tuple(
+                    sorted(
+                        (
+                            expectation.lane_id,
+                            expectation.normalized_effect_key,
+                            expectation.effect_state,
+                        )
+                        for expectation in prediction.lane_effect_expectations
+                    )
+                ),
                 re.sub(r"\s+", " ", prediction.prediction.casefold()).strip(),
             )
             for prediction in profile.distinguishing_predictions
@@ -2549,10 +2577,19 @@ def _parse_candidate_semantic_profiles(
         "lane_ids",
     }
     expected_comparison_fields = {"lane_ids"}
-    expected_prediction_fields = {
+    required_prediction_fields = {
         "discriminator_kind",
         "lane_ids",
         "prediction",
+    }
+    product_outcome_prediction_fields = {
+        *required_prediction_fields,
+        "lane_effect_expectations",
+    }
+    expected_effect_expectation_fields = {
+        "lane_id",
+        "effect_key",
+        "effect_state",
     }
     for profile_index, raw in enumerate(payload):
         try:
@@ -2611,19 +2648,85 @@ def _parse_candidate_semantic_profiles(
                 )
             predictions: list[CandidateDistinguishingPrediction] = []
             for prediction_index, prediction in enumerate(raw_predictions):
-                if not isinstance(prediction, dict) or set(
-                    prediction
-                ) != expected_prediction_fields:
+                if not isinstance(prediction, dict):
                     raise LLMOutputValidationError(
                         f"candidate_semantic_profiles[{profile_index}]."
                         f"distinguishing_predictions[{prediction_index}] must "
-                        f"contain exactly {sorted(expected_prediction_fields)}"
+                        "be an object"
+                    )
+                discriminator_kind = prediction.get("discriminator_kind")
+                if not isinstance(discriminator_kind, str):
+                    raise LLMOutputValidationError(
+                        f"candidate_semantic_profiles[{profile_index}]."
+                        f"distinguishing_predictions[{prediction_index}]."
+                        "discriminator_kind must be a string"
+                    )
+                actual_prediction_fields = set(prediction)
+                allowed_prediction_fields = (
+                    {frozenset(product_outcome_prediction_fields)}
+                    if discriminator_kind == "product_outcome"
+                    else {
+                        frozenset(required_prediction_fields),
+                        frozenset(product_outcome_prediction_fields),
+                    }
+                )
+                if frozenset(actual_prediction_fields) not in allowed_prediction_fields:
+                    raise LLMOutputValidationError(
+                        f"candidate_semantic_profiles[{profile_index}]."
+                        f"distinguishing_predictions[{prediction_index}] must "
+                        "contain the required prediction fields and only the "
+                        "optional lane_effect_expectations field"
+                    )
+                raw_effect_expectations = prediction.get(
+                    "lane_effect_expectations",
+                    [],
+                )
+                if not isinstance(raw_effect_expectations, list):
+                    raise LLMOutputValidationError(
+                        f"candidate_semantic_profiles[{profile_index}]."
+                        f"distinguishing_predictions[{prediction_index}]."
+                        "lane_effect_expectations must be an array"
+                    )
+                if (
+                    discriminator_kind != "product_outcome"
+                    and raw_effect_expectations
+                ):
+                    raise LLMOutputValidationError(
+                        f"candidate_semantic_profiles[{profile_index}]."
+                        f"distinguishing_predictions[{prediction_index}] non-"
+                        "product predictions cannot declare Lane effects"
+                    )
+                lane_effect_expectations: list[
+                    CandidateLaneEffectExpectation
+                ] = []
+                for expectation_index, expectation in enumerate(
+                    raw_effect_expectations
+                ):
+                    if not isinstance(expectation, dict) or set(
+                        expectation
+                    ) != expected_effect_expectation_fields:
+                        raise LLMOutputValidationError(
+                            f"candidate_semantic_profiles[{profile_index}]."
+                            f"distinguishing_predictions[{prediction_index}]."
+                            "lane_effect_expectations"
+                            f"[{expectation_index}] must contain exactly "
+                            f"{sorted(expected_effect_expectation_fields)}"
+                        )
+                    lane_effect_expectations.append(
+                        CandidateLaneEffectExpectation(
+                            lane_id=expectation["lane_id"],
+                            effect_key=expectation["effect_key"],
+                            effect_state=expectation["effect_state"],
+                        )
                     )
                 predictions.append(
                     CandidateDistinguishingPrediction(
-                        discriminator_kind=prediction["discriminator_kind"],
+                        discriminator_kind=discriminator_kind,
                         lane_ids=tuple(prediction.get("lane_ids", [])),
                         prediction=prediction["prediction"],
+                        lane_effect_expectations=tuple(
+                            lane_effect_expectations
+                        ),
                     )
                 )
             raw_dependency_index = raw.get("depends_on_candidate_index")
@@ -2727,6 +2830,23 @@ def _parse_candidate_semantic_profiles(
                 for prediction in profile.distinguishing_predictions
                 for lane_id in prediction.lane_ids
             }
+            product_outcome_predictions = [
+                prediction
+                for prediction in profile.distinguishing_predictions
+                if prediction.discriminator_kind == "product_outcome"
+            ]
+            for prediction in product_outcome_predictions:
+                expectation_lane_ids = {
+                    expectation.lane_id
+                    for expectation in prediction.lane_effect_expectations
+                }
+                if expectation_lane_ids != set(prediction.lane_ids):
+                    raise LLMOutputValidationError(
+                        "semantic coherence: "
+                        f"candidate_semantic_profiles[{profile_index}] each "
+                        "product_outcome prediction must provide Lane effect "
+                        "expectations for exactly its prediction Lanes"
+                    )
             if (
                 profile.scope_relation
                 == CandidateScopeRelation.SHARED_EFFECT.value
@@ -2783,6 +2903,33 @@ def _parse_candidate_semantic_profiles(
                     f"candidate_semantic_profiles[{profile_index}] prediction "
                     "Lane coverage must match the resolved comparison scope"
                 )
+            if (
+                profile.scope_relation
+                == CandidateScopeRelation.SHARED_EFFECT.value
+                and product_outcome_predictions
+            ):
+                effects_by_lane: dict[str, set[tuple[str, str]]] = {
+                    lane_id: set() for lane_id in comparison_lane_ids
+                }
+                for prediction in product_outcome_predictions:
+                    for expectation in prediction.lane_effect_expectations:
+                        effects_by_lane.setdefault(expectation.lane_id, set()).add(
+                            (
+                                expectation.normalized_effect_key,
+                                expectation.effect_state,
+                            )
+                        )
+                claimed_effect_sets = {
+                    frozenset(effects_by_lane.get(lane_id, set()))
+                    for lane_id in claimed_lane_ids
+                }
+                if len(claimed_effect_sets) != 1:
+                    raise LLMOutputValidationError(
+                        "semantic coherence: "
+                        f"candidate_semantic_profiles[{profile_index}] "
+                        "shared_effect claimed Lanes must predict the same "
+                        "product effect"
+                    )
             profiles_by_surviving_index[surviving_index] = profile
         except (LLMOutputValidationError, ModelValidationError, TypeError, ValueError) as exc:
             errors.append(
@@ -2947,9 +3094,6 @@ class QwenHypothesisCandidateGenerator:
                 limit=_MAX_CHALLENGE_EVIDENCE,
             ),
         }
-        prompt_synthesis = compact_lane_first_synthesis_for_prompt(
-            evidence_synthesis
-        )
         prompt_evidence_by_id = {
             evidence_id: evidence_by_id[evidence_id]
             for evidence_id in prompt_evidence_ids
@@ -2979,6 +3123,11 @@ class QwenHypothesisCandidateGenerator:
                 for record in evidence_register
                 if str(record.get("evidence_id", "")).strip()
             }
+            prompt_synthesis = compact_lane_first_synthesis_for_prompt(
+                evidence_synthesis,
+                allowed_evidence_ids=current_prompt_evidence_ids,
+                known_evidence_ids=set(evidence_by_id),
+            )
             prompt_evidence_by_id = {
                 evidence_id: evidence_by_id[evidence_id]
                 for evidence_id in current_prompt_evidence_ids
@@ -3073,6 +3222,13 @@ class QwenHypothesisCandidateGenerator:
                 },
                 temperature=0.0,
             )
+            projected_payload = project_prompt_evidence_references(
+                request.payload,
+                allowed_evidence_ids=current_prompt_evidence_ids,
+                known_evidence_ids=set(evidence_by_id),
+            )
+            request.payload.clear()
+            request.payload.update(projected_payload)
             payload_char_count = _payload_char_count(request.payload)
             while payload_char_count > _TARGET_PROMPT_PAYLOAD_CHARS:
                 removable_index = next(
@@ -3092,7 +3248,6 @@ class QwenHypothesisCandidateGenerator:
                     for record in evidence_register
                     if str(record.get("evidence_id", "")).strip()
                 ]
-                prompt_synthesis["prompt_evidence_ids"] = current_ids
                 request.payload["new_evidence_ids_since_prior"] = [
                     evidence_id
                     for evidence_id in request.payload[
@@ -3139,6 +3294,19 @@ class QwenHypothesisCandidateGenerator:
                             ),
                         )
                     )
+                prompt_synthesis = compact_lane_first_synthesis_for_prompt(
+                    evidence_synthesis,
+                    allowed_evidence_ids=set(current_ids),
+                    known_evidence_ids=set(evidence_by_id),
+                )
+                request.payload["evidence_synthesis"] = prompt_synthesis
+                projected_payload = project_prompt_evidence_references(
+                    request.payload,
+                    allowed_evidence_ids=set(current_ids),
+                    known_evidence_ids=set(evidence_by_id),
+                )
+                request.payload.clear()
+                request.payload.update(projected_payload)
                 payload_char_count = _payload_char_count(request.payload)
             current_prompt_evidence_ids = {
                 str(record.get("evidence_id", ""))
@@ -3193,6 +3361,11 @@ class QwenHypothesisCandidateGenerator:
             }
             evidence_synthesis.update(prompt_audit)
             prompt_synthesis.update(prompt_audit)
+            request_prompt_synthesis = request.payload.get(
+                "evidence_synthesis"
+            )
+            if isinstance(request_prompt_synthesis, dict):
+                request_prompt_synthesis.update(prompt_audit)
             payload_char_count = _payload_char_count(request.payload)
             evidence_synthesis["prompt_payload_char_count"] = payload_char_count
             prompt_synthesis["prompt_payload_char_count"] = payload_char_count

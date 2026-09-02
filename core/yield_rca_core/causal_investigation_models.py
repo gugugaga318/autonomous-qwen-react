@@ -155,6 +155,7 @@ class CompetitionFailureReason(StrEnum):
     SCOPE_HYPOTHESIS_COLLAPSED = "scope_hypothesis_collapsed"
     SEMANTIC_PROFILE_INVALID = "semantic_profile_invalid"
     CANDIDATE_VALIDATION_EXHAUSTED = "candidate_validation_exhausted"
+    CANDIDATE_PROVIDER_FAILED = "candidate_provider_failed"
     CHALLENGE_OUTPUT_INVALID = "challenge_output_invalid"
     NO_DISCRIMINATIVE_ACTION = "no_discriminative_action"
 
@@ -248,6 +249,81 @@ _DISTINGUISHING_PREDICTION_KINDS = {
 }
 
 
+class CandidateLaneEffectState(StrEnum):
+    """Qwen-declared effect polarity for one Lane-bound prediction."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    INCREASED = "increased"
+    DECREASED = "decreased"
+    UNCHANGED = "unchanged"
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True)
+class CandidateLaneEffectExpectation:
+    """One structured Lane/effect assertion authored by Qwen."""
+
+    lane_id: str
+    effect_key: str
+    effect_state: str
+    schema_version: str = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "lane_id", _non_empty(self.lane_id, "lane_id"))
+        object.__setattr__(
+            self,
+            "effect_key",
+            _non_empty(self.effect_key, "effect_key"),
+        )
+        if not self.normalized_effect_key:
+            raise ModelValidationError(
+                "effect_key must contain at least one alphanumeric token"
+            )
+        try:
+            effect_state = CandidateLaneEffectState(
+                _non_empty(self.effect_state, "effect_state").casefold()
+            ).value
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in CandidateLaneEffectState)
+            raise ModelValidationError(
+                f"effect_state must be one of: {allowed}"
+            ) from exc
+        object.__setattr__(self, "effect_state", effect_state)
+        if self.schema_version != SCHEMA_VERSION:
+            raise ModelValidationError(
+                f"unsupported schema_version {self.schema_version!r}; "
+                f"expected {SCHEMA_VERSION!r}"
+            )
+
+    @property
+    def normalized_effect_key(self) -> str:
+        """Return a comparison key without changing the serialized Qwen text."""
+
+        return "".join(
+            character
+            for character in self.effect_key.casefold()
+            if character.isalnum()
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lane_id": self.lane_id,
+            "effect_key": self.effect_key,
+            "effect_state": self.effect_state,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            lane_id=data["lane_id"],
+            effect_key=data["effect_key"],
+            effect_state=data["effect_state"],
+            schema_version=data.get("schema_version", SCHEMA_VERSION),
+        )
+
+
 @dataclass(frozen=True)
 class CandidateDistinguishingPrediction:
     """One falsifiable Qwen claim bound to Python-owned Lane and Gap kinds."""
@@ -256,6 +332,7 @@ class CandidateDistinguishingPrediction:
     lane_ids: tuple[str, ...]
     prediction: str
     schema_version: str = SCHEMA_VERSION
+    lane_effect_expectations: tuple[CandidateLaneEffectExpectation, ...] = ()
 
     def __post_init__(self) -> None:
         kind = _non_empty(self.discriminator_kind, "discriminator_kind")
@@ -269,6 +346,33 @@ class CandidateDistinguishingPrediction:
         if not self.lane_ids:
             raise ModelValidationError("prediction lane_ids must not be empty")
         object.__setattr__(self, "prediction", _non_empty(self.prediction, "prediction"))
+        if not isinstance(self.lane_effect_expectations, (list, tuple)) or any(
+            not isinstance(item, CandidateLaneEffectExpectation)
+            for item in self.lane_effect_expectations
+        ):
+            raise ModelValidationError(
+                "lane_effect_expectations must contain "
+                "CandidateLaneEffectExpectation instances"
+            )
+        expectations = tuple(self.lane_effect_expectations)
+        object.__setattr__(self, "lane_effect_expectations", expectations)
+        lane_ids = set(self.lane_ids)
+        duplicate_keys: set[tuple[str, str]] = set()
+        expectation_keys: set[tuple[str, str]] = set()
+        for expectation in expectations:
+            if expectation.lane_id not in lane_ids:
+                raise ModelValidationError(
+                    "lane effect expectation lane_id must be within prediction "
+                    "lane_ids"
+                )
+            key = (expectation.lane_id, expectation.normalized_effect_key)
+            if key in expectation_keys:
+                duplicate_keys.add(key)
+            expectation_keys.add(key)
+        if duplicate_keys:
+            raise ModelValidationError(
+                "lane_effect_expectations must not repeat a Lane/effect key"
+            )
         if self.schema_version != SCHEMA_VERSION:
             raise ModelValidationError(
                 f"unsupported schema_version {self.schema_version!r}; "
@@ -280,6 +384,9 @@ class CandidateDistinguishingPrediction:
             "discriminator_kind": self.discriminator_kind,
             "lane_ids": list(self.lane_ids),
             "prediction": self.prediction,
+            "lane_effect_expectations": [
+                item.to_dict() for item in self.lane_effect_expectations
+            ],
             "schema_version": self.schema_version,
         }
 
@@ -290,6 +397,10 @@ class CandidateDistinguishingPrediction:
             lane_ids=tuple(data.get("lane_ids", [])),
             prediction=data["prediction"],
             schema_version=data.get("schema_version", SCHEMA_VERSION),
+            lane_effect_expectations=tuple(
+                CandidateLaneEffectExpectation.from_dict(item)
+                for item in data.get("lane_effect_expectations", [])
+            ),
         )
 
 

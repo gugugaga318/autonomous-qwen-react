@@ -98,6 +98,7 @@ from yield_rca_core.rca_reasoning_agent import RCAReasoningAgent
 from yield_rca_core.report_generator import ReportGenerator
 from yield_rca_core.specialist_agents import DefectWATAgent, FDCAgent, KnowledgeAgent, MESAgent
 from yield_rca_core.specialist_v2 import SpecialistV2Error, SpecialistV2Executor
+from yield_rca_core.warning_policy import reconcile_current_warnings
 from yield_rca_core.workflow_events import emit_workflow_event
 
 SUPERVISOR_EXECUTABLE_AGENTS = frozenset(
@@ -111,6 +112,53 @@ SUPERVISOR_EXECUTABLE_AGENTS = frozenset(
     }
 )
 _RCA_REASONING_MIN_REMAINING_LLM_CALLS = 3
+
+
+def _llm_react_governance_requested(state: RCAState) -> bool:
+    """Preserve Qwen-path publication governance after executor fallback."""
+
+    requested_mode = state.execution_metadata.get("orchestration_requested_mode")
+    if requested_mode is None:
+        requested_mode = state.execution_metadata.get("orchestration_mode")
+    return str(requested_mode or "").strip() == "llm_react"
+
+
+def _align_non_competition_llm_react_terminal(state: RCAState) -> RCAState:
+    """Withhold supported publication when formal Competition never started."""
+
+    authoritative = state.authoritative_rca_finding
+    if authoritative is None:
+        return state
+    conclusion_status = str(authoritative.details.get("conclusion_status", "")).strip()
+    if conclusion_status == "supported":
+        return state
+    aligned = replace(
+        state,
+        goal_status=GoalStatus.BLOCKED.value,
+        conclusion_level=ConclusionLevel.INCONCLUSIVE.value,
+        stop_reason=StopReason.NO_HIGH_VALUE_ACTION.value,
+        execution_metadata={
+            **state.execution_metadata,
+            "terminal_question_updates_source": "python_evidence_gate",
+            "terminal_question_updates_validated_by": "python_evidence_gate",
+            "terminal_conclusion_status_source": "authoritative_rca_finding",
+        },
+    )
+    return _mark_fallback_python_terminal(aligned)
+
+
+def _mark_fallback_python_terminal(state: RCAState) -> RCAState:
+    """Record Python ownership without rewriting the preserved Qwen prefix."""
+
+    return replace(
+        state,
+        execution_metadata={
+            **state.execution_metadata,
+            "planner_stop_proposed_by": "python_runtime",
+            "terminal_stop_projection_applied": True,
+            "terminal_stop_projection_trace": "execution_metadata_only",
+        },
+    )
 
 
 def _rca_reasoning_round_budget_available(llm_client: LLMClient) -> bool:
@@ -398,7 +446,7 @@ def _update_causal_lane_state(state: RCAState, finding: AgentFinding) -> RCAStat
         for item in ordered
         if item.investigation_status == InvestigationLaneStatus.BLOCKED.value
     )
-    unresolved_ids = tuple(item.lane_id for item in overflow)
+    unresolved_ids: tuple[str, ...] = ()
     ordered = list(
         apply_active_lane_snapshot(
             ordered,
@@ -735,7 +783,6 @@ def _update_competition_state(state: RCAState, finding: AgentFinding) -> RCAStat
     unresolved_ids = tuple(
         dict.fromkeys(
             [
-                *overflow_ids,
                 *(
                     []
                     if alternative_search_status
@@ -1153,11 +1200,22 @@ def _latest_finding_for_agent(
     return matches[-1]
 
 
-def _merge_warnings(existing: list[Warning], incoming: list[Warning]) -> list[Warning]:
-    warnings_by_id = {item.warning_id: item for item in existing}
-    for item in incoming:
-        warnings_by_id[item.warning_id] = item
-    return list(warnings_by_id.values())
+def _merge_warnings(
+    existing: list[Warning],
+    incoming: list[Warning],
+    *,
+    current_findings: list[AgentFinding] | None = None,
+) -> list[Warning]:
+    if current_findings is None:
+        warnings_by_id = {item.warning_id: item for item in existing}
+        for item in incoming:
+            warnings_by_id[item.warning_id] = item
+        return list(warnings_by_id.values())
+    return reconcile_current_warnings(
+        existing,
+        incoming,
+        current_findings=current_findings,
+    )
 
 
 def _time_window(inputs: dict[str, Any], job: RCAJob) -> tuple[str | None, str | None]:
@@ -1482,12 +1540,18 @@ class Supervisor:
         *,
         policy: InvestigationPolicy | None = None,
         tool_latencies: list[dict[str, str | float]] | None = None,
+        orchestration_requested_mode: str | None = None,
     ) -> RCAState:
         """Run a bounded observation-action loop without changing fixed-plan execution."""
         state = RCAState(
             job=replace(job, status=TaskStatus.RUNNING.value),
             investigation_goal=goal,
             evidence=_initial_context_evidence(job),
+            execution_metadata=(
+                {"orchestration_requested_mode": orchestration_requested_mode}
+                if orchestration_requested_mode is not None
+                else {}
+            ),
         )
         return self._continue_controlled(
             state,
@@ -1556,14 +1620,42 @@ class Supervisor:
                     evidence_gaps=evidence_gaps,
                     stop_reason=decision.stop_reason,
                 )
+                if (
+                    _llm_react_governance_requested(terminal)
+                    and terminal.authoritative_rca_finding is not None
+                ):
+                    terminal = finalize_investigation(terminal)
+                    if terminal.execution_metadata.get("investigation_finalizer") == (
+                        "python_competition_progression"
+                    ):
+                        terminal = replace(
+                            terminal,
+                            execution_metadata={
+                                **terminal.execution_metadata,
+                                "terminal_question_updates_source": (
+                                    "python_evidence_gate"
+                                ),
+                                "terminal_question_updates_validated_by": (
+                                    "python_evidence_gate"
+                                ),
+                            },
+                        )
+                        terminal = _mark_fallback_python_terminal(terminal)
+                        validate_terminal_investigation_state(terminal)
+                    elif (
+                        terminal.execution_metadata.get("investigation_finalizer")
+                        == "not_applicable"
+                    ):
+                        terminal = _align_non_competition_llm_react_terminal(terminal)
+                        validate_terminal_investigation_state(terminal)
                 emit_workflow_event(
                     "investigation_stopped",
                     {
                         "mode": "controlled_react",
-                        "goal_status": decision.goal_status,
-                        "conclusion_level": decision.conclusion_level,
-                        "stop_reason": decision.stop_reason,
-                        "evidence_gaps": evidence_gaps,
+                        "goal_status": terminal.goal_status,
+                        "conclusion_level": terminal.conclusion_level,
+                        "stop_reason": terminal.stop_reason,
+                        "evidence_gaps": list(terminal.evidence_gaps),
                     },
                 )
                 report = self.report_generator.generate(terminal)
@@ -2516,7 +2608,7 @@ class Supervisor:
             hypotheses.append(hypothesis)
             authoritative_rca_finding_id = finding.finding_id
             authoritative_hypothesis_id = hypothesis.hypothesis_id
-            if state.execution_metadata.get("orchestration_mode") == "llm_react":
+            if _llm_react_governance_requested(state):
                 raw_impact_gate = finding.details.get("impact_lot_gate", {})
                 confirmed = (
                     raw_impact_gate.get("confirmed_impact_lots", [])
@@ -2564,7 +2656,11 @@ class Supervisor:
             ],
             authoritative_rca_finding_id=authoritative_rca_finding_id,
             authoritative_hypothesis_id=authoritative_hypothesis_id,
-            warnings=_merge_warnings(state.warnings, finding.warnings),
+            warnings=_merge_warnings(
+                state.warnings,
+                finding.warnings,
+                current_findings=[*state.findings, finding],
+            ),
         )
         lane_state = _update_causal_lane_state(recorded_state, finding)
         competition_state = _update_competition_state(lane_state, finding)
@@ -2961,7 +3057,11 @@ class Supervisor:
             hypotheses=hypotheses,
             authoritative_rca_finding_id=authoritative_rca_finding_id,
             authoritative_hypothesis_id=authoritative_hypothesis_id,
-            warnings=_merge_warnings(state.warnings, finding.warnings),
+            warnings=_merge_warnings(
+                state.warnings,
+                finding.warnings,
+                current_findings=[*state.findings, finding],
+            ),
         )
         lane_state = _update_causal_lane_state(recorded_state, finding)
         competition_state = _update_competition_state(lane_state, finding)

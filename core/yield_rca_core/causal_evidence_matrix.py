@@ -31,7 +31,12 @@ from yield_rca_core.causal_investigation_models import (
     CandidateSemanticProfile,
     CausalLaneRecord,
 )
-from yield_rca_core.evidence_models import EntityType, Evidence, EvidenceType
+from yield_rca_core.evidence_models import (
+    EntityType,
+    Evidence,
+    EvidenceSourceType,
+    EvidenceType,
+)
 
 _EXPOSURE_TYPES = {
     EvidenceType.LOT_CONTEXT.value,
@@ -418,6 +423,29 @@ def is_relevant_mechanism_intermediate(
             EntityType.WAT_ITEM.value,
         }
     )
+
+
+def _intermediate_can_confirm_causal_bridge(evidence: Evidence) -> bool:
+    """Separate observed occurrence from Evidence that may confirm causation."""
+
+    causal_status = str(evidence.metadata.get("causal_status", "")).casefold()
+    if causal_status in {
+        "confirmed",
+        "approved",
+        "confirmed_cause",
+        "confirmed_causal_intermediate",
+    }:
+        return True
+    if causal_status in {
+        "observed",
+        "occurrence_only",
+        "observed_not_confirmed_cause",
+        "not_confirmed_cause",
+    }:
+        return False
+    # User-reported incident observations preserve what was seen, but absence
+    # of explicit causal confirmation must not turn the report into proof.
+    return evidence.source_type != EvidenceSourceType.USER.value
 
 
 _DIRECTION_ALIASES = {
@@ -1187,6 +1215,16 @@ def _mechanism_claim(
         for item in explicit_intermediates
         if is_relevant_mechanism_intermediate(item, candidate)
     ]
+    causally_confirmed_intermediates = [
+        item
+        for item in relevant_intermediates
+        if _intermediate_can_confirm_causal_bridge(item)
+    ]
+    occurrence_only_intermediates = [
+        item
+        for item in relevant_intermediates
+        if not _intermediate_can_confirm_causal_bridge(item)
+    ]
     empirical_discrimination = [
         item
         for item in evidence
@@ -1244,9 +1282,16 @@ def _mechanism_claim(
         "observed_intermediate_evidence_ids": [
             item.evidence_id for item in relevant_intermediates
         ],
+        "causally_confirmed_intermediate_evidence_ids": [
+            item.evidence_id for item in causally_confirmed_intermediates
+        ],
+        "occurrence_only_intermediate_evidence_ids": [
+            item.evidence_id for item in occurrence_only_intermediates
+        ],
         "observed_intermediate_provenance": {
             item.evidence_id: {
                 "causal_role": _explicit_mechanism_intermediate_role(item),
+                "causal_status": item.metadata.get("causal_status"),
                 "source_type": item.source_type,
                 "source_id": item.source_id,
                 "source_table": item.source_table,
@@ -1299,14 +1344,15 @@ def _mechanism_claim(
             support_source=MechanismSupportSource.APPROVED_KNOWLEDGE,
             fact_overrides=mechanism_facts,
         )
-    if relevant_intermediates and shared_empirical_lots:
+    if causally_confirmed_intermediates and shared_empirical_lots:
         return _result(
             CausalClaim.MECHANISM,
             CausalClaimStatus.SUPPORTED,
-            relevant_intermediates,
+            causally_confirmed_intermediates,
             (
-                "Typed current-Lot Evidence explicitly records a physical "
-                "intermediate relevant to the proposed mechanism."
+                "Typed current-Lot Evidence explicitly records a causally "
+                "confirmed physical intermediate relevant to the proposed "
+                "mechanism."
             ),
             support_source=MechanismSupportSource.OBSERVED_INTERMEDIATE,
             fact_overrides=mechanism_facts,
@@ -1321,6 +1367,20 @@ def _mechanism_claim(
                 "comparison Evidence discriminates the proposed mechanism."
             ),
             support_source=MechanismSupportSource.EMPIRICAL_DISCRIMINATION,
+            fact_overrides=mechanism_facts,
+        )
+    if occurrence_only_intermediates and shared_empirical_lots:
+        return _result(
+            CausalClaim.MECHANISM,
+            CausalClaimStatus.PLAUSIBLE,
+            occurrence_only_intermediates,
+            (
+                "Typed current-Lot Evidence records a physical intermediate "
+                "relevant to the proposed mechanism, but its provenance limits "
+                "the claim to observed occurrence and does not confirm the "
+                "causal bridge."
+            ),
+            support_source=MechanismSupportSource.OBSERVED_INTERMEDIATE,
             fact_overrides=mechanism_facts,
         )
     if (

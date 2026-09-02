@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 
-from yield_rca_core.causal_competition_progression import progress_competition
+from yield_rca_core.causal_competition_progression import (
+    competition_processing_failed,
+    progress_competition,
+)
 from yield_rca_core.causal_investigation_models import (
     ActionValueAssessment,
     CandidateCompetitionStatus,
@@ -17,6 +20,7 @@ from yield_rca_core.investigation_models import (
     ConclusionLevel,
     EvidenceGapStatus,
     GoalStatus,
+    InvestigationQuestion,
     QuestionEvidenceRelation,
     StopReason,
 )
@@ -28,6 +32,7 @@ from yield_rca_core.models import (
     RCAState,
     TaskStatus,
 )
+from yield_rca_core.question_capability import QUESTION_CAPABILITY_REGISTRY
 
 
 class InvestigationFinalizationError(RuntimeError):
@@ -47,8 +52,11 @@ def _formal_competition_is_applicable(state: RCAState) -> bool:
     return (
         state.authoritative_rca_finding is not None
         and state.competition_trace is not None
-        and state.competition_trace.competition_requirement
-        != CompetitionRequirement.NOT_EVALUATED.value
+        and (
+            state.competition_trace.competition_requirement
+            != CompetitionRequirement.NOT_EVALUATED.value
+            or competition_processing_failed(state.competition_trace)
+        )
     )
 
 
@@ -63,6 +71,57 @@ def _terminal_question_reason(competition_status: str) -> str:
     if competition_status == CandidateCompetitionStatus.COMPLETE_REJECTED.value:
         return "The formal Candidates were contradicted and no supported root cause remains."
     return "No remaining registered Action has enough value to change the RCA decision."
+
+
+def _reconcile_questions_with_complete_evidence_groups(
+    state: RCAState,
+) -> list[InvestigationQuestion]:
+    """Close open Questions only from complete Python-validated Evidence groups."""
+
+    available_evidence_ids = {item.evidence_id for item in state.evidence}
+    result: list[InvestigationQuestion] = []
+    for question in state.investigation_questions:
+        if question.status != EvidenceGapStatus.OPEN.value:
+            result.append(question)
+            continue
+        definition = QUESTION_CAPABILITY_REGISTRY.get(str(question.question_kind))
+        required_groups = (
+            set(definition.closure_evidence_groups)
+            if definition is not None
+            else set()
+        )
+        supporting_links = [
+            link
+            for link in state.question_evidence_links
+            if (
+                link.question_id == question.question_id
+                and link.relation == QuestionEvidenceRelation.SUPPORTS.value
+                and link.evidence_id in available_evidence_ids
+                and link.matched_evidence_group in required_groups
+            )
+        ]
+        satisfied_groups = {
+            link.matched_evidence_group for link in supporting_links
+        }
+        if not required_groups or not required_groups <= satisfied_groups:
+            result.append(question)
+            continue
+        evidence_ids = list(
+            dict.fromkeys(link.evidence_id for link in supporting_links)
+        )
+        result.append(
+            replace(
+                question,
+                status=EvidenceGapStatus.CLOSED.value,
+                answer=(
+                    "Python-validated Evidence links satisfy the required groups "
+                    f"{', '.join(sorted(required_groups))}."
+                ),
+                evidence_ids=evidence_ids,
+                unavailable_reason=None,
+            )
+        )
+    return result
 
 
 def _update_authoritative_finding(
@@ -273,7 +332,7 @@ def finalize_investigation(
                 link.question_id,
                 [],
             ).append(link.evidence_id)
-    questions = list(updated.investigation_questions)
+    questions = _reconcile_questions_with_complete_evidence_groups(updated)
     if progression.trace.competition_status == (
         CandidateCompetitionStatus.BLOCKED_BY_MISSING_DATA.value
     ):

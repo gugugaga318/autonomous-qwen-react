@@ -16,7 +16,10 @@ from yield_rca_core.evidence_models import (
     EvidenceSourceType,
     EvidenceType,
 )
-from yield_rca_core.evidence_synthesis import compact_evidence_prompt_card
+from yield_rca_core.evidence_synthesis import (
+    compact_evidence_prompt_card,
+    compact_lane_first_synthesis_for_prompt,
+)
 from yield_rca_core.hypothesis_candidate_generator import (
     HypothesisCandidateProposal,
     QwenHypothesisCandidateGenerator,
@@ -177,6 +180,99 @@ def finding(items: list[Evidence]) -> AgentFinding:
         evidence_ids=[item.evidence_id for item in items],
         evidence=items,
     )
+
+
+def prompt_visible_evidence_ids(
+    value: object,
+    *,
+    known_evidence_ids: set[str],
+) -> set[str]:
+    if isinstance(value, str):
+        return {value} if value in known_evidence_ids else set()
+    if isinstance(value, dict):
+        return {
+            evidence_id
+            for item in value.values()
+            for evidence_id in prompt_visible_evidence_ids(
+                item,
+                known_evidence_ids=known_evidence_ids,
+            )
+        }
+    if isinstance(value, (list, tuple)):
+        return {
+            evidence_id
+            for item in value
+            for evidence_id in prompt_visible_evidence_ids(
+                item,
+                known_evidence_ids=known_evidence_ids,
+            )
+        }
+    return set()
+
+
+def test_compact_synthesis_projects_only_referenceable_evidence_ids() -> None:
+    keep_id = "EVIDENCE-KEEP"
+    trimmed_id = "EVIDENCE-TRIMMED"
+    known_evidence_ids = {keep_id, trimmed_id}
+    synthesis = {
+        "active_causal_lanes": [
+            {
+                **lane(LANE_A, "RCP_A"),
+                "facts": {
+                    "process_excursions": [
+                        {"evidence_id": keep_id},
+                        {"evidence_id": trimmed_id},
+                    ]
+                },
+            }
+        ],
+        "global_facts": {
+            "outcomes": [{"evidence_id": trimmed_id}]
+        },
+        "mechanism_bridge_inputs": {
+            "by_lane": [
+                {
+                    "lane_id": LANE_A,
+                    "parameter_or_process_evidence_ids": [
+                        keep_id,
+                        trimmed_id,
+                    ],
+                }
+            ],
+            "global_outcome_evidence_ids": [trimmed_id],
+        },
+        "candidate_competition": {
+            "supporting_evidence_ids": [keep_id, "UNREGISTERED-CUSTOM-ID"],
+            "source_agent_by_evidence_id": {
+                keep_id: "fdc",
+                trimmed_id: "fdc",
+                "UNREGISTERED-CUSTOM-ID": "fdc",
+            },
+        },
+        "prompt_evidence_ids": [keep_id, trimmed_id],
+        "synthesis_note": "EV_PREFIX is ordinary prose, not an Evidence ID.",
+    }
+
+    projected = compact_lane_first_synthesis_for_prompt(
+        synthesis,
+        allowed_evidence_ids={keep_id},
+        known_evidence_ids=known_evidence_ids,
+    )
+
+    assert prompt_visible_evidence_ids(
+        projected,
+        known_evidence_ids=known_evidence_ids,
+    ) == {keep_id}
+    assert projected["candidate_competition"]["supporting_evidence_ids"] == [
+        keep_id
+    ]
+    assert projected["candidate_competition"]["source_agent_by_evidence_id"] == {
+        keep_id: "fdc"
+    }
+    assert projected["synthesis_note"] == (
+        "EV_PREFIX is ordinary prose, not an Evidence ID."
+    )
+    assert json.loads(json.dumps(projected)) == projected
 
 
 def response(
@@ -554,6 +650,10 @@ def test_repair_feedback_never_advertises_evidence_trimmed_from_register(
         "yield_rca_core.hypothesis_candidate_generator._TARGET_PROMPT_PAYLOAD_CHARS",
         9_000,
     )
+    monkeypatch.setattr(
+        "yield_rca_core.hypothesis_candidate_generator._MAX_PROMPT_EVIDENCE",
+        5,
+    )
     items = closure_evidence()
     items.extend(
         evidence(
@@ -619,6 +719,13 @@ def test_repair_feedback_never_advertises_evidence_trimmed_from_register(
         for evidence_id in gap["eligible_evidence_ids"]
     )
     assert advertised_ids <= register_ids
+    assert prompt_visible_evidence_ids(
+        second_payload,
+        known_evidence_ids={item.evidence_id for item in items},
+    ) <= register_ids
+    assert second_payload["evidence_synthesis"]["prompt_evidence_count"] == len(
+        register_ids
+    )
 
 
 def test_missing_scope_reference_is_not_reported_as_closure_complete() -> None:

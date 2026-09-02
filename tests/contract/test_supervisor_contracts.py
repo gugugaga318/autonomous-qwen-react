@@ -9,15 +9,20 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "core"))
 
 from yield_rca_core.models import (  # noqa: E402
+    AgentFinding,
     AgentKind,
     AgentTask,
     RCAJob,
     RCAState,
     TaskPlan,
     TaskStatus,
+    Warning,
 )
 from yield_rca_core.planner_agent import PlannerAgent  # noqa: E402
-from yield_rca_core.supervisor import SupervisorExecutionError  # noqa: E402
+from yield_rca_core.supervisor import (  # noqa: E402
+    SupervisorExecutionError,
+    _merge_warnings,
+)
 from yield_rca_core.workflow import build_csv_workflow  # noqa: E402
 
 SEED_DIR = ROOT / "data" / "seeds" / "golden_case"
@@ -90,6 +95,71 @@ class SupervisorContractTest(unittest.TestCase):
                 finding.details["evidence"],
             )
         self.assertTrue(set(state.report.cited_evidence_ids) <= known_evidence)
+
+    def test_current_state_drops_stale_missing_specialist_warning(self) -> None:
+        stale = Warning(
+            warning_id="WARN_RCA_MISSING_FINDINGS",
+            message="Missing Specialist findings: knowledge.",
+        )
+        persistent = Warning(
+            warning_id="WARN_PERSISTENT_CONTRACT",
+            message="A non-derived warning remains active.",
+        )
+        current_findings = [
+            AgentFinding(
+                finding_id=f"FINDING_{agent}",
+                agent=agent,
+                summary=f"{agent} finding is now present.",
+                confidence=0.8,
+                evidence_ids=[f"EV_{agent.upper()}"],
+            )
+            for agent in (
+                AgentKind.MES.value,
+                AgentKind.FDC.value,
+                AgentKind.DEFECT_WAT.value,
+                AgentKind.KNOWLEDGE.value,
+            )
+        ]
+
+        warnings = _merge_warnings(
+            [stale, persistent],
+            [],
+            current_findings=current_findings,
+        )
+
+        assert {item.warning_id for item in warnings} == {
+            "WARN_PERSISTENT_CONTRACT"
+        }
+
+    def test_current_state_keeps_missing_specialist_warning_until_complete(self) -> None:
+        missing = Warning(
+            warning_id="WARN_RCA_MISSING_FINDINGS",
+            message="Missing Specialist findings: knowledge.",
+        )
+        incomplete_findings = [
+            AgentFinding(
+                finding_id=f"FINDING_{agent}",
+                agent=agent,
+                summary=f"{agent} finding is present.",
+                confidence=0.8,
+                evidence_ids=[f"EV_{agent.upper()}"],
+            )
+            for agent in (
+                AgentKind.MES.value,
+                AgentKind.FDC.value,
+                AgentKind.DEFECT_WAT.value,
+            )
+        ]
+
+        warnings = _merge_warnings(
+            [missing],
+            [],
+            current_findings=incomplete_findings,
+        )
+
+        assert [item.warning_id for item in warnings] == [
+            "WARN_RCA_MISSING_FINDINGS"
+        ]
 
     def test_supervisor_rejects_non_executable_registered_kind(self) -> None:
         invalid_plan = TaskPlan(

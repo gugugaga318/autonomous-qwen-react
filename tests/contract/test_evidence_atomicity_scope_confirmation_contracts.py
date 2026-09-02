@@ -351,7 +351,26 @@ def test_chamber_shared_effect_requires_process_and_outcome_per_recipe_lane() ->
             recipe="RCP_A",
             outcome="contact_resistance",
         ),
+        _typed_evidence(
+            "EV_PARAMETER_B",
+            EvidenceType.PARAMETER_DEVIATION.value,
+            lot_id="LOT_B",
+            recipe="RCP_B",
+            parameter="oxygen_flow",
+        ),
+        _typed_evidence(
+            "EV_OUTCOME_B",
+            EvidenceType.METROLOGY_DEVIATION.value,
+            lot_id="LOT_B",
+            recipe="RCP_B",
+            outcome="contact_resistance",
+        ),
     ]
+    cited_ids = tuple(
+        item.evidence_id
+        for item in items
+        if item.evidence_id.endswith("_A")
+    )
     hypothesis = CausalHypothesis(
         root_cause=(
             "EQ_A_CH01 oxygen_flow instability during operation 2500 causes "
@@ -361,7 +380,7 @@ def test_chamber_shared_effect_requires_process_and_outcome_per_recipe_lane() ->
             "High oxygen flow changes removal chemistry, leaves residue, and "
             "raises contact resistance."
         ),
-        supporting_evidence_ids=tuple(item.evidence_id for item in items),
+        supporting_evidence_ids=cited_ids,
     )
     proposal = HypothesisCandidateProposal(
         root_cause=hypothesis.root_cause,
@@ -397,9 +416,15 @@ def test_chamber_shared_effect_requires_process_and_outcome_per_recipe_lane() ->
     assert scope.facts["scope_outcome_covered_lane_ids"] == [LANE_A]
     assert scope.facts["scope_missing_process_lane_ids"] == [LANE_B]
     assert scope.facts["scope_missing_outcome_lane_ids"] == [LANE_B]
-    assert closure[0]["status"] == "complete"
+    assert closure[0]["status"] == "incomplete"
     assert closure[0]["matching_claimed_scope_lane_ids"] == [LANE_A, LANE_B]
-    assert closure[0]["closure_gaps"] == []
+    assert {
+        (gap["lane_id"], gap["evidence_role"])
+        for gap in closure[0]["closure_gaps"]
+    } == {
+        (LANE_B, "parameter"),
+        (LANE_B, "outcome"),
+    }
 
     gaps = build_causal_evidence_gaps([matrix])
     coverage_gaps = [item for item in gaps if item.get("gap_origin") == "scope_coverage"]
@@ -853,7 +878,7 @@ def test_old_candidate_semantic_profile_defaults_to_lane_scope() -> None:
     assert CandidateSemanticProfile.from_dict(profile.to_dict()) == profile
 
 
-def test_explicit_incident_inspection_span_is_typed_and_can_ground_bridge() -> None:
+def test_explicit_incident_inspection_span_is_typed_without_proving_causation() -> None:
     query = (
         "Investigate LOT_A: resistance tail with surface-residue inspection on "
         "matching wafers. The detection point is an observation, not a cause."
@@ -910,13 +935,61 @@ def test_explicit_incident_inspection_span_is_typed_and_can_ground_bridge() -> N
         [parameter, outcome, observation],
     )
 
-    assert matrix.mechanism_status == CausalClaimStatus.SUPPORTED.value
+    assert matrix.mechanism_status == CausalClaimStatus.PLAUSIBLE.value
     assert matrix.mechanism_support_source == "observed_intermediate"
     assert matrix.claims["mechanism"].facts[
         "observed_intermediate_evidence_ids"
     ] == [observation.evidence_id]
     serialized = json.dumps(matrix.to_dict(), ensure_ascii=False)
     assert '"source_quote": "surface-residue"' in serialized
+
+
+def test_confirmed_typed_mechanism_intermediate_can_support_bridge() -> None:
+    parameter = _typed_evidence(
+        "EV_PARAMETER_CONFIRMED_INTERMEDIATE",
+        EvidenceType.PARAMETER_DEVIATION.value,
+        lot_id="LOT_A",
+        recipe="RCP_A",
+        parameter="oxygen_flow",
+    )
+    outcome = _typed_evidence(
+        "EV_OUTCOME_CONFIRMED_INTERMEDIATE",
+        EvidenceType.METROLOGY_DEVIATION.value,
+        lot_id="LOT_A",
+        recipe="RCP_A",
+        outcome="contact_resistance",
+    )
+    intermediate = _typed_evidence(
+        "EV_CONFIRMED_INTERMEDIATE",
+        EvidenceType.DEFECT_SIGNAL.value,
+        lot_id="LOT_A",
+        recipe="RCP_A",
+        outcome="surface_residue",
+        metadata_overrides={
+            "causal_role": "physical_intermediate",
+            "causal_status": "confirmed_causal_intermediate",
+        },
+    )
+    hypothesis = CausalHypothesis(
+        root_cause="High oxygen_flow causes surface residue and contact resistance",
+        causal_explanation=(
+            "High oxygen flow changes removal chemistry, leaves surface residue, "
+            "and raises contact resistance."
+        ),
+        supporting_evidence_ids=(
+            parameter.evidence_id,
+            outcome.evidence_id,
+            intermediate.evidence_id,
+        ),
+    )
+
+    matrix = build_causal_evidence_matrix(
+        hypothesis,
+        [parameter, outcome, intermediate],
+    )
+
+    assert matrix.mechanism_status == CausalClaimStatus.SUPPORTED.value
+    assert matrix.mechanism_support_source == "observed_intermediate"
 
 
 def test_incident_query_without_explicit_observation_does_not_create_evidence() -> None:

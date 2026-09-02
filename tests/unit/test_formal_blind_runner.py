@@ -20,6 +20,7 @@ def clean_result() -> dict[str, object]:
         "actual_orchestration_mode": "llm_react",
         "fallback_reason": None,
         "hypothesis_candidate_source": "qwen",
+        "hypothesis_candidate_count": 1,
         "hypothesis_candidate_fallback_reason": None,
         "provider_failures": [],
         "llm_call_cap_exceeded": False,
@@ -27,6 +28,26 @@ def clean_result() -> dict[str, object]:
         "planner_stop_reason": "goal_satisfied",
         "terminal_question_updates_source": "python_evidence_gate",
     }
+
+
+def test_execution_layer_qwen_candidate_metric_requires_a_candidate() -> None:
+    without_candidate = {
+        **clean_result(),
+        "hypothesis_candidate_count": 0,
+        "hypothesis_candidate_fallback_reason": "qwen_candidate_provider_failed",
+    }
+
+    metrics = _execution_layer([without_candidate])
+
+    assert metrics["qwen_candidate_count"] == 0
+    assert metrics["qwen_candidate_rate"] == 0.0
+
+
+def test_execution_layer_counts_nonempty_qwen_candidate_output() -> None:
+    metrics = _execution_layer([clean_result()])
+
+    assert metrics["qwen_candidate_count"] == 1
+    assert metrics["qwen_candidate_rate"] == 1.0
 
 
 def test_strict_qwen_accepts_a_clean_llm_react_case() -> None:

@@ -1127,6 +1127,102 @@ class QwenNextActionPlannerContractTest(unittest.TestCase):
             target_scope["lane_id"],
         )
 
+    def test_lower_priority_high_value_gap_survives_action_value_filter(self) -> None:
+        mechanism = questions()[1]
+        stale_gap_id = "candidate_0.mechanism.reasoning_refresh"
+        actionable_gap_id = (
+            "candidate_0.hypothesis_discrimination.parameter_anomaly.lane_b"
+        )
+        target_scope = {
+            "lane_id": "lane:2500:EQ_A:EQ_A_CH01:RCP_B",
+            "operation": "2500",
+            "equipment": "EQ_A",
+            "chamber": "EQ_A_CH01",
+            "recipe": "RCP_B",
+            "discriminator_kind": "parameter_anomaly",
+        }
+        mes = finding(AgentKind.MES.value)
+        mes.details["lane_candidates"] = [
+            {
+                **target_scope,
+                "parameter_scope": ["oxygen_flow"],
+                "exposed_lot_ids": ["LOT_01"],
+            }
+        ]
+        rca = AgentFinding(
+            finding_id="FINDING_ACTION_VALUE_PRIORITY_RCA",
+            agent=AgentKind.RCA_REASONING.value,
+            summary="A lower-priority Lane discriminator can still change ranking.",
+            confidence=0.5,
+            evidence_ids=["EV_RCA_TRACE"],
+            details={
+                "competition_requirement": "mechanism_required",
+                "competition_axes": ["mechanism"],
+                "causal_evidence_gaps": [
+                    {
+                        "gap_id": stale_gap_id,
+                        "gap_type": "missing_support",
+                        "candidate_index": 0,
+                        "candidate_id": "C_PRIMARY",
+                        "claim": "mechanism",
+                        "status": "incomplete",
+                        "priority": 1,
+                        "information_gain": 0.2,
+                        "reason": "Refresh reasoning only after new ranking Evidence.",
+                        "question_kind": "process_mechanism",
+                        "allowed_actions": [ActionKind.RUN_RCA_REASONING.value],
+                    },
+                    {
+                        "gap_id": actionable_gap_id,
+                        "gap_type": "hypothesis_discrimination",
+                        "discriminator_kind": "parameter_anomaly",
+                        "competition_axis": "mechanism",
+                        "can_change_ranking": True,
+                        "candidate_index": 0,
+                        "candidate_id": "C_PRIMARY",
+                        "claim": "hypothesis_discrimination",
+                        "status": "unresolved",
+                        "priority": 2,
+                        "information_gain": 0.8,
+                        "reason": "Inspect the sibling Recipe Lane discriminator.",
+                        "question_kind": "process_mechanism",
+                        "allowed_actions": [ActionKind.INSPECT_FDC_SPC.value],
+                        "preferred_action": ActionKind.INSPECT_FDC_SPC.value,
+                        "target_scope": target_scope,
+                        "challenge_selected": True,
+                    },
+                ],
+            },
+        )
+        client = RecordingNextActionClient()
+
+        outcome = QwenNextActionPlanner(client).decide_with_review(
+            goal=goal(),
+            questions=[mechanism],
+            findings=[
+                mes,
+                finding(AgentKind.FDC.value),
+                finding(AgentKind.DEFECT_WAT.value),
+                rca,
+            ],
+            action_records=[],
+            tool_call_count=0,
+            evidence_ids=["EV_RCA_TRACE"],
+            question_evidence_links=[],
+            authoritative_rca_finding_id=rca.finding_id,
+        )
+
+        self.assertEqual(client.requests, [])
+        self.assertEqual(outcome.decision.decision_type, DecisionType.ACT.value)
+        self.assertEqual(
+            outcome.decision.next_action.kind,
+            ActionKind.INSPECT_FDC_SPC.value,
+        )
+        self.assertEqual(
+            outcome.decision.next_action.scope["causal_gap_id"],
+            actionable_gap_id,
+        )
+
     def test_qwen_must_select_one_gap_when_an_action_has_multiple_legal_gaps(
         self,
     ) -> None:

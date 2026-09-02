@@ -1584,6 +1584,19 @@ class QwenNextActionPlanner:
         high_value_assessments = list(
             high_value_action_assessments(action_value_assessments)
         )
+        if high_value_assessments:
+            active_priority = min(
+                int(gap_by_id[item.gap_id].get("priority", 3))
+                for item in high_value_assessments
+                if item.gap_id in gap_by_id
+            )
+            high_value_assessments = [
+                item
+                for item in high_value_assessments
+                if item.gap_id in gap_by_id
+                and int(gap_by_id[item.gap_id].get("priority", 3))
+                == active_priority
+            ]
         decision_critical_unavailable_gain = any(
             gain.gain_type == InvestigationGainType.STATE_GAIN.value
             and gain.reason_code
@@ -3083,7 +3096,7 @@ class QwenNextActionPlanner:
                     targets_by_action.setdefault(action_kind, []).append(
                         question.question_id
                     )
-        gap_action_targets: list[tuple[int, str, list[str]]] = []
+        gap_action_targets: list[tuple[str, list[str]]] = []
         for gap in eligible_gaps:
             question_kind = str(gap["question_kind"])
             targets = [
@@ -3125,13 +3138,10 @@ class QwenNextActionPlanner:
                 ):
                     continue
                 gap_action_targets.append(
-                    (int(gap.get("priority", 3)), str(action_kind), targets)
+                    (str(action_kind), targets)
                 )
-        if gap_action_targets:
-            active_priority = min(item[0] for item in gap_action_targets)
-            for priority, action_kind, targets in gap_action_targets:
-                if priority == active_priority:
-                    targets_by_action.setdefault(action_kind, []).extend(targets)
+        for action_kind, targets in gap_action_targets:
+            targets_by_action.setdefault(action_kind, []).extend(targets)
         return {
             action_kind: list(dict.fromkeys(target_ids))
             for action_kind, target_ids in sorted(targets_by_action.items())
@@ -3149,7 +3159,7 @@ class QwenNextActionPlanner:
         finding_agents = {finding.agent for finding in findings}
         known_lane_ids = _known_causal_lane_ids(findings)
         open_kinds = {question.question_kind for question in questions}
-        executable_gap_actions: list[tuple[int, str, str]] = []
+        executable_gap_actions: list[tuple[str, str]] = []
         for gap in _eligible_causal_gaps(causal_gaps):
             gap_id = str(gap["gap_id"])
             if str(gap["question_kind"]) not in open_kinds:
@@ -3187,14 +3197,11 @@ class QwenNextActionPlanner:
                 ):
                     continue
                 executable_gap_actions.append(
-                    (int(gap.get("priority", 3)), action_kind, gap_id)
+                    (action_kind, gap_id)
                 )
         result: dict[str, list[str]] = {}
-        if executable_gap_actions:
-            active_priority = min(item[0] for item in executable_gap_actions)
-            for priority, action_kind, gap_id in executable_gap_actions:
-                if priority == active_priority:
-                    result.setdefault(action_kind, []).append(gap_id)
+        for action_kind, gap_id in executable_gap_actions:
+            result.setdefault(action_kind, []).append(gap_id)
         return {
             action_kind: list(dict.fromkeys(gap_ids))
             for action_kind, gap_ids in sorted(result.items())

@@ -232,6 +232,22 @@ def semantic_profile(
     mechanism_relation: str | None = None,
     depends_on_candidate_index: int | None = None,
 ) -> dict[str, object]:
+    distinguishing_prediction: dict[str, object] = {
+        "discriminator_kind": discriminator_kind,
+        "lane_ids": comparison_lane_ids,
+        "prediction": prediction,
+    }
+    if discriminator_kind == "product_outcome":
+        distinguishing_prediction["lane_effect_expectations"] = [
+            {
+                "lane_id": lane_id,
+                "effect_key": "observed_product_outcome",
+                "effect_state": (
+                    "present" if lane_id in claimed_lane_ids else "absent"
+                ),
+            }
+            for lane_id in comparison_lane_ids
+        ]
     return {
         "candidate_index": candidate_index,
         "claimed_scope": {
@@ -247,13 +263,7 @@ def semantic_profile(
             mechanism_relation
             or ("reference" if candidate_index == 0 else "independent_alternative")
         ),
-        "distinguishing_predictions": [
-            {
-                "discriminator_kind": discriminator_kind,
-                "lane_ids": comparison_lane_ids,
-                "prediction": prediction,
-            }
-        ],
+        "distinguishing_predictions": [distinguishing_prediction],
     }
 
 
@@ -293,6 +303,30 @@ class CandidateProviderFailureClient(FakeLLMClient):
             "candidate provider unavailable",
             status_code=503,
             failure_category="provider_http_error",
+        )
+
+
+class CandidateRepairProviderFailureClient(FakeLLMClient):
+    """Return one repairable output, then fail the bounded repair call."""
+
+    def __init__(self) -> None:
+        self.requests: list[LLMRequest] = []
+
+    def complete_json(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        base = super().complete_json(request)
+        if len(self.requests) == 1:
+            return LLMResponse(
+                data={
+                    "candidates": [proposal(supporting=["EV_UNKNOWN"])],
+                    "analysis_summary": "The first output requires bounded repair.",
+                },
+                usage=base.usage,
+            )
+        raise LLMCallError(
+            "candidate repair provider unavailable",
+            failure_category="transport_error",
+            call_attempt_count=2,
         )
 
 
@@ -2985,6 +3019,10 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
             "qwen_candidate_output_invalid",
         )
         self.assertTrue(generation["candidate_output_invalid"])
+        self.assertEqual(
+            generation["competition_failure_reason"],
+            "candidate_validation_exhausted",
+        )
         self.assertEqual(result.details["status"], "inconclusive")
         self.assertIn(
             "WARN_RCA_QWEN_CANDIDATE_INVALID",
@@ -3059,10 +3097,48 @@ class QwenHypothesisCandidateContractTest(unittest.TestCase):
             "qwen_candidate_provider_failed",
         )
         self.assertEqual(generation["candidate_count"], 0)
+        self.assertFalse(generation["candidate_output_invalid"])
+        self.assertEqual(
+            generation["competition_failure_reason"],
+            "candidate_provider_failed",
+        )
         self.assertEqual(result.details["status"], "inconclusive")
         self.assertEqual(result.details["hypothesis_engine_result"]["candidates"], [])
         self.assertIn(
             "WARN_RCA_LLM_CANDIDATE_FALLBACK",
+            {warning.warning_id for warning in result.warnings},
+        )
+        self.assertNotIn(
+            "WARN_RCA_CANDIDATE_VALIDATION_BOUNDARY",
+            {warning.warning_id for warning in result.warnings},
+        )
+
+    def test_candidate_repair_provider_failure_is_not_output_validation(self) -> None:
+        client = CandidateRepairProviderFailureClient()
+
+        result = RCAReasoningAgent(
+            llm_client=client,
+            agent_mode="llm",
+        ).analyze(
+            request_id="REQ_RCA_REPAIR_PROVIDER_FAILURE",
+            findings=causal_findings(),
+        )
+
+        generation = result.details["hypothesis_candidate_generation"]
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(
+            generation["fallback_reason"],
+            "qwen_candidate_provider_failed",
+        )
+        self.assertFalse(generation["candidate_output_invalid"])
+        self.assertEqual(
+            generation["competition_failure_reason"],
+            "candidate_provider_failed",
+        )
+        self.assertEqual(generation["candidate_count"], 0)
+        self.assertEqual(result.details["status"], "inconclusive")
+        self.assertNotIn(
+            "WARN_RCA_CANDIDATE_VALIDATION_BOUNDARY",
             {warning.warning_id for warning in result.warnings},
         )
 

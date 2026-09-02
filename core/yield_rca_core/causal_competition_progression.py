@@ -27,6 +27,22 @@ from yield_rca_core.causal_investigation_models import (
 CONCLUSION_SUPPORTED = "supported"
 CONCLUSION_INCONCLUSIVE = "inconclusive"
 CONCLUSION_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+_PROCESSING_FAILURE_REASONS = frozenset(
+    {
+        CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value,
+        CompetitionFailureReason.CANDIDATE_PROVIDER_FAILED.value,
+        CompetitionFailureReason.CHALLENGE_OUTPUT_INVALID.value,
+    }
+)
+
+
+def competition_processing_failed(trace: CompetitionTrace) -> bool:
+    """Return whether Competition stopped because a governed processor failed."""
+
+    return (
+        trace.competition_status == CandidateCompetitionStatus.FAILED.value
+        and trace.competition_failure_reason in _PROCESSING_FAILURE_REASONS
+    )
 
 
 @dataclass(frozen=True)
@@ -392,14 +408,7 @@ def progress_competition(
     current_status = trace.competition_status
     terminal_reason: str | None = None
 
-    processing_failure_reasons = {
-        CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value,
-        CompetitionFailureReason.CHALLENGE_OUTPUT_INVALID.value,
-    }
-    processing_failed = (
-        current_status == CandidateCompetitionStatus.FAILED.value
-        and trace.competition_failure_reason in processing_failure_reasons
-    )
+    processing_failed = competition_processing_failed(trace)
     competition_gap_reason = trace.competition_gap_reason
     legacy_failure_reason = trace.competition_failure_reason
     if (
@@ -492,7 +501,7 @@ def progress_competition(
             scope_assessment_status = ScopeAssessmentStatus.ACTIVE.value
     lane_resolutions = _with_missing_source_lane_resolutions(
         trace,
-        gain_history=gain_history,
+        gain_history=critical_unavailable_gains,
         terminally_blocked=(
             status == CandidateCompetitionStatus.BLOCKED_BY_MISSING_DATA.value
         ),
@@ -614,6 +623,7 @@ def progress_competition(
 
 __all__ = [
     "CompetitionProgressionResult",
+    "competition_processing_failed",
     "derive_candidate_resolutions",
     "progress_competition",
 ]

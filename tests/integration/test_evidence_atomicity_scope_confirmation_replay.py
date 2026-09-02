@@ -212,16 +212,21 @@ def test_formal_009_atomic_scope_confirmation_offline_replay() -> None:
         semantic_profile=profile,
     )
 
-    assert matrix.mechanism_status == CausalClaimStatus.SUPPORTED.value
+    assert matrix.mechanism_status == CausalClaimStatus.PLAUSIBLE.value
     assert matrix.mechanism_support_source == "observed_intermediate"
+    assert matrix.claims["mechanism"].facts[
+        "occurrence_only_intermediate_evidence_ids"
+    ] == [item.evidence_id for item in incident_evidence]
     assert matrix.claims["scope"].status == CausalClaimStatus.SUPPORTED.value
-    assert confirmation.status == "supported"
-    assert impact_gate["confirmed_impact_lots"] == [
+    assert confirmation.status == "inconclusive"
+    assert impact_gate["candidate_impact_lots"] == [
         "LOT_016F55DC01",
         "LOT_2EE4F67090",
         "LOT_706579D262",
         "LOT_E694A57AFB",
     ], impact_gate["rows"]
+    assert impact_gate["confirmed_impact_lots"] == []
+    assert impact_gate["publication_status"] == "withheld"
     rows = {item["lot_id"]: item for item in impact_gate["rows"]}
     assert rows["LOT_06EDD88B80"]["checks"]["outcome"] is False
     assert rows["LOT_39FBF686C1"]["checks"]["outcome"] is False

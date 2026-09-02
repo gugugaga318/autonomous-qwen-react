@@ -39,6 +39,13 @@ Return exactly one JSON object:
         {
           "discriminator_kind": "parameter_anomaly | exposure_commonality | recipe_commonality | product_outcome | temporal_alignment | mechanism_context",
           "lane_ids": ["existing active Lane ID"],
+          "lane_effect_expectations": [
+            {
+              "lane_id": "one Lane ID from this prediction",
+              "effect_key": "stable product-effect identity",
+              "effect_state": "present | absent | increased | decreased | unchanged | unresolved"
+            }
+          ],
           "prediction": "a falsifiable observation that distinguishes this candidate"
         }
       ]
@@ -78,6 +85,17 @@ Rules:
   effect only in the claimed focal Lane; ``differential_sensitivity`` when the
   same underlying condition has materially different effects across compared
   Lanes; and ``unresolved`` when current Evidence cannot bound the reach.
+- Every ``product_outcome`` prediction must provide one or more structured
+  ``lane_effect_expectations`` for exactly the Lanes in that prediction. Use a
+  stable ``effect_key`` for the same product effect and one of the listed
+  ``effect_state`` values. For other discriminator kinds, omit
+  ``lane_effect_expectations`` or return it as an empty array. The free-text
+  ``prediction`` must explain, not contradict, the structured expectations;
+  Python validates the structure and does not infer effect polarity from prose.
+- For ``scope_relation=shared_effect``, every claimed Lane must have the same
+  normalized set of product ``effect_key`` + ``effect_state`` expectations.
+  Extra comparison/control Lanes may declare a different state. For
+  ``focal_only`` and ``differential_sensitivity``, compared Lanes may differ.
 - ``comparison_scope.lane_ids`` must include every claimed Lane and may include
   additional active Lanes needed for controls or contrast. For every resolved
   scope relation, the distinguishing predictions must collectively name every

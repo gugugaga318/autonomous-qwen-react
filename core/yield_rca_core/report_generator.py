@@ -21,6 +21,7 @@ from yield_rca_core.models import (
     Warning,
 )
 from yield_rca_core.question_capability import QUESTION_CAPABILITY_REGISTRY
+from yield_rca_core.warning_policy import reconcile_current_warnings
 
 
 class ReportGenerationError(ValueError):
@@ -139,11 +140,16 @@ def _evidence_text(evidence: Evidence) -> str:
 
 
 def _state_warnings(state: RCAState) -> list[Warning]:
-    warnings_by_id = {warning.warning_id: warning for warning in state.warnings}
-    for finding in state.findings:
-        for warning in finding.warnings:
-            warnings_by_id[warning.warning_id] = warning
-    return list(warnings_by_id.values())
+    historical_finding_warnings = [
+        warning
+        for finding in state.findings
+        for warning in finding.warnings
+    ]
+    return reconcile_current_warnings(
+        state.warnings,
+        historical_finding_warnings,
+        current_findings=state.findings,
+    )
 
 
 def _validate_evidence_ids(

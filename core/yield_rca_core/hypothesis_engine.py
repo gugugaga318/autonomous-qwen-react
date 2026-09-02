@@ -744,6 +744,51 @@ def _llm_candidate_payload(
     }
 
 
+_MATRIX_REJECTION_PREFIXES = (
+    "The Causal Evidence Matrix found a critical claim/Evidence conflict.",
+    "Causal Evidence Matrix could not be built:",
+)
+
+
+def _synchronize_candidate_matrix_validation(
+    candidate: dict[str, Any],
+    matrix: CausalEvidenceMatrix,
+) -> None:
+    """Keep candidate validation fields consistent with the final Matrix."""
+
+    matrix_consistent = not matrix.has_critical_conflict
+    validation_results = [
+        dict(item)
+        for item in candidate.get("validation_results", [])
+        if isinstance(item, Mapping)
+    ]
+    for result in validation_results:
+        if result.get("gate") == "claim_evidence_consistency":
+            result["outcome"] = "passed" if matrix_consistent else "failed"
+    candidate["validation_results"] = validation_results
+
+    rejection_reasons = [
+        str(reason)
+        for reason in candidate.get("rejection_reasons", [])
+        if not str(reason).startswith(_MATRIX_REJECTION_PREFIXES)
+    ]
+    if not matrix_consistent:
+        rejection_reasons.append(_MATRIX_REJECTION_PREFIXES[0])
+    candidate["rejection_reasons"] = list(dict.fromkeys(rejection_reasons))
+
+    gate_passed = (
+        bool(validation_results)
+        and all(
+            result.get("outcome") == "passed"
+            for result in validation_results
+        )
+        and not candidate.get("contradicting_evidence_ids", [])
+    )
+    candidate["llm_gate_passed"] = gate_passed
+    if candidate.get("status") != "conflicted" and not gate_passed:
+        candidate["status"] = "candidate"
+
+
 @dataclass(frozen=True)
 class HypothesisEngine:
     """Generate, validate, rank, and gate deterministic RCA hypotheses."""
@@ -947,6 +992,8 @@ class HypothesisEngine:
             candidate["causal_evidence_matrix"] = matrix.to_dict()
             candidate["causal_matrix_status"] = matrix.status
             candidate["mechanism_support_source"] = matrix.mechanism_support_source
+            if candidate.get("basis") == "llm_evidence_composition":
+                _synchronize_candidate_matrix_validation(candidate, matrix)
 
         matrices = list(matrices_by_root.values())
         matrix_candidate_ids = [

@@ -351,7 +351,10 @@ def _execution_layer(results: list[dict[str, Any]]) -> dict[str, Any]:
     )
     provider_clean = sum(not bool(item.get("provider_failure")) for item in results)
     qwen_candidates = sum(
-        item.get("hypothesis_candidate_source") == "qwen" for item in results
+        item.get("hypothesis_candidate_source") == "qwen"
+        and type(item.get("hypothesis_candidate_count")) is int
+        and int(item["hypothesis_candidate_count"]) > 0
+        for item in results
     )
     qwen_stop = sum(item.get("planner_stop_proposed_by") == "qwen" for item in results)
     governed_python_stop = sum(

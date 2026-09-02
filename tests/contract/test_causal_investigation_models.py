@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from yield_rca_core.causal_investigation_models import (  # noqa: E402
     CandidateCompetitionStatus,
     CandidateCompetitionType,
     CandidateDistinguishingPrediction,
+    CandidateLaneEffectExpectation,
     CandidateScopeRelation,
     CandidateSemanticProfile,
     CausalChainCompleteness,
@@ -215,6 +217,61 @@ def test_rca_state_causal_fields_round_trip_and_legacy_compatibility() -> None:
     assert legacy.candidate_challenges == []
     assert legacy.competition_trace is None
     assert legacy.causal_chain_completeness is None
+
+
+def test_candidate_lane_effect_expectations_round_trip_and_legacy_state() -> None:
+    legacy_profile = CandidateSemanticProfile.from_dict(
+        {
+            "candidate_id": "CANDIDATE_A",
+            "scope_relation": CandidateScopeRelation.FOCAL_ONLY.value,
+            "claimed_lane_ids": ["LANE_001"],
+            "comparison_lane_ids": ["LANE_001"],
+            "mechanism_claim": "Pressure instability changes wafer clamping.",
+            "distinguishing_predictions": [
+                {
+                    "discriminator_kind": "product_outcome",
+                    "lane_ids": ["LANE_001"],
+                    "prediction": "The focal Lane produces the product failure.",
+                }
+            ],
+        }
+    )
+    legacy_prediction = legacy_profile.distinguishing_predictions[0]
+    assert legacy_prediction.lane_effect_expectations == ()
+
+    state = make_state(
+        causal_lanes=[make_lane()],
+        competition_trace=CompetitionTrace(
+            candidate_semantic_profiles=(legacy_profile,),
+        ),
+    )
+    legacy_state_payload = json.loads(json.dumps(state.to_dict()))
+    del legacy_state_payload["competition_trace"]["candidate_semantic_profiles"][0][
+        "distinguishing_predictions"
+    ][0]["lane_effect_expectations"]
+    restored_state = RCAState.from_dict(legacy_state_payload)
+    restored_profile = restored_state.competition_trace.candidate_semantic_profiles[0]
+    assert restored_profile.distinguishing_predictions[
+        0
+    ].lane_effect_expectations == ()
+    json.dumps(restored_state.to_dict())
+
+    structured_prediction = CandidateDistinguishingPrediction(
+        discriminator_kind="product_outcome",
+        lane_ids=("LANE_001",),
+        prediction="The focal Lane produces HIGH_CONTACT_R.",
+        lane_effect_expectations=(
+            CandidateLaneEffectExpectation(
+                lane_id="LANE_001",
+                effect_key="HIGH_CONTACT_R",
+                effect_state="present",
+            ),
+        ),
+    )
+    structured_payload = json.loads(json.dumps(structured_prediction.to_dict()))
+    assert CandidateDistinguishingPrediction.from_dict(
+        structured_payload
+    ) == structured_prediction
 
 
 def test_rca_state_rejects_invalid_causal_references_and_status() -> None:

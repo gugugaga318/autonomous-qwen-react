@@ -26,7 +26,10 @@ from yield_rca_core.evidence_models import (
     EvidenceType,
 )
 from yield_rca_core.models import AgentFinding, RCAJob, RCAState
-from yield_rca_core.supervisor import _update_competition_state
+from yield_rca_core.supervisor import (
+    _update_causal_lane_state,
+    _update_competition_state,
+)
 
 
 def _challenge(
@@ -282,6 +285,48 @@ def test_supervisor_persists_each_lane_result_without_closing_other_lane() -> No
         "EV_B",
         "EV_C",
     }
+
+
+def test_deferred_overflow_lanes_are_not_active_unresolved_alternatives() -> None:
+    lane_ids = ("LANE_A", "LANE_B", "LANE_C", "LANE_D")
+    evidence = [_evidence(f"EV_{lane_id}", lane_id) for lane_id in lane_ids]
+    finding = AgentFinding(
+        finding_id="F_263_OVERFLOW",
+        agent="mes",
+        summary="Four searchable factual Lanes were discovered.",
+        confidence=0.9,
+        evidence_ids=[item.evidence_id for item in evidence],
+        details={
+            "lane_candidates": [
+                {
+                    "lane_id": lane_id,
+                    "operation": str(2500 + index),
+                    "equipment": f"EQ_{index}",
+                    "chamber": f"EQ_{index}_CH01",
+                    "recipe": f"RCP_{index}",
+                    "parameter_scope": ["oxygen_flow"],
+                    "exposed_lot_ids": [f"LOT_{index}"],
+                    "evidence_ids": [f"EV_{lane_id}"],
+                    "priority_score": 1.0 - (index / 10),
+                }
+                for index, lane_id in enumerate(lane_ids)
+            ]
+        },
+    )
+    state = RCAState(
+        job=RCAJob(job_id="JOB_263_OVERFLOW", user_query="test"),
+        evidence=evidence,
+        findings=[finding],
+    )
+
+    updated = _update_causal_lane_state(state, finding)
+
+    assert updated.competition_trace is not None
+    assert len(updated.competition_trace.active_lane_ids) == 3
+    assert len(updated.competition_trace.overflow_lane_ids) == 1
+    assert set(updated.competition_trace.overflow_lane_ids).isdisjoint(
+        updated.competition_trace.unresolved_lane_ids
+    )
 
 
 def test_supervisor_persists_candidate_competition_failure_without_challenge() -> None:

@@ -22,7 +22,10 @@ from yield_rca_core.evidence_models import (
     EvidenceSourceType,
     EvidenceType,
 )
-from yield_rca_core.hypothesis_engine import HypothesisEngine
+from yield_rca_core.hypothesis_engine import (
+    HypothesisEngine,
+    _synchronize_candidate_matrix_validation,
+)
 from yield_rca_core.models import AgentKind
 
 LANE_A = "lane:2500:EQ_A:EQ_A_CH01:RCP_A"
@@ -277,8 +280,84 @@ def test_hypothesis_engine_passes_candidate_semantics_into_matrix() -> None:
     )
 
     scope = result["candidates"][0]["causal_evidence_matrix"]["claims"]["scope"]
+    candidate_result = result["candidates"][0]
     assert scope["status"] == "supported"
     assert scope["facts"]["scope_relation"] == "shared_effect"
+    assert (
+        "The Causal Evidence Matrix found a critical claim/Evidence conflict."
+        not in candidate_result["rejection_reasons"]
+    )
+    claim_consistency = next(
+        item
+        for item in candidate_result["validation_results"]
+        if item["gate"] == "claim_evidence_consistency"
+    )
+    assert claim_consistency["outcome"] == "passed"
+
+
+def test_matrix_audit_sync_does_not_promote_candidate_without_decision_gate() -> None:
+    matrix = build_causal_evidence_matrix(
+        _candidate("EV_A"),
+        [_evidence("EV_A", LANE_A, "LOT_A")],
+        semantic_profile=_profile(
+            CandidateScopeRelation.SHARED_EFFECT,
+            claimed=(LANE_A, LANE_B),
+            comparison=(LANE_A, LANE_B),
+        ),
+    )
+    candidate = {
+        "status": "candidate",
+        "llm_gate_passed": False,
+        "contradicting_evidence_ids": [],
+        "validation_results": [
+            {"gate": "known_evidence", "outcome": "passed"},
+            {"gate": "claim_evidence_consistency", "outcome": "failed"},
+        ],
+        "rejection_reasons": [
+            "The Causal Evidence Matrix found a critical claim/Evidence conflict."
+        ],
+    }
+
+    _synchronize_candidate_matrix_validation(candidate, matrix)
+
+    assert matrix.status == "incomplete"
+    assert candidate["llm_gate_passed"] is True
+    assert candidate["status"] == "candidate"
+    assert candidate["rejection_reasons"] == []
+
+
+def test_matrix_audit_sync_still_downgrades_final_conflict() -> None:
+    matrix = build_causal_evidence_matrix(
+        _candidate("EV_A", "EV_OUTSIDE"),
+        [
+            _evidence("EV_A", LANE_A, "LOT_A"),
+            _evidence("EV_OUTSIDE", LANE_OUTSIDE, "LOT_Z"),
+        ],
+        semantic_profile=_profile(
+            CandidateScopeRelation.FOCAL_ONLY,
+            claimed=(LANE_A,),
+            comparison=(LANE_A, LANE_B),
+        ),
+    )
+    candidate = {
+        "status": "supported",
+        "llm_gate_passed": True,
+        "contradicting_evidence_ids": [],
+        "validation_results": [
+            {"gate": "known_evidence", "outcome": "passed"},
+            {"gate": "claim_evidence_consistency", "outcome": "passed"},
+        ],
+        "rejection_reasons": [],
+    }
+
+    _synchronize_candidate_matrix_validation(candidate, matrix)
+
+    assert matrix.status == "conflicted"
+    assert candidate["llm_gate_passed"] is False
+    assert candidate["status"] == "candidate"
+    assert candidate["rejection_reasons"] == [
+        "The Causal Evidence Matrix found a critical claim/Evidence conflict."
+    ]
 
 
 def test_legacy_matrix_without_semantic_profile_keeps_old_scope_rule() -> None:

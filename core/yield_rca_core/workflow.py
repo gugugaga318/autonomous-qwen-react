@@ -171,6 +171,7 @@ class PurePythonRCAWorkflow:
                         job,
                         goal,
                         tool_latencies=tool_latencies,
+                        orchestration_requested_mode=active_orchestration_mode,
                     )
                     state = replace(
                         state,

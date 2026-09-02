@@ -29,6 +29,7 @@ from yield_rca_core.models import (  # noqa: E402
     RCAJob,
     RCAState,
     Report,
+    Warning,
 )
 from yield_rca_core.rca_reasoning_agent import RCAReasoningAgent  # noqa: E402
 from yield_rca_core.report_generator import (  # noqa: E402
@@ -152,6 +153,26 @@ class ReportGeneratorContractTest(unittest.TestCase):
         self.assertIn("Inspect slurry pump", self.report.markdown)
         self.assertIn("WARN_SPC_BASELINE_INSUFFICIENT", self.report.markdown)
         self.assertIn("## Minimal SPC Analysis", self.report.markdown)
+
+    def test_report_does_not_resurrect_historical_missing_specialist_warning(self) -> None:
+        stale = Warning(
+            warning_id="WARN_RCA_MISSING_FINDINGS",
+            message="Missing Specialist findings: knowledge.",
+        )
+        historical_rca = replace(
+            self.state.findings[-1],
+            warnings=[*self.state.findings[-1].warnings, stale],
+        )
+        state = replace(
+            self.state,
+            findings=[*self.state.findings[:-1], historical_rca],
+            warnings=[*self.state.warnings, stale],
+        )
+
+        report = ReportGenerator().generate(state)
+
+        self.assertNotIn("WARN_RCA_MISSING_FINDINGS", report.markdown)
+        self.assertIn("WARN_SPC_BASELINE_INSUFFICIENT", report.markdown)
 
     def test_report_citations_resolve_to_rca_state_evidence(self) -> None:
         state_evidence_ids = {item.evidence_id for item in self.state.evidence}

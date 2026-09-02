@@ -171,6 +171,234 @@ def test_shared_effect_requires_multiple_claimed_lanes() -> None:
     assert any("shared_effect" in error for error in errors)
 
 
+def test_non_outcome_prediction_allows_empty_lane_effect_expectations() -> None:
+    profile = semantic_profile(
+        relation=CandidateScopeRelation.FOCAL_ONLY,
+        claimed_lane_ids=["LANE_RCP_A"],
+        comparison_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        prediction_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+    )
+    profile["distinguishing_predictions"][0]["lane_effect_expectations"] = []
+
+    profiles, errors = _parse_candidate_semantic_profiles(
+        [profile],
+        request_id="REQ_NON_OUTCOME_EMPTY_EFFECTS",
+        surviving_candidate_indexes=[0],
+        known_lane_ids={"LANE_RCP_A", "LANE_RCP_B"},
+    )
+
+    assert errors == ()
+    assert len(profiles) == 1
+
+
+def test_qwen_product_outcome_requires_lane_effect_expectations() -> None:
+    profile = semantic_profile(
+        relation=CandidateScopeRelation.FOCAL_ONLY,
+        claimed_lane_ids=["LANE_RCP_A"],
+        comparison_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        prediction_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+    )
+    profile["distinguishing_predictions"] = [
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_A", "LANE_RCP_B"],
+            "prediction": "Only RCP_A produces the product outcome.",
+        }
+    ]
+
+    profiles, errors = _parse_candidate_semantic_profiles(
+        [profile],
+        request_id="REQ_PRODUCT_OUTCOME_REQUIRES_EFFECTS",
+        surviving_candidate_indexes=[0],
+        known_lane_ids={"LANE_RCP_A", "LANE_RCP_B"},
+    )
+
+    assert profiles == ()
+    assert any("lane_effect_expectations" in error for error in errors)
+
+
+def test_shared_effect_rejects_lane_split_product_outcome_predictions() -> None:
+    profile = semantic_profile(
+        relation=CandidateScopeRelation.SHARED_EFFECT,
+        claimed_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        comparison_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        prediction_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+    )
+    profile["distinguishing_predictions"] = [
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_A"],
+            "prediction": "RCP_A produces the product failure.",
+            "lane_effect_expectations": [
+                {
+                    "lane_id": "LANE_RCP_A",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "present",
+                }
+            ],
+        },
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_B"],
+            "prediction": "RCP_B does not produce the product failure.",
+            "lane_effect_expectations": [
+                {
+                    "lane_id": "LANE_RCP_B",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "absent",
+                }
+            ],
+        },
+    ]
+
+    profiles, errors = _parse_candidate_semantic_profiles(
+        [profile],
+        request_id="REQ_SHARED_EFFECT_OUTCOME_CONFLICT",
+        surviving_candidate_indexes=[0],
+        known_lane_ids={"LANE_RCP_A", "LANE_RCP_B"},
+    )
+
+    assert profiles == ()
+    assert any(
+        "shared_effect claimed Lanes must predict the same product effect"
+        in error
+        for error in errors
+    )
+
+
+def test_shared_effect_rejects_conflicting_claimed_lane_effects() -> None:
+    profile = semantic_profile(
+        relation=CandidateScopeRelation.SHARED_EFFECT,
+        claimed_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        comparison_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        prediction_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+    )
+    profile["distinguishing_predictions"] = [
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_A", "LANE_RCP_B"],
+            "prediction": "The compared Lanes have different product outcomes.",
+            "lane_effect_expectations": [
+                {
+                    "lane_id": "LANE_RCP_A",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "present",
+                },
+                {
+                    "lane_id": "LANE_RCP_B",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "absent",
+                },
+            ],
+        }
+    ]
+
+    profiles, errors = _parse_candidate_semantic_profiles(
+        [profile],
+        request_id="REQ_SHARED_EFFECT_CONFLICTING_EFFECTS",
+        surviving_candidate_indexes=[0],
+        known_lane_ids={"LANE_RCP_A", "LANE_RCP_B"},
+    )
+
+    assert profiles == ()
+    assert any(
+        "shared_effect claimed Lanes must predict the same product effect"
+        in error
+        for error in errors
+    )
+
+
+def test_shared_effect_allows_different_effect_for_extra_comparison_control() -> None:
+    profile = semantic_profile(
+        relation=CandidateScopeRelation.SHARED_EFFECT,
+        claimed_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        comparison_lane_ids=["LANE_RCP_A", "LANE_RCP_B", "LANE_CONTROL"],
+        prediction_lane_ids=["LANE_RCP_A", "LANE_RCP_B", "LANE_CONTROL"],
+    )
+    profile["distinguishing_predictions"] = [
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_A", "LANE_RCP_B", "LANE_CONTROL"],
+            "prediction": "The claimed Lanes fail while the control remains normal.",
+            "lane_effect_expectations": [
+                {
+                    "lane_id": "LANE_RCP_A",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "present",
+                },
+                {
+                    "lane_id": "LANE_RCP_B",
+                    "effect_key": "high-contact-r",
+                    "effect_state": "present",
+                },
+                {
+                    "lane_id": "LANE_CONTROL",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "absent",
+                },
+            ],
+        }
+    ]
+
+    profiles, errors = _parse_candidate_semantic_profiles(
+        [profile],
+        request_id="REQ_SHARED_EFFECT_COMPARISON_CONTROL",
+        surviving_candidate_indexes=[0],
+        known_lane_ids={"LANE_RCP_A", "LANE_RCP_B", "LANE_CONTROL"},
+    )
+
+    assert errors == ()
+    assert len(profiles) == 1
+
+
+def test_differential_sensitivity_allows_lane_split_product_outcomes() -> None:
+    profile = semantic_profile(
+        relation=CandidateScopeRelation.DIFFERENTIAL_SENSITIVITY,
+        claimed_lane_ids=["LANE_RCP_A"],
+        comparison_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+        prediction_lane_ids=["LANE_RCP_A", "LANE_RCP_B"],
+    )
+    profile["distinguishing_predictions"] = [
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_A"],
+            "prediction": "RCP_A produces the more severe product failure.",
+            "lane_effect_expectations": [
+                {
+                    "lane_id": "LANE_RCP_A",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "increased",
+                }
+            ],
+        },
+        {
+            "discriminator_kind": "product_outcome",
+            "lane_ids": ["LANE_RCP_B"],
+            "prediction": "RCP_B remains within the product limit.",
+            "lane_effect_expectations": [
+                {
+                    "lane_id": "LANE_RCP_B",
+                    "effect_key": "HIGH_CONTACT_R",
+                    "effect_state": "unchanged",
+                }
+            ],
+        },
+    ]
+
+    profiles, errors = _parse_candidate_semantic_profiles(
+        [profile],
+        request_id="REQ_DIFFERENTIAL_OUTCOME",
+        surviving_candidate_indexes=[0],
+        known_lane_ids={"LANE_RCP_A", "LANE_RCP_B"},
+    )
+
+    assert errors == ()
+    assert len(profiles) == 1
+    assert profiles[0].scope_relation == (
+        CandidateScopeRelation.DIFFERENTIAL_SENSITIVITY
+    )
+
+
 def test_differential_sensitivity_accepts_claimed_subset_and_full_comparison() -> None:
     profiles, errors = _parse_candidate_semantic_profiles(
         [

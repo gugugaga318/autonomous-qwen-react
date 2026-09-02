@@ -58,15 +58,9 @@ from yield_rca_core.models import (
     ModelValidationError,
     Warning,
 )
+from yield_rca_core.warning_policy import SPECIALIST_AGENT_KINDS
 
-SPECIALIST_AGENTS = frozenset(
-    {
-        AgentKind.MES.value,
-        AgentKind.FDC.value,
-        AgentKind.DEFECT_WAT.value,
-        AgentKind.KNOWLEDGE.value,
-    }
-)
+SPECIALIST_AGENTS = SPECIALIST_AGENT_KINDS
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -926,6 +920,15 @@ class RCAReasoningAgent:
                             )
                         )
             except (LLMCallError, LLMOutputValidationError) as exc:
+                candidate_output_invalid = isinstance(
+                    exc,
+                    LLMOutputValidationError,
+                )
+                failure_reason = (
+                    CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value
+                    if candidate_output_invalid
+                    else CompetitionFailureReason.CANDIDATE_PROVIDER_FAILED.value
+                )
                 candidate_generation = {
                     "source": "qwen",
                     "candidate_count": 0,
@@ -935,34 +938,30 @@ class RCAReasoningAgent:
                     "validation_errors": [str(exc)],
                     "fallback_reason": (
                         "qwen_candidate_output_invalid"
-                        if isinstance(exc, LLMOutputValidationError)
+                        if candidate_output_invalid
                         else "qwen_candidate_provider_failed"
                     ),
-                    "candidate_output_invalid": True,
+                    "candidate_output_invalid": candidate_output_invalid,
                     "competition_requirement": competition_requirement,
                     "competition_status": CandidateCompetitionStatus.FAILED.value,
                     "competition_type": competition_type,
-                    "competition_failure_reason": (
-                        CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value
-                    ),
+                    "competition_failure_reason": failure_reason,
                     "candidate_lineage": [],
                 }
                 competition_status = CandidateCompetitionStatus.FAILED.value
-                competition_failure_reason = (
-                    CompetitionFailureReason.CANDIDATE_VALIDATION_EXHAUSTED.value
-                )
+                competition_failure_reason = failure_reason
                 warnings.append(
                     Warning(
                         warning_id=(
                             "WARN_RCA_QWEN_CANDIDATE_INVALID"
-                            if isinstance(exc, LLMOutputValidationError)
+                            if candidate_output_invalid
                             else "WARN_RCA_LLM_CANDIDATE_FALLBACK"
                         ),
                         message=(
                             "Qwen hypothesis candidate output was invalid; the "
                             "workflow returned an inconclusive result without "
                             "inventing a deterministic replacement candidate."
-                            if isinstance(exc, LLMOutputValidationError)
+                            if candidate_output_invalid
                             else "Qwen hypothesis candidate generation failed; the "
                             "deterministic Evidence Gate continued without model "
                             "candidates."

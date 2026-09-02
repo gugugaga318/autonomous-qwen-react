@@ -179,12 +179,40 @@ class CandidateGenerationTransportFailureClient(RecordingFakeClient):
         return super().complete_json(request)
 
 
+class FallbackThenCandidateTransportFailureClient(
+    InvalidNextActionAfterFirstClient
+):
+    """Exercise Candidate failure after a mid-loop Planner fallback."""
+
+    def complete_json(self, request: LLMRequest) -> LLMResponse:
+        if request.prompt_name == "hypothesis_candidate_generator":
+            self.requests.append(request)
+            raise LLMCallError(
+                "candidate provider transport failure after Planner fallback",
+                failure_category="transport_error",
+                call_attempt_count=2,
+            )
+        return super().complete_json(request)
+
+
 class InvalidIntentClient(RecordingFakeClient):
     def complete_json(self, request: LLMRequest) -> LLMResponse:
         response = super().complete_json(request)
         if request.prompt_name == "intent_planner":
             return LLMResponse(data={}, usage=response.usage)
         return response
+
+
+class IntentPlannerTransportFailureClient(RecordingFakeClient):
+    def complete_json(self, request: LLMRequest) -> LLMResponse:
+        if request.prompt_name == "intent_planner":
+            self.requests.append(request)
+            raise LLMCallError(
+                "intent planner transport failure",
+                failure_category="transport_error",
+                call_attempt_count=2,
+            )
+        return super().complete_json(request)
 
 
 class ImmediateUnsupportedStopClient(RecordingFakeClient):
@@ -433,9 +461,18 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
         )
         self.assertIsNotNone(state.competition_trace)
         assert state.competition_trace is not None
-        self.assertNotIn(
-            state.competition_trace.competition_status,
-            {"active", "pending"},
+        self.assertEqual(state.competition_trace.competition_status, "failed")
+        self.assertEqual(
+            state.competition_trace.competition_failure_reason,
+            "candidate_provider_failed",
+        )
+        self.assertEqual(
+            state.competition_trace.terminal_reason,
+            "candidate_competition_processing_failed",
+        )
+        self.assertEqual(
+            state.execution_metadata["investigation_finalizer"],
+            "python_competition_progression",
         )
         self.assertTrue(
             any(
@@ -443,6 +480,79 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
                 for request in client.requests
             )
         )
+
+    def test_mid_loop_fallback_keeps_qwen_terminal_and_impact_governance(
+        self,
+    ) -> None:
+        client = FallbackThenCandidateTransportFailureClient()
+        workflow = build_csv_workflow(
+            SEED_DIR,
+            llm_settings=LLMSettings(agent_mode="llm", api_key="test-only-key"),
+            llm_client=client,
+            orchestration_mode="llm_react",
+        )
+
+        state = workflow.run(
+            ROOT_CAUSE_QUERY,
+            job_id="JOB_MID_LOOP_FALLBACK_CANDIDATE_PROVIDER_FAILURE",
+            lot_id="LOT_A_001",
+        )
+
+        self.assertEqual(
+            state.execution_metadata["orchestration_requested_mode"],
+            "llm_react",
+        )
+        self.assertEqual(
+            state.execution_metadata["orchestration_mode"],
+            "controlled_react",
+        )
+        mes_finding = next(
+            finding for finding in state.findings if finding.agent == AgentKind.MES.value
+        )
+        self.assertTrue(mes_finding.details["impact_lots"])
+        rca_finding = state.authoritative_rca_finding
+        self.assertIsNotNone(rca_finding)
+        assert rca_finding is not None
+        impact_gate = rca_finding.details["impact_lot_gate"]
+        self.assertTrue(impact_gate["observed_impact_lots"])
+        self.assertEqual(impact_gate["confirmed_impact_lots"], [])
+        self.assertIsNotNone(state.competition_trace)
+        assert state.competition_trace is not None
+        self.assertEqual(state.competition_trace.competition_status, "failed")
+        self.assertEqual(
+            state.competition_trace.competition_failure_reason,
+            "candidate_provider_failed",
+        )
+
+        with self.subTest("authoritative impact publication"):
+            self.assertEqual(state.impact_lots, [])
+            assert state.report is not None
+            self.assertIn("- Impact Lot Count: 0", state.report.markdown)
+            self.assertIn("- Impact Lots: None identified.", state.report.markdown)
+        with self.subTest("Python terminal projection"):
+            self.assertEqual(
+                state.competition_trace.terminal_reason,
+                "candidate_competition_processing_failed",
+            )
+            self.assertEqual(
+                state.execution_metadata["investigation_finalizer"],
+                "python_competition_progression",
+            )
+            self.assertEqual(
+                state.execution_metadata["terminal_question_updates_source"],
+                "python_evidence_gate",
+            )
+            self.assertEqual(
+                state.execution_metadata["planner_stop_proposed_by"],
+                "python_runtime",
+            )
+            self.assertEqual(state.goal_status, "blocked")
+            self.assertEqual(
+                state.stop_reason,
+                StopReason.NO_HIGH_VALUE_ACTION.value,
+            )
+            self.assertEqual(state.conclusion_level, "inconclusive")
+        self.assertEqual(RCAState.from_dict(state.to_dict()), state)
 
     def test_llm_call_cap_ends_llm_react_without_controlled_fallback(self) -> None:
         state = run_lot(
@@ -934,7 +1044,6 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
             if request.prompt_name == "intent_planner"
         ]
         self.assertEqual(len(intent_requests), 2)
-        self.assertEqual(state.planner_decisions, [])
         self.assertEqual(
             state.execution_metadata["orchestration_requested_mode"],
             "llm_react",
@@ -985,6 +1094,44 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
             state.action_history[0].action.kind,
             "inspect_defect_pattern",
         )
+        rca_finding = state.authoritative_rca_finding
+        self.assertIsNotNone(rca_finding)
+        assert rca_finding is not None
+        impact_gate = rca_finding.details["impact_lot_gate"]
+        self.assertTrue(impact_gate["observed_impact_lots"])
+        self.assertEqual(impact_gate["confirmed_impact_lots"], [])
+        self.assertEqual(state.impact_lots, [])
+        self.assertIsNotNone(state.competition_trace)
+        assert state.competition_trace is not None
+        self.assertEqual(
+            state.competition_trace.competition_status,
+            "not_evaluated",
+        )
+        self.assertIsNone(state.competition_trace.terminal_reason)
+        self.assertEqual(
+            state.execution_metadata["investigation_finalizer"],
+            "not_applicable",
+        )
+        self.assertEqual(
+            state.execution_metadata["terminal_question_updates_source"],
+            "python_evidence_gate",
+        )
+        self.assertEqual(
+            state.execution_metadata["planner_stop_proposed_by"],
+            "python_runtime",
+        )
+        self.assertEqual(
+            state.execution_metadata["terminal_conclusion_status_source"],
+            "authoritative_rca_finding",
+        )
+        self.assertEqual(state.planner_decisions, [])
+        self.assertEqual(state.goal_status, "blocked")
+        self.assertEqual(state.stop_reason, StopReason.NO_HIGH_VALUE_ACTION.value)
+        self.assertEqual(state.conclusion_level, ConclusionLevel.INCONCLUSIVE.value)
+        assert state.report is not None
+        self.assertIn("- Impact Lot Count: 0", state.report.markdown)
+        self.assertIn("- Impact Lots: None identified.", state.report.markdown)
+        self.assertEqual(RCAState.from_dict(state.to_dict()), state)
         self.assertIsNone(state.run_evaluation)
 
     def test_invalid_full_rca_intent_preserves_python_baseline_goal(self) -> None:
@@ -1018,6 +1165,47 @@ class LLMReactWorkflowIntegrationTest(unittest.TestCase):
                 "product_outcome",
             ],
         )
+
+    def test_intent_transport_fallback_keeps_qwen_publication_governance(
+        self,
+    ) -> None:
+        state = run_lot(
+            IntentPlannerTransportFailureClient(),
+            ROOT_CAUSE_QUERY,
+            job_id="JOB_LLM_REACT_INTENT_TRANSPORT_FALLBACK",
+        )
+
+        self.assertEqual(
+            state.execution_metadata["orchestration_requested_mode"],
+            "llm_react",
+        )
+        self.assertEqual(
+            state.execution_metadata["orchestration_mode"],
+            "controlled_react",
+        )
+        self.assertEqual(
+            state.execution_metadata["orchestration_fallback_reason"],
+            "qwen_intent_call_failed",
+        )
+        self.assertEqual(
+            state.execution_metadata["orchestration_fallback_stage"],
+            "intent_planning",
+        )
+        self.assertEqual(
+            state.execution_metadata["investigation_finalizer"],
+            "not_applicable",
+        )
+        self.assertEqual(
+            state.execution_metadata["terminal_conclusion_status_source"],
+            "authoritative_rca_finding",
+        )
+        self.assertEqual(state.goal_status, "blocked")
+        self.assertEqual(state.conclusion_level, ConclusionLevel.INCONCLUSIVE.value)
+        self.assertEqual(state.stop_reason, StopReason.NO_HIGH_VALUE_ACTION.value)
+        self.assertEqual(state.impact_lots, [])
+        assert state.report is not None
+        self.assertIn("- Impact Lot Count: 0", state.report.markdown)
+        self.assertEqual(RCAState.from_dict(state.to_dict()), state)
 
     def test_product_root_cause_and_history_use_mes_selected_lots(self) -> None:
         workflow = fake_llm_workflow(RecordingFakeClient())
@@ -1191,6 +1379,9 @@ class LLMReactAPIIntegrationTest(unittest.TestCase):
         self.assertIn("candidate_summary", diagnostics[0])
         self.assertIn("baseline_diff", diagnostics[0])
         self.assertNotIn("user_query", str(diagnostics))
+        self.assertEqual(state["conclusion_level"], "inconclusive")
+        self.assertEqual(state["impact_lots"], [])
+        self.assertEqual(state["planner_decisions"], [])
 
     def test_api_exposes_rejected_question_update_without_fallback(self) -> None:
         app = create_app(
