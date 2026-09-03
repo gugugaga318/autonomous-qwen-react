@@ -248,6 +248,45 @@ def _prepare_output(output_dir: Path, *, overwrite: bool) -> None:
 _FINALIZER_TERMINAL_PROJECTOR = "python_investigation_finalizer"
 
 
+def _stop_reason_telemetry_fields(stop_reason: str | None) -> dict[str, Any]:
+    """Stop-reason telemetry fields for one case result.
+
+    ``terminal_stop_reason`` is the canonical key for the Finalizer-governed
+    terminal outcome. ``planner_stop_reason`` is a deprecated compatibility
+    alias kept for historical run_results.json consumers; both always carry
+    the same terminal value. The Planner proposal stop reason is tracked
+    separately through ``planner_stop_proposed_by`` provenance and is never
+    written into either key.
+    """
+
+    return {
+        "terminal_stop_reason": stop_reason,
+        "planner_stop_reason": stop_reason,
+    }
+
+
+def _terminal_stop_reason(
+    result: dict[str, Any],
+    *,
+    allow_legacy_alias: bool,
+) -> Any:
+    """Read the terminal stop reason with strict-new / lax-old semantics.
+
+    New runner output always carries the canonical ``terminal_stop_reason``
+    key. The strict mode never falls back to the deprecated alias, so a
+    missing canonical write cannot pass acceptance silently. Only historical
+    result files, which predate the canonical key, are read through
+    ``allow_legacy_alias=True``.
+    """
+
+    canonical = result.get("terminal_stop_reason")
+    if canonical is not None:
+        return canonical
+    if allow_legacy_alias:
+        return result.get("planner_stop_reason")
+    return None
+
+
 def _python_terminal_stop_is_governed(result: dict[str, Any]) -> bool:
     stop_proposer = result.get("planner_stop_proposed_by")
     terminal_projector = result.get("terminal_stop_projected_by")
@@ -261,13 +300,17 @@ def _python_terminal_stop_is_governed(result: dict[str, Any]) -> bool:
         StopReason.NO_HIGH_VALUE_ACTION.value,
         StopReason.BUDGET_EXHAUSTED.value,
     }
+    terminal_stop_reason = _terminal_stop_reason(
+        result,
+        allow_legacy_alias=False,
+    )
     governed_legacy_data_unavailable = (
-        result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
+        terminal_stop_reason == StopReason.DATA_UNAVAILABLE.value
         and result.get("conclusion_status") == "insufficient_evidence"
         and bool(result.get("required_unavailable_evidence_ids"))
     )
     governed_competition_data_unavailable = (
-        result.get("planner_stop_reason") == StopReason.DATA_UNAVAILABLE.value
+        terminal_stop_reason == StopReason.DATA_UNAVAILABLE.value
         and result.get("conclusion_status") == "insufficient_evidence"
         and result.get("competition_status") == "blocked_by_missing_data"
         and result.get("competition_terminal_reason")
@@ -277,7 +320,7 @@ def _python_terminal_stop_is_governed(result: dict[str, Any]) -> bool:
         and bool(result.get("decision_critical_unavailable_evidence_ids"))
     )
     return (
-        result.get("planner_stop_reason") in governed_stop_reasons
+        terminal_stop_reason in governed_stop_reasons
         or governed_legacy_data_unavailable
         or governed_competition_data_unavailable
     )
@@ -727,7 +770,7 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                     "terminal_stop_projected_by": state.execution_metadata.get(
                         "terminal_stop_projected_by"
                     ),
-                    "planner_stop_reason": state.stop_reason,
+                    **_stop_reason_telemetry_fields(state.stop_reason),
                     "terminal_question_updates_source": state.execution_metadata.get(
                         "terminal_question_updates_source"
                     ),
@@ -796,7 +839,7 @@ def run_formal_blind(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     "planner_stop_proposed_by": None,
                     "terminal_stop_projected_by": None,
-                    "planner_stop_reason": None,
+                    **_stop_reason_telemetry_fields(None),
                     "terminal_question_updates_source": None,
                     "required_unavailable_evidence_ids": [],
                 }

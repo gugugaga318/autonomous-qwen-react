@@ -26,6 +26,7 @@ def clean_result() -> dict[str, object]:
         "llm_call_cap_exceeded": False,
         "planner_stop_proposed_by": "qwen",
         "terminal_stop_projected_by": None,
+        "terminal_stop_reason": "goal_satisfied",
         "planner_stop_reason": "goal_satisfied",
         "terminal_question_updates_source": "python_evidence_gate",
     }
@@ -118,6 +119,7 @@ def test_strict_qwen_accepts_governed_python_no_gain_stop() -> None:
     result = {
         **clean_result(),
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "no_allowed_action",
         "planner_stop_reason": "no_allowed_action",
     }
 
@@ -132,6 +134,7 @@ def test_strict_qwen_rejects_ungoverned_python_stop() -> None:
     result = {
         **clean_result(),
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "goal_satisfied",
         "planner_stop_reason": "goal_satisfied",
     }
 
@@ -148,6 +151,7 @@ def test_strict_qwen_accepts_evidence_proven_data_unavailable_stop() -> None:
     result = {
         **clean_result(),
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "data_unavailable",
         "planner_stop_reason": "data_unavailable",
         "conclusion_status": "insufficient_evidence",
         "required_unavailable_evidence_ids": ["EV_REQUIRED_GENEALOGY_MISSING"],
@@ -164,6 +168,7 @@ def test_strict_qwen_rejects_unproven_data_unavailable_stop() -> None:
     result = {
         **clean_result(),
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "data_unavailable",
         "planner_stop_reason": "data_unavailable",
         "conclusion_status": "inconclusive",
         "required_unavailable_evidence_ids": [],
@@ -182,6 +187,7 @@ def test_strict_qwen_accepts_competition_governed_data_unavailable_stop() -> Non
     result = {
         **clean_result(),
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "data_unavailable",
         "planner_stop_reason": "data_unavailable",
         "conclusion_status": "insufficient_evidence",
         "required_unavailable_evidence_ids": [],
@@ -205,6 +211,7 @@ def test_strict_qwen_rejects_unproven_competition_missing_data_stop() -> None:
     result = {
         **clean_result(),
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "data_unavailable",
         "planner_stop_reason": "data_unavailable",
         "conclusion_status": "insufficient_evidence",
         "required_unavailable_evidence_ids": [],
@@ -286,6 +293,7 @@ def test_execution_layer_reports_governed_python_stop_separately() -> None:
         "workflow_completed": True,
         "strict_qwen_accepted": True,
         "planner_stop_proposed_by": "python_runtime",
+        "terminal_stop_reason": "no_allowed_action",
         "planner_stop_reason": "no_allowed_action",
     }
 
@@ -303,6 +311,7 @@ def test_execution_layer_separates_qwen_proposal_from_finalizer_projection() -> 
         "strict_qwen_accepted": True,
         "planner_stop_proposed_by": "qwen",
         "terminal_stop_projected_by": "python_investigation_finalizer",
+        "terminal_stop_reason": "no_high_value_action",
         "planner_stop_reason": "no_high_value_action",
     }
 
